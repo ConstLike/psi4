@@ -17,6 +17,7 @@
 #include "multistate_matrix.h"
 #include "psi4/libmints/matrix.h"
 #include "psi4/psi4-dec.h"
+#include "psi4/libpsi4util/PsiOutStream.h"
 #include <cstring>
 #include <cstdlib>
 
@@ -84,15 +85,17 @@ void MultiStateMatrix::allocate() {
         std::string state_name = name_ + "[" + std::to_string(s) + "]";
         auto mat = std::make_shared<Matrix>(state_name, nirrep_, rowspi_, colspi_, symmetry_);
 
-        // Copy data from contiguous block to Matrix
-        // TODO: Replace with direct memory sharing once Matrix supports external data
+        // Copy data from contiguous block to Matrix using public API
         for (int h = 0; h < nirrep_; ++h) {
-            size_t block_size = rowspi_[h] * colspi_[h ^ symmetry_];
-            if (block_size > 0 && mat->matrix_[h]) {
-                std::memcpy(&mat->matrix_[h][0][0],
-                           &data_contiguous_[offset],
-                           block_size * sizeof(double));
-                offset += block_size;
+            int nrow = rowspi_[h];
+            int ncol = colspi_[h ^ symmetry_];
+            if (nrow > 0 && ncol > 0) {
+                // Use Matrix::pointer() to get data pointer (public method)
+                double** mat_data = mat->pointer(h);
+                for (int i = 0; i < nrow; ++i) {
+                    std::memcpy(mat_data[i], &data_contiguous_[offset], ncol * sizeof(double));
+                    offset += ncol;
+                }
             }
         }
 
