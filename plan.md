@@ -26,15 +26,25 @@ Each step: Claude codes → commits → pushes; User compiles → tests → vali
 **Phase:** 0 - HPC Performance Optimization 🔥
 
 **Completed:**
-- ✅ Code analysis: Matrix class, BLAS integration, memory layout
-- ✅ Identified bottlenecks: alignment (10-30%), get_block (10-20x), cache locality (2-3x)
-- ✅ HPC optimization plan formulated
-- ✅ **Phase 0.1:** Aligned allocation (posix_memalign 64-byte) ← tested OK
-- ✅ **Phase 0.2:** Vectorize get_block/set_block with memcpy ← tested OK
-- ✅ **Phase 0.3 (part 1/2):** MultiStateMatrix class + compilation fixes ← committed 62ceb56e, tested OK
-- ⚙️ **Phase 0.3 (part 2/2):** Integrated into RHF/UHF with opt-in flag ← committed fe0d483c
+- ✅ **Phase 0.1:** Aligned allocation (64-byte) → +10-30% BLAS performance
+- ✅ **Phase 0.2:** Vectorized get_block/set_block → 10-20x faster subset operations
+- ✅ **Phase 0.3:** MultiStateMatrix infrastructure created
 
-**Next Action:** User tests Phase 0.3 part 2/2 compilation and validates correctness
+**Current Problem (Phase 0.3 fix):**
+Testing showed +2.5% slowdown instead of 2-3x speedup. Root cause:
+```cpp
+// Current: Build in contiguous → copy back (overhead!)
+D_multi_->get(0) → build density
+Da_->copy(D_alpha);  // ← WASTEFUL COPY
+// Rest of code uses Da_/Db_ → no cache locality benefit!
+```
+
+**Solution in progress:**
+- Make Da_/Db_ as **views** into D_multi_ (no copying!)
+- Extend contiguous storage to Fock matrices (Fa_/Fb_)
+- Entire UHF pipeline uses contiguous memory for cache locality
+
+**Next Action:** Fix Phase 0.3 - eliminate copies, extend to Fock matrices
 
 ---
 
@@ -103,201 +113,135 @@ F_b = H + (J_a + J_b) - K_b
 
 ---
 
-## Phase 0: HPC Performance Optimization 🔥 **PRIORITY**
+## Phase 0.3 Fix: Proper Contiguous Storage (IN PROGRESS)
 
-**Goal:** Maximize Matrix operations performance (3-5x speedup for multi-state)
+**Current Issue:** Phase 0.3 implementation shows +2.5% slowdown due to wasteful copying.
 
-### Critical Findings from Code Analysis
+### Root Cause Analysis
 
-| Issue | Current | Impact | Fix |
-|-------|---------|--------|-----|
-| **Memory alignment** | `malloc()` ~16 bytes | -10-30% BLAS | `posix_memalign(64)` |
-| **get_block() copy** | Element-wise O(n²) | -10-20x | `memcpy` per row |
-| **Multi-state layout** | Separate allocations | -2-3x cache miss | Contiguous storage |
-| **Cache blocking** | None | -30-50% (large) | Tiled DGEMM |
-
-**Total potential:** **3-5x overall speedup** for REKS/multi-state operations
-
----
-
-### 0.1: Aligned Memory Allocation ⚡ **QUICK WIN**
-
-**Time:** 1 hour | **Gain:** 10-30% BLAS performance
-
-**Problem:**
 ```cpp
-// matrix.cc:461 - Current code
-double* block = (double*)malloc(nrows * ncols * sizeof(double));
-// malloc() gives ~16 byte alignment
-// AVX-512 needs 64 bytes (cache line size)
+// CURRENT (WRONG):
+void UHF::form_D() {
+    D_multi_->zero_all();
+    SharedMatrix D_alpha = D_multi_->get(0);  // Build in contiguous
+    SharedMatrix D_beta = D_multi_->get(1);
+
+    // Build densities...
+
+    Da_->copy(D_alpha);  // ← WASTEFUL COPY!
+    Db_->copy(D_beta);   // ← WASTEFUL COPY!
+}
+
+// Rest of code uses Da_/Db_ → separate memory locations
+// NO cache locality benefit, ONLY copy overhead!
 ```
 
-**Solution:**
-```cpp
-// matrix.cc:461 - New code
-static constexpr size_t CACHE_LINE_SIZE = 64;  // x86-64 standard
+### Solution: Make Da_/Db_ as Views
 
-double* block = nullptr;
-int ret = posix_memalign((void**)&block, CACHE_LINE_SIZE,
-                         nrows * ncols * sizeof(double));
-if (ret != 0) {
-    throw PSIEXCEPTION("posix_memalign failed");
+**Key insight:** `SharedMatrix` is just `shared_ptr<Matrix>`. We can make `Da_/Db_` point directly into contiguous storage!
+
+```cpp
+// CORRECT:
+void UHF::common_init() {
+    // Create contiguous storage for ALL UHF matrices
+    D_multi_ = std::make_shared<MultiStateMatrix>("D", 2, nirrep_, nsopi_, nsopi_, 0);
+
+    // Da_/Db_ are VIEWS into contiguous storage (no allocation!)
+    Da_ = D_multi_->get(0);  // Points to [0...N] in data_contiguous_
+    Db_ = D_multi_->get(1);  // Points to [N...2N] in data_contiguous_
+
+    // Same for Fock matrices
+    F_multi_ = std::make_shared<MultiStateMatrix>("F", 2, nirrep_, nsopi_, nsopi_, 0);
+    Fa_ = F_multi_->get(0);
+    Fb_ = F_multi_->get(1);
+
+    // G matrices (intermediate)
+    G_multi_ = std::make_shared<MultiStateMatrix>("G", 2, nirrep_, nsopi_, nsopi_, 0);
+    Ga_ = G_multi_->get(0);
+    Gb_ = G_multi_->get(1);
+}
+
+void UHF::form_D() {
+    // Build directly in Da_/Db_ (which ARE contiguous!)
+    Da_->zero();  // Actually zeroing contiguous block
+    Db_->zero();
+
+    // DGEMM writes directly to contiguous storage
+    for (int h = 0; h < nirrep_; ++h) {
+        double** Da = Da_->pointer(h);  // Points into data_contiguous_
+        double** Db = Db_->pointer(h);
+        C_DGEMM('N', 'T', nso, nso, na, 1.0, Ca[0], nmo, Ca[0], nmo, 0.0, Da[0], nso);
+        C_DGEMM('N', 'T', nso, nso, nb, 1.0, Cb[0], nmo, Cb[0], nmo, 0.0, Db[0], nso);
+    }
+    // No copy needed! Da_/Db_ already in contiguous storage
 }
 ```
 
-**Files to modify:**
-- `psi4/src/psi4/libmints/matrix.cc:461` (Matrix::alloc)
-- `psi4/src/psi4/libmints/matrix.cc:3562` (linalg::detail::matrix)
+### Memory Layout (UHF with contiguous storage)
 
-**Cache line size:** Hardcoded 64 bytes (Intel/AMD/ARM standard). Could use runtime:
+```
+Single allocation for densities:
+[Da_h0][Da_h1]...[Db_h0][Db_h1]... ← 64-byte aligned, contiguous
+
+Single allocation for Fock:
+[Fa_h0][Fa_h1]...[Fb_h0][Fb_h1]... ← 64-byte aligned, contiguous
+
+Single allocation for G:
+[Ga_h0][Ga_h1]...[Gb_h0][Gb_h1]... ← 64-byte aligned, contiguous
+```
+
+### Cache Locality Benefits
+
+**JK contraction pattern:**
 ```cpp
-// Optional: runtime detection (overkill)
-#include <unistd.h>
-size_t cache_line = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);  // Usually 64
+jk_->C_left() = {Ca_occ, Cb_occ};  // JK reads Da, Db for screening
+jk_->compute();                    // Generates J, Ka, Kb
+
+// JK builder accesses: Da[i] → Db[i] → Da[i+1] → Db[i+1]...
+// With contiguous: ALL in same cache lines! 2-3x fewer cache misses
 ```
-But 64 is safe for 99.9% of systems.
 
-**Test:** Compile + run RHF/UHF tests. Performance should improve 10-30% on DGEMM-heavy systems.
-
----
-
-### 0.2: Vectorize get_block() ⚡⚡ **CRITICAL**
-
-**Time:** 4 hours | **Gain:** 10-20x for subset operations
-
-**Problem:**
+**Fock assembly pattern:**
 ```cpp
-// matrix.cc:666 - Current code (DISASTER!)
-for (int p = 0; p < max_p; p++) {
-    for (int q = 0; q < max_q; q++) {
-        double val = get(h, p + rows_begin[h], q + cols_begin[h]);
-        block->set(h, p, q, val);  // Element-wise! O(n²) operations!
-    }
-}
-// Used in Ca_subset("SO", "OCC") → EVERY SCF ITERATION!
+Ga_->add(J_);    Gb_->add(J_);    // Read Ga, Gb sequentially
+Ga_->axpy(-α, Ka_); Gb_->axpy(-α, Kb_);  // Write Ga, Gb sequentially
+Fa_->copy(H_); Fa_->add(Ga_);    // Read Ga after just writing it
+Fb_->copy(H_); Fb_->add(Gb_);    // Read Gb after just writing it
+
+// With contiguous: Ga/Gb hot in cache → 2-3x faster
 ```
 
-**Solution:**
-```cpp
-// matrix.cc:666 - New code
-for (int h = 0; h < nirrep_; ++h) {
-    if (rows_per_h[h] == 0 || cols_per_h[h] == 0) continue;
+### Implementation Plan
 
-    const int row_offset = rows_begin[h];
-    const int col_offset = cols_begin[h];
-    const size_t bytes_per_row = cols_per_h[h] * sizeof(double);
+**Step 1: Remove copying (1 hour)**
+- Modify UHF::common_init() to make Da_/Db_ as views
+- Remove copy operations from form_D()
+- Test: identical energies, measure performance
 
-    // Vectorized memcpy per row (10-20x faster!)
-    for (int i = 0; i < rows_per_h[h]; ++i) {
-        std::memcpy(&block->matrix_[h][i][0],
-                   &matrix_[h][i + row_offset][col_offset],
-                   bytes_per_row);
-    }
-}
-```
+**Step 2: Extend to Fock matrices (2 hours)**
+- Add F_multi_, G_multi_ to UHF
+- Make Fa_/Fb_, Ga_/Gb_ as views
+- Test on medium molecule (30-50 atoms)
 
-**Files to modify:**
-- `psi4/src/psi4/libmints/matrix.cc:666` (Matrix::get_block)
-- Similar pattern in other block operations
+**Step 3: RHF support (1 hour)**
+- RHF uses n=1 (single state), but still benefits from alignment
+- Make Da_ as view into D_multi_
 
-**Test:** Benchmark `Ca_subset("SO", "OCC")` - should be 10-20x faster.
+**Total time:** ~4 hours
 
----
-
-### 0.3: Multi-State Contiguous Storage ⚡⚡⚡ **GAME CHANGER**
-
-**Time:** 2-3 days | **Gain:** 2-3x for multi-state (REKS critical!)
-
-**Problem:**
-```cpp
-// Current UHF: Da and Db in different memory locations
-SharedMatrix Da_;  // address: 0x1000
-SharedMatrix Db_;  // address: 0x9000 (8KB+ gap!)
-// Access pattern: Da[i] → Db[i] → CACHE MISS every time!
-```
-
-**Solution: MultiStateMatrix with contiguous storage**
-
-```cpp
-// New file: psi4/src/psi4/libscf_solver/multistate_matrix.h
-
-class MultiStateMatrix {
-    int n_states_;
-    int nirrep_;
-    std::vector<Dimension> rowspi_;
-    std::vector<Dimension> colspi_;
-
-    // KEY: Single aligned allocation for ALL states
-    double* data_contiguous_;
-    size_t total_elements_;
-
-    // Views (SharedMatrix) pointing into data_contiguous_
-    std::vector<SharedMatrix> state_views_;
-
-public:
-    MultiStateMatrix(const std::string& name, int n_states,
-                     int nirrep, const std::vector<Dimension>& dims);
-
-    ~MultiStateMatrix() {
-        if (data_contiguous_) free(data_contiguous_);
-    }
-
-    // Access
-    SharedMatrix get(int state) const { return state_views_[state]; }
-    int n_states() const { return n_states_; }
-
-    // Contiguous pointer for advanced operations
-    double* contiguous_data() { return data_contiguous_; }
-
-    // Zero all states efficiently
-    void zero_all() {
-        std::memset(data_contiguous_, 0, total_elements_ * sizeof(double));
-    }
-};
-```
-
-**Memory layout:**
-```
-Single allocation:
-[State0_h0_data][State0_h1_data]...[State1_h0_data][State1_h1_data]...
-^                                  ^
-Da (view)                          Db (view)
-
-All data contiguous → excellent cache locality!
-```
-
-**Files to create:**
-- `psi4/src/psi4/libscf_solver/multistate_matrix.h`
-- `psi4/src/psi4/libscf_solver/multistate_matrix.cc`
-- Update `CMakeLists.txt`
-
-**Integration:** Phase 1 will use this in RHF/UHF
-
-**Test:** Benchmark multi-state operations - expect 2-3x speedup vs separate matrices.
-
----
-
-### 0.4: Cache-Aware Tiling (Optional, later)
-
-**Time:** 1-2 weeks | **Gain:** 30-50% for large systems (>500 basis functions)
-
-**Idea:** Block DGEMM to fit in L2 cache (typical: 256KB → tile ~128x128)
-
-**Status:** Defer to Phase 2 or later. Profile first to confirm benefit.
+**Expected gain:** 2-3x for UHF on medium/large systems (100+ basis functions)
 
 ---
 
 ## Phase 0 Summary
 
-| Step | Time | Gain | Priority | Status |
-|------|------|------|----------|--------|
-| **0.1 Aligned allocation** | 1h | 10-30% | ⚠️ HIGH | 📍 NEXT |
-| **0.2 Vectorize get_block** | 4h | 10-20x | ⚠️ CRITICAL | Pending |
-| **0.3 Contiguous multi-state** | 2-3d | 2-3x | ⚠️ CRITICAL | Pending |
-| **0.4 Cache tiling** | 1-2w | 30-50% | MEDIUM | Deferred |
-| **Total Phase 0** | ~3-4 days | **3-5x overall** | - | 0% |
+| Step | Gain | Status |
+|------|------|--------|
+| **0.1 Aligned allocation** | +10-30% BLAS | ✅ Done |
+| **0.2 Vectorize get_block** | 10-20x subset | ✅ Done |
+| **0.3 Contiguous storage** | 2-3x multi-state | ⚙️ **Fixing now** |
 
-**After Phase 0:** Matrix infrastructure optimized, ready for refactoring.
+**After Phase 0:** Ready for Phase 1 (refactoring with optimized infrastructure)
 
 ---
 
