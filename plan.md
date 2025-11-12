@@ -121,17 +121,61 @@ Phase 5: Multi-Spin Integration 🎯 GOAL
 
 ---
 
-## Phase 0.5: Унификация базы ✅ (COMPLETE - AWAITING USER TEST)
+## Phase 0.5: Унификация базы ✅ COMPLETE
 
-**Status:** ROHF migration complete - awaiting compilation and tests
+**Status:** Tested and validated! All three (RHF/UHF/ROHF) use MultiStateMatrix.
 
-**Current State:**
-- ✅ **RHF** uses MultiStateMatrix (n=1) - ✅ DONE in Phase 0.3!
-- ✅ **UHF** uses MultiStateMatrix (n=2) - ✅ DONE, proven +15.9%
-- ✅ **ROHF** uses MultiStateMatrix (n=2) - ✅ DONE in Phase 0.5! 🎉
-- ⚠️ SCFEngine ready but not tested yet
+---
 
-**Solution:** ✅ All three (RHF/UHF/ROHF) now use unified MultiStateMatrix pattern!
+## Phase 0.6: SCFEngine API Integration (IN PROGRESS) 🚧
+
+**Status:** Step 1 - n_states() API complete, awaiting compilation test
+
+**Goal:** Make SCFEngine usable with existing theories through clean API.
+
+**Strategy:** Opt-in pattern, full backward compatibility, no Python changes yet.
+
+### Step 0.6.1: Add n_states() API ✅ DONE (awaiting test)
+
+**What was done:**
+1. ✅ Added `virtual int n_states() const` to HF base class (default return 1)
+2. ✅ Override in RHF: `return 1` (closed-shell, alpha = beta)
+3. ✅ Override in UHF: `return 2` (alpha, beta spins)
+4. ✅ Override in ROHF: `return 2` (alpha, beta different occupations)
+
+**Changes:**
+```cpp
+// hf.h - Base class
+virtual int n_states() const { return 1; }
+
+// rhf.h
+int n_states() const override { return 1; }  // Closed-shell
+
+// uhf.h
+int n_states() const override { return 2; }  // Open-shell (alpha, beta)
+
+// rohf.h
+int n_states() const override { return 2; }  // Restricted open-shell
+```
+
+**Purpose:**
+- SCFEngine can query theory: "how many states do you handle?"
+- Foundation for future multi-state/multi-cycle support
+- No logic changes, pure API extension
+
+**Validation (AWAITING USER):**
+- Compilation should succeed
+- All existing tests should pass (no behavior change)
+- API is ready for next step
+
+### Step 0.6.2: Basic SCFEngine test (NEXT)
+
+After Step 0.6.1 validates, create minimal C++ test:
+- Instantiate SCFEngine with RHF
+- Call n_states()
+- Verify API works
+
+**NO real SCF run yet** - just API verification.
 
 ### Step 0.5.1: RHF → MultiStateMatrix ✅ DONE
 

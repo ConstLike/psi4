@@ -315,6 +315,13 @@ class HF : public Wavefunction {
     std::shared_ptr<Vector> occupation_a() const;
     std::shared_ptr<Vector> occupation_b() const;
 
+    /// Returns the number of states this theory handles
+    /// RHF: 1 (closed-shell)
+    /// UHF: 2 (alpha, beta)
+    /// ROHF: 2 (alpha, beta with different occupations)
+    /// SA-REKS: N (multiple electronic states)
+    virtual int n_states() const { return 1; }
+
     /// Save the current density and energy.
     virtual void save_density_and_energy();
 

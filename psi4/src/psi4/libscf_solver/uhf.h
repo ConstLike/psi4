@@ -80,6 +80,9 @@ class UHF : public HF {
     virtual bool same_a_b_orbs() const { return false; }
     virtual bool same_a_b_dens() const { return false; }
 
+    /// UHF handles 2 states (alpha and beta spins)
+    int n_states() const override { return 2; }
+
     void save_density_and_energy() override;
 
     void form_C(double shift = 0.0) override;

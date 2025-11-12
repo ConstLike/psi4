@@ -85,6 +85,9 @@ class ROHF : public HF {
     SharedMatrix moFb() const { return moFb_; }
     SharedMatrix Ct() const {return Ct_; }
 
+    /// ROHF handles 2 states (alpha and beta with different occupations)
+    int n_states() const override { return 2; }
+
     void save_density_and_energy() override;
 
     void form_C(double shift = 0.0) override;
