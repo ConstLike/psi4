@@ -31,7 +31,7 @@ Each step: Claude codes → commits → pushes; User compiles → tests → vali
 - ✅ HPC optimization plan formulated
 - ✅ **Phase 0.1:** Aligned allocation (posix_memalign 64-byte) ← tested OK
 - ✅ **Phase 0.2:** Vectorize get_block/set_block with memcpy ← tested OK
-- ⚙️ **Phase 0.3 (part 1/2):** MultiStateMatrix class created ← committed 487a618c
+- ⚙️ **Phase 0.3 (part 1/2):** MultiStateMatrix class + compilation fixes ← committed 62ceb56e
 
 **Next Action:** User tests Phase 0.3 compilation → then integrate into RHF/UHF (part 2/2)
 
