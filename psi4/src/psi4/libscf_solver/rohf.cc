@@ -71,20 +71,28 @@ ROHF::~ROHF() {}
 
 void ROHF::common_init() {
     name_ = "ROHF";
-    Fa_ = SharedMatrix(factory_->create_matrix("Alpha Fock Matrix"));
-    Fb_ = SharedMatrix(factory_->create_matrix("Beta Fock Matrix"));
+
+    // Phase 0.5: Create contiguous storage (n=2 for ROHF, like UHF)
+    D_multi_ = std::make_shared<MultiStateMatrix>("D", 2, nirrep_, nsopi_, nsopi_, 0);
+    F_multi_ = std::make_shared<MultiStateMatrix>("F", 2, nirrep_, nsopi_, nsopi_, 0);
+    G_multi_ = std::make_shared<MultiStateMatrix>("G", 2, nirrep_, nsopi_, nsopi_, 0);
+
+    // Da_/Db_/Fa_/Fb_/Ga_/Gb_ are VIEWS into contiguous storage (no copying!)
+    Da_ = D_multi_->get(0);
+    Db_ = D_multi_->get(1);
+    Fa_ = F_multi_->get(0);
+    Fb_ = F_multi_->get(1);
+    Ga_ = G_multi_->get(0);
+    Gb_ = G_multi_->get(1);
+
     moFeff_ = SharedMatrix(factory_->create_matrix("F effective (MO basis)"));
     soFeff_ = SharedMatrix(factory_->create_matrix("F effective (orthogonalized SO basis)"));
     Ct_ = SharedMatrix(factory_->create_matrix("Orthogonalized Molecular orbitals"));
     Ca_ = SharedMatrix(factory_->create_matrix("MO coefficients (C)"));
     Cb_ = Ca_;
-    Da_ = SharedMatrix(factory_->create_matrix("SCF alpha density"));
-    Db_ = SharedMatrix(factory_->create_matrix("SCF beta density"));
     Lagrangian_ = SharedMatrix(factory_->create_matrix("Lagrangian matrix"));
     Ka_ = SharedMatrix(factory_->create_matrix("K alpha"));
     Kb_ = SharedMatrix(factory_->create_matrix("K beta"));
-    Ga_ = SharedMatrix(factory_->create_matrix("G alpha"));
-    Gb_ = SharedMatrix(factory_->create_matrix("G beta"));
     Dt_ = SharedMatrix(factory_->create_matrix("Total SCF density"));
     Dt_old_ = SharedMatrix(factory_->create_matrix("Old total SCF density"));
     Da_old_ = SharedMatrix(factory_->create_matrix("Old alpha SCF density"));
@@ -271,8 +279,12 @@ void ROHF::finalize() {
     moFeff_.reset();
     Ka_.reset();
     Kb_.reset();
-    Ga_.reset();
-    Gb_.reset();
+
+    // Phase 0.5: Reset multi-state matrices (Da_, Db_, Fa_, Fb_, Ga_, Gb_ are views)
+    D_multi_.reset();
+    F_multi_.reset();
+    G_multi_.reset();
+
     Da_old_.reset();
     Db_old_.reset();
     Dt_old_.reset();
@@ -449,8 +461,8 @@ void ROHF::form_initial_C() {
 }
 
 void ROHF::form_D() {
-    Da_->zero();
-    Db_->zero();
+    // Phase 0.5: Zero contiguous storage efficiently with single memset
+    D_multi_->zero_all();
 
     for (int h = 0; h < nirrep_; ++h) {
         int nso = nsopi_[h];
@@ -461,8 +473,8 @@ void ROHF::form_D() {
         if (nso == 0 || nmo == 0) continue;
 
         auto Ca = Ca_->pointer(h);
-        auto Da = Da_->pointer(h);
-        auto Db = Db_->pointer(h);
+        auto Da = Da_->pointer(h);  // View into D_multi_
+        auto Db = Db_->pointer(h);  // View into D_multi_
 
         C_DGEMM('N', 'T', nso, nso, na, 1.0, Ca[0], nmo, Ca[0], nmo, 0.0, Da[0], nso);
         C_DGEMM('N', 'T', nso, nso, nb, 1.0, Ca[0], nmo, Ca[0], nmo, 0.0, Db[0], nso);
