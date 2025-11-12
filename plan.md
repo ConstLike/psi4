@@ -29,9 +29,10 @@ Each step: Claude codes → commits → pushes; User compiles → tests → vali
 - ✅ Code analysis: Matrix class, BLAS integration, memory layout
 - ✅ Identified bottlenecks: alignment (10-30%), get_block (10-20x), cache locality (2-3x)
 - ✅ HPC optimization plan formulated
-- ✅ **Phase 0.1:** Aligned allocation (posix_memalign 64-byte) ← committed 581c0833
+- ✅ **Phase 0.1:** Aligned allocation (posix_memalign 64-byte) ← tested OK
+- ✅ **Phase 0.2:** Vectorize get_block/set_block with memcpy ← committed 59ee3a84
 
-**Next Action:** User tests Phase 0.1 performance → if OK, proceed to Phase 0.2
+**Next Action:** User tests Phase 0.2 performance (expect 10-20x speedup for subsets) → if OK, proceed to Phase 0.3
 
 ---
 
@@ -320,9 +321,9 @@ All data contiguous → excellent cache locality!
 | Phase | Focus | Time | Gain | Status |
 |-------|-------|------|------|--------|
 | **0** | **HPC Optimization** | **3-4d** | **3-5x** | **📍 ACTIVE** |
-| 0.1 | Aligned allocation | 1h | 10-30% | ✅ **TESTING** |
-| 0.2 | Vectorize get_block | 4h | 10-20x | 📍 NEXT |
-| 0.3 | Contiguous multi-state | 2-3d | 2-3x | Pending |
+| 0.1 | Aligned allocation | 1h | 10-30% | ✅ **DONE** |
+| 0.2 | Vectorize get_block | 4h | 10-20x | ✅ **TESTING** |
+| 0.3 | Contiguous multi-state | 2-3d | 2-3x | 📍 NEXT |
 | 1 | Matrix Containers | 10h | - | Pending |
 | 2 | Density Ops | 4h | - | Pending |
 | 3 | JK Multi-State | 6h | - | Pending |
