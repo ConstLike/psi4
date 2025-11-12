@@ -30,9 +30,10 @@ Each step: Claude codes → commits → pushes; User compiles → tests → vali
 - ✅ Identified bottlenecks: alignment (10-30%), get_block (10-20x), cache locality (2-3x)
 - ✅ HPC optimization plan formulated
 - ✅ **Phase 0.1:** Aligned allocation (posix_memalign 64-byte) ← tested OK
-- ✅ **Phase 0.2:** Vectorize get_block/set_block with memcpy ← committed 59ee3a84
+- ✅ **Phase 0.2:** Vectorize get_block/set_block with memcpy ← tested OK
+- ⚙️ **Phase 0.3 (part 1/2):** MultiStateMatrix class created ← committed 487a618c
 
-**Next Action:** User tests Phase 0.2 performance (expect 10-20x speedup for subsets) → if OK, proceed to Phase 0.3
+**Next Action:** User tests Phase 0.3 compilation → then integrate into RHF/UHF (part 2/2)
 
 ---
 
@@ -322,8 +323,8 @@ All data contiguous → excellent cache locality!
 |-------|-------|------|------|--------|
 | **0** | **HPC Optimization** | **3-4d** | **3-5x** | **📍 ACTIVE** |
 | 0.1 | Aligned allocation | 1h | 10-30% | ✅ **DONE** |
-| 0.2 | Vectorize get_block | 4h | 10-20x | ✅ **TESTING** |
-| 0.3 | Contiguous multi-state | 2-3d | 2-3x | 📍 NEXT |
+| 0.2 | Vectorize get_block | 4h | 10-20x | ✅ **DONE** |
+| 0.3 | Contiguous multi-state | 2-3d | 2-3x | ⚙️ **IN PROGRESS** |
 | 1 | Matrix Containers | 10h | - | Pending |
 | 2 | Density Ops | 4h | - | Pending |
 | 3 | JK Multi-State | 6h | - | Pending |
