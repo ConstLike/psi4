@@ -3,6 +3,7 @@ list(APPEND sources
   frac.cc
   hf.cc
   mom.cc
+  multistate_matrix.cc
   rhf.cc
   rohf.cc
   sad.cc
