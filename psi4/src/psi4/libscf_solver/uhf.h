@@ -44,9 +44,10 @@ class UHF : public HF {
 
     std::shared_ptr<UV> potential_;
 
-    // Phase 0.3: Multi-state contiguous storage (opt-in)
-    bool use_multistate_matrices_;
-    std::shared_ptr<MultiStateMatrix> D_multi_;
+    // Phase 0.3: Multi-state contiguous storage for cache locality
+    std::shared_ptr<MultiStateMatrix> D_multi_;  // Da, Db as views
+    std::shared_ptr<MultiStateMatrix> F_multi_;  // Fa, Fb as views
+    std::shared_ptr<MultiStateMatrix> G_multi_;  // Ga, Gb as views
 
     double compute_initial_E() override;
 

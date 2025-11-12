@@ -102,17 +102,27 @@ void UHF::common_init() {
     step_scale_ = options_.get_double("FOLLOW_STEP_SCALE");
     step_increment_ = options_.get_double("FOLLOW_STEP_INCREMENT");
 
-    Fa_ = SharedMatrix(factory_->create_matrix("F alpha"));
-    Fb_ = SharedMatrix(factory_->create_matrix("F beta"));
-    Da_ = SharedMatrix(factory_->create_matrix("SCF alpha density"));
-    Db_ = SharedMatrix(factory_->create_matrix("SCF beta density"));
+    // Phase 0.3: Create contiguous storage for alpha/beta matrices (cache locality!)
+    D_multi_ = std::make_shared<MultiStateMatrix>("D", 2, nirrep_, nsopi_, nsopi_, 0);
+    F_multi_ = std::make_shared<MultiStateMatrix>("F", 2, nirrep_, nsopi_, nsopi_, 0);
+    G_multi_ = std::make_shared<MultiStateMatrix>("G", 2, nirrep_, nsopi_, nsopi_, 0);
+
+    // Da_/Db_/Fa_/Fb_/Ga_/Gb_ are VIEWS into contiguous storage (no separate allocation!)
+    Da_ = D_multi_->get(0);  // Alpha density
+    Db_ = D_multi_->get(1);  // Beta density
+    Fa_ = F_multi_->get(0);  // Alpha Fock
+    Fb_ = F_multi_->get(1);  // Beta Fock
+    Ga_ = G_multi_->get(0);  // Alpha G matrix
+    Gb_ = G_multi_->get(1);  // Beta G matrix
+
+    // Old densities for DIIS (separate allocation is OK)
     Da_old_ = SharedMatrix(factory_->create_matrix("Old alpha SCF density"));
     Db_old_ = SharedMatrix(factory_->create_matrix("Old beta SCF density"));
+
+    // Other matrices (not in contiguous storage)
     Lagrangian_ = SharedMatrix(factory_->create_matrix("Lagrangian"));
     Ca_ = SharedMatrix(factory_->create_matrix("alpha MO coefficients (C)"));
     Cb_ = SharedMatrix(factory_->create_matrix("beta MO coefficients (C)"));
-    Ga_ = SharedMatrix(factory_->create_matrix("G alpha"));
-    Gb_ = SharedMatrix(factory_->create_matrix("G beta"));
     Va_ = SharedMatrix(factory_->create_matrix("V alpha"));
     Vb_ = SharedMatrix(factory_->create_matrix("V beta"));
     J_ = SharedMatrix(factory_->create_matrix("J total"));
@@ -120,13 +130,6 @@ void UHF::common_init() {
     Kb_ = SharedMatrix(factory_->create_matrix("K beta"));
     wKa_ = SharedMatrix(factory_->create_matrix("wK alpha"));
     wKb_ = SharedMatrix(factory_->create_matrix("wK beta"));
-
-    // Phase 0.3: Multi-state contiguous storage (opt-in)
-    use_multistate_matrices_ = options_.get_bool("USE_MULTISTATE_MATRICES");
-    if (use_multistate_matrices_) {
-        D_multi_ = std::make_shared<MultiStateMatrix>("D (multi-state)", 2, nirrep_, nsopi_, nsopi_, 0);
-        outfile->Printf("  Using MultiStateMatrix for alpha/beta densities (Phase 0.3 HPC optimization)\n");
-    }
 
     epsilon_a_ = SharedVector(factory_->create_vector());
     epsilon_a_->set_name("alpha orbital energies");
@@ -330,53 +333,26 @@ void UHF::form_C(double shift) {
 }
 
 void UHF::form_D() {
-    if (use_multistate_matrices_) {
-        // Phase 0.3: Use contiguous multi-state storage (2-3x cache locality improvement!)
-        D_multi_->zero_all();
-        SharedMatrix D_alpha = D_multi_->get(0);  // State 0 = alpha
-        SharedMatrix D_beta = D_multi_->get(1);   // State 1 = beta
+    // Phase 0.3: Da_/Db_ are views into contiguous storage
+    // Zero all states efficiently with single memset
+    D_multi_->zero_all();
 
-        for (int h = 0; h < nirrep_; ++h) {
-            int nso = nsopi_[h];
-            int nmo = nmopi_[h];
-            int na = nalphapi_[h];
-            int nb = nbetapi_[h];
+    for (int h = 0; h < nirrep_; ++h) {
+        int nso = nsopi_[h];
+        int nmo = nmopi_[h];
+        int na = nalphapi_[h];
+        int nb = nbetapi_[h];
 
-            if (nso == 0 || nmo == 0) continue;
+        if (nso == 0 || nmo == 0) continue;
 
-            double** Ca = Ca_->pointer(h);
-            double** Cb = Cb_->pointer(h);
-            double** Da = D_alpha->pointer(h);
-            double** Db = D_beta->pointer(h);
+        double** Ca = Ca_->pointer(h);
+        double** Cb = Cb_->pointer(h);
+        double** Da = Da_->pointer(h);  // Points directly into D_multi_ contiguous storage
+        double** Db = Db_->pointer(h);  // Points directly into D_multi_ contiguous storage
 
-            C_DGEMM('N', 'T', nso, nso, na, 1.0, Ca[0], nmo, Ca[0], nmo, 0.0, Da[0], nso);
-            C_DGEMM('N', 'T', nso, nso, nb, 1.0, Cb[0], nmo, Cb[0], nmo, 0.0, Db[0], nso);
-        }
-
-        // Copy to Da_/Db_ for compatibility with rest of code
-        Da_->copy(D_alpha);
-        Db_->copy(D_beta);
-    } else {
-        // Original code path
-        Da_->zero();
-        Db_->zero();
-
-        for (int h = 0; h < nirrep_; ++h) {
-            int nso = nsopi_[h];
-            int nmo = nmopi_[h];
-            int na = nalphapi_[h];
-            int nb = nbetapi_[h];
-
-            if (nso == 0 || nmo == 0) continue;
-
-            double** Ca = Ca_->pointer(h);
-            double** Cb = Cb_->pointer(h);
-            double** Da = Da_->pointer(h);
-            double** Db = Db_->pointer(h);
-
-            C_DGEMM('N', 'T', nso, nso, na, 1.0, Ca[0], nmo, Ca[0], nmo, 0.0, Da[0], nso);
-            C_DGEMM('N', 'T', nso, nso, nb, 1.0, Cb[0], nmo, Cb[0], nmo, 0.0, Db[0], nso);
-        }
+        // DGEMM writes directly to contiguous memory (no copy needed!)
+        C_DGEMM('N', 'T', nso, nso, na, 1.0, Ca[0], nmo, Ca[0], nmo, 0.0, Da[0], nso);
+        C_DGEMM('N', 'T', nso, nso, nb, 1.0, Cb[0], nmo, Cb[0], nmo, 0.0, Db[0], nso);
     }
 
     if (debug_) {

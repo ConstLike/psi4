@@ -98,31 +98,33 @@ void RHF::common_init() {
 
     if (multiplicity_ != 1) throw PSIEXCEPTION("RHF: RHF reference is only for singlets.");
 
-    // Allocate matrix memory
-    Fa_ = SharedMatrix(factory_->create_matrix("F"));
-    Fb_ = Fa_;
+    // Phase 0.3: Create contiguous storage (n=1 for RHF, but benefits from 64-byte alignment)
+    D_multi_ = std::make_shared<MultiStateMatrix>("D", 1, nirrep_, nsopi_, nsopi_, 0);
+    F_multi_ = std::make_shared<MultiStateMatrix>("F", 1, nirrep_, nsopi_, nsopi_, 0);
+    G_multi_ = std::make_shared<MultiStateMatrix>("G", 1, nirrep_, nsopi_, nsopi_, 0);
+
+    // Da_/Fa_/G_ are VIEWS into contiguous storage
+    Da_ = D_multi_->get(0);
+    Db_ = Da_;  // RHF: beta = alpha
+    Fa_ = F_multi_->get(0);
+    Fb_ = Fa_;  // RHF: beta = alpha
+    G_ = G_multi_->get(0);
+
+    // Orbitals
     Ca_ = SharedMatrix(factory_->create_matrix("MO coefficients (C)"));
     Cb_ = Ca_;
     epsilon_a_ = SharedVector(factory_->create_vector());
     epsilon_a_->set_name("orbital energies");
     epsilon_b_ = epsilon_a_;
-    Da_ = SharedMatrix(factory_->create_matrix("SCF density"));
-    Db_ = Da_;
+
+    // Other matrices
     Lagrangian_ = SharedMatrix(factory_->create_matrix("X"));
     Dold_ = SharedMatrix(factory_->create_matrix("D old"));
     Va_ = SharedMatrix(factory_->create_matrix("V"));
     Vb_ = Va_;
-    G_ = SharedMatrix(factory_->create_matrix("G"));
     J_ = SharedMatrix(factory_->create_matrix("J"));
     K_ = SharedMatrix(factory_->create_matrix("K"));
     wK_ = SharedMatrix(factory_->create_matrix("wK"));
-
-    // Phase 0.3: Multi-state contiguous storage (opt-in)
-    use_multistate_matrices_ = options_.get_bool("USE_MULTISTATE_MATRICES");
-    if (use_multistate_matrices_) {
-        D_multi_ = std::make_shared<MultiStateMatrix>("D (multi-state)", 1, nirrep_, nsopi_, nsopi_, 0);
-        outfile->Printf("  Using MultiStateMatrix for density (Phase 0.3 HPC optimization)\n");
-    }
 
     same_a_b_dens_ = true;
     same_a_b_orbs_ = true;
@@ -284,42 +286,22 @@ void RHF::form_C(double shift) {
 }
 
 void RHF::form_D() {
-    if (use_multistate_matrices_) {
-        // Phase 0.3: Use contiguous multi-state storage
-        D_multi_->zero_all();
-        SharedMatrix D_state0 = D_multi_->get(0);
+    // Phase 0.3: Da_ is a view into contiguous storage
+    // Zero efficiently with single memset
+    D_multi_->zero_all();
 
-        for (int h = 0; h < nirrep_; ++h) {
-            int nso = nsopi_[h];
-            int nmo = nmopi_[h];
-            int na = nalphapi_[h];
+    for (int h = 0; h < nirrep_; ++h) {
+        int nso = nsopi_[h];
+        int nmo = nmopi_[h];
+        int na = nalphapi_[h];
 
-            if (nso == 0 || nmo == 0) continue;
+        if (nso == 0 || nmo == 0) continue;
 
-            auto Ca = Ca_->pointer(h);
-            auto D = D_state0->pointer(h);
+        auto Ca = Ca_->pointer(h);
+        auto D = Da_->pointer(h);  // Points directly into D_multi_ contiguous storage
 
-            C_DGEMM('N', 'T', nso, nso, na, 1.0, Ca[0], nmo, Ca[0], nmo, 0.0, D[0], nso);
-        }
-
-        // Copy to Da_ for compatibility with rest of code
-        Da_->copy(D_state0);
-    } else {
-        // Original code path
-        Da_->zero();
-
-        for (int h = 0; h < nirrep_; ++h) {
-            int nso = nsopi_[h];
-            int nmo = nmopi_[h];
-            int na = nalphapi_[h];
-
-            if (nso == 0 || nmo == 0) continue;
-
-            auto Ca = Ca_->pointer(h);
-            auto D = Da_->pointer(h);
-
-            C_DGEMM('N', 'T', nso, nso, na, 1.0, Ca[0], nmo, Ca[0], nmo, 0.0, D[0], nso);
-        }
+        // DGEMM writes directly to contiguous memory (no copy needed!)
+        C_DGEMM('N', 'T', nso, nso, na, 1.0, Ca[0], nmo, Ca[0], nmo, 0.0, D[0], nso);
     }
 
     if (debug_) {

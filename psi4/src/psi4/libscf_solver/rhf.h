@@ -50,9 +50,10 @@ class RHF : public HF {
 
     std::shared_ptr<RV> potential_;
 
-    // Phase 0.3: Multi-state contiguous storage (opt-in)
-    bool use_multistate_matrices_;
-    std::shared_ptr<MultiStateMatrix> D_multi_;
+    // Phase 0.3: Contiguous storage for aligned memory (n=1 for RHF, but same infrastructure)
+    std::shared_ptr<MultiStateMatrix> D_multi_;  // Da as view
+    std::shared_ptr<MultiStateMatrix> F_multi_;  // Fa as view
+    std::shared_ptr<MultiStateMatrix> G_multi_;  // G as view
 
     double compute_initial_E() override;
 
