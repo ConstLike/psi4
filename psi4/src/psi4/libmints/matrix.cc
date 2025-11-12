@@ -3564,7 +3564,17 @@ namespace detail {
 double **matrix(int nrow, int ncol) {
     double **mat = (double **)malloc(sizeof(double *) * nrow);
     const size_t size = sizeof(double) * nrow * (size_t)ncol;
-    mat[0] = (double *)malloc(size);
+
+    // Use aligned allocation for SIMD/cache line optimization (AVX-512 + cache line = 64 bytes)
+    constexpr size_t CACHE_LINE_SIZE = 64;
+    void* aligned_ptr = nullptr;
+    int ret = posix_memalign(&aligned_ptr, CACHE_LINE_SIZE, size);
+    if (ret != 0) {
+        ::free(mat);
+        throw PSIEXCEPTION("posix_memalign failed in Matrix::detail::matrix");
+    }
+    mat[0] = (double *)aligned_ptr;
+
     ::memset((void *)mat[0], 0, size);
     for (int r = 1; r < nrow; ++r) mat[r] = mat[r - 1] + ncol;
     return mat;
