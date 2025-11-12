@@ -7,6 +7,7 @@ list(APPEND sources
   rhf.cc
   rohf.cc
   sad.cc
+  scf_engine.cc
   uhf.cc
   )
 psi4_add_module(lib scf_solver sources)

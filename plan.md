@@ -65,7 +65,52 @@ Db_ = D_multi_->get(1);  // View into [N...2N]
 
 **Phase 0 COMPLETE:** +15.9% confirmed on realistic molecules! Ready for Phase 1.
 
-**Next:** Phase 1 - Architectural refactoring with optimized infrastructure
+---
+
+## Multi-Cycle SCF Architecture (NEW!)
+
+**Status:** Layer 1 - Foundation (IN PROGRESS) 🚧
+
+**Goal:** Build multi-cycle SCF engine capable of simultaneously converging multiple Fock matrices with shared JK computation.
+
+**Architecture Documents:**
+- `skelet.md` - Abstract pseudocode skeleton (theory-agnostic design)
+- `skelet_psi4.md` - Psi4-specific implementation plan (6 layers)
+
+**Implementation Progress:**
+
+### Layer 1: SCFEngine Foundation ✅ (AWAITING USER TEST)
+
+**Implemented:**
+- ✅ `scf_engine.h` - Base SCFEngine class with iteration coordination
+- ✅ `scf_engine.cc` - Implementation using existing HF virtual methods
+- ✅ Added to CMakeLists.txt
+
+**Features:**
+- Coordinates SCF iterations via HF virtual methods (form_G, form_F, form_C, form_D)
+- Theory-independent convergence checking (energy + density RMS)
+- Non-breaking: opt-in, doesn't modify existing RHF/UHF code
+- Foundation for multi-state and multi-cycle extensions
+
+**Design:**
+```cpp
+class SCFEngine {
+    HF* theory_;  // Uses existing RHF/UHF/etc via virtual methods
+
+    virtual int iterate() {
+        while (iteration_ < max && !converged_) {
+            iterate_step();      // Calls theory->form_G/F/C/D()
+            check_convergence(); // Energy + density RMS
+        }
+    }
+};
+```
+
+**Next Steps:**
+1. **User:** Create build directory, compile with ninja
+2. **User:** Test with existing RHF/UHF to verify non-breaking
+3. **User:** Report compilation status and test results
+4. **If successful:** Proceed to Layer 2 (multi-state support)
 
 ---
 
