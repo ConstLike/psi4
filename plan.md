@@ -2,42 +2,35 @@
 
 ## Overview
 
-**Goal:** Refactor Psi4 SCF to separate theory (Fock formation) from convergence algorithm, enabling clean implementation of advanced methods like REKS (Restricted Ensemble Kohn-Sham).
+**Goal:** Maximize SCF performance and enable REKS implementation through HPC-aware architecture.
 
-**Strategy:** **Bottom-up incremental refactoring** - from small, safe changes to complete architecture.
-Each step: Claude modifies code → commits → pushes; User compiles → tests → validates.
+**Strategy:**
+1. **Phase 0:** HPC optimization (aligned memory, cache-aware operations) - **START HERE** 🔥
+2. **Phase 1-6:** Incremental refactoring to multi-Fock architecture
 
-**Key Innovation:** Multi-Fock architecture with **shared JK contraction** for efficiency.
+Each step: Claude codes → commits → pushes; User compiles → tests → validates on **kk/refactor_scf** branch.
+
+**Key Innovation:** Multi-state architecture with shared JK contraction + HPC-optimized memory layout.
 
 ## Workflow & Roles
 
-**Claude (AI) - "The Hands":**
-- Modifies code (C++, Python, CMake)
-- Commits and pushes changes
-- **DOES NOT:** compile, run tests, create test files
+**Claude (AI):** Modifies code, commits, pushes (does NOT compile/test)
+**User:** Pulls, compiles (`cd build && ninja psi4`), tests, reports results
 
-**User - "The Tester/Validator":**
-- Pulls changes on chc2 server
-- Compiles: `cd build && ninja psi4`
-- Runs comprehensive test suite (covers ALL SCF features: RHF/UHF/ROHF, all DFT functionals, all SCF types, all options)
-- Reports: "✅ Success" or "❌ Error: [details]"
-
-**Key:** User's test suite is production-ready and comprehensive. Trust user's validation completely.
+**Branch:** `kk/refactor_scf` ← **ACTIVE DEVELOPMENT**
 
 ---
 
 ## Current Status
 
-**Phase:** Planning & Analysis ✅
-
-**Branch:** `claude/improve-scf-code-refactor-011CUySHMdVr9aeEhprxf6EJ`
+**Phase:** 0 - HPC Performance Optimization 🔥
 
 **Completed:**
-- ✅ Phase 0.0: DEBUG output added to RHF, UHF, ROHF (validated by user)
-- ✅ Code analysis: current structure understood
-- ✅ New refactoring plan formulated (bottom-up, multi-Fock)
+- ✅ Code analysis: Matrix class, BLAS integration, memory layout
+- ✅ Identified bottlenecks: alignment (10-30%), get_block (10-20x), cache locality (2-3x)
+- ✅ HPC optimization plan formulated
 
-**Next Action:** Begin Phase 1 - Matrix Containers
+**Next Action:** Phase 0.1 - Aligned memory allocation
 
 ---
 
@@ -104,469 +97,323 @@ F_b = H + (J_a + J_b) - K_b
 
 ---
 
-## Phases Overview
+---
 
-### Phase 1: Matrix Containers (Encapsulation)
-**Goal:** Wrap ALL SCF matrices in multi-state containers
+## Phase 0: HPC Performance Optimization 🔥 **PRIORITY**
 
-**1.1 Create `MultiStateMatrix` class**
-- Wrapper for N matrices: `states_[i] → SharedMatrix` for i=0..N-1
-- Methods: `get(i)`, `set(i, M)`, `n_states()`, `zero_all()`, `copy_all_from()`
-- Location: `psi4/src/psi4/libscf_solver/multistate_matrix.h`
-- Test: compile only, not used yet
+**Goal:** Maximize Matrix operations performance (3-5x speedup for multi-state)
 
-**1.2 Add `MultiStateMatrix` for density in RHF (opt-in)**
-- Add member: `std::shared_ptr<MultiStateMatrix> density_msm_;` (n_states=1)
-- Add flag: `bool use_multistate_density_ = false;`
-- In `form_D()`: if flag set, sync `density_msm_->get(0)` ↔ `Da_`
-- Test: both paths work
+### Critical Findings from Code Analysis
 
-**1.3 Add `MultiStateMatrix` for Fock in RHF (opt-in)**
-- Add member: `std::shared_ptr<MultiStateMatrix> fock_msm_;` (n_states=1)
-- In `form_F()`: if flag set, sync `fock_msm_->get(0)` ↔ `Fa_`
-- Test: both paths work
+| Issue | Current | Impact | Fix |
+|-------|---------|--------|-----|
+| **Memory alignment** | `malloc()` ~16 bytes | -10-30% BLAS | `posix_memalign(64)` |
+| **get_block() copy** | Element-wise O(n²) | -10-20x | `memcpy` per row |
+| **Multi-state layout** | Separate allocations | -2-3x cache miss | Contiguous storage |
+| **Cache blocking** | None | -30-50% (large) | Tiled DGEMM |
 
-**1.4 Add `MultiStateMatrix` for C, epsilon in RHF (opt-in)**
-- Orbitals: `orbitals_msm_` → contains `Ca_`
-- Energies: `epsilon_msm_` → contains `epsilon_a_`
-- Test: both paths work
-
-**1.5 Switch RHF to `MultiStateMatrix` fully**
-- Remove opt-in flags, use only `*_msm_` members
-- Create aliases: `SharedMatrix& Da_ = density_msm_->get(0);` for compatibility
-- Test: all RHF tests pass
-
-**1.6 Switch UHF to `MultiStateMatrix` (n_states=2)**
-- `density_msm_(2)`: states[0]=Da, states[1]=Db
-- `fock_msm_(2)`: states[0]=Fa, states[1]=Fb
-- `orbitals_msm_(2)`: states[0]=Ca, states[1]=Cb
-- Test: all UHF tests pass
-
-**Time:** ~8-10 hours | **Risk:** LOW (pure wrapping, no logic change)
+**Total potential:** **3-5x overall speedup** for REKS/multi-state operations
 
 ---
 
-### Phase 2: Density Operations (Extraction)
-**Goal:** Extract density formation into standalone functions
+### 0.1: Aligned Memory Allocation ⚡ **QUICK WIN**
 
-**2.1 Create `density_builder.h/cc`**
-- Function: `build_density_from_orbitals(C, nocc_pi, D_out)`
-- Uses DGEMM: `D = C_occ × C_occ^T`
-- Location: `psi4/src/psi4/libscf_solver/density_builder.h`
-- Test: unit test (standalone)
+**Time:** 1 hour | **Gain:** 10-30% BLAS performance
 
-**2.2 Use `build_density_from_orbitals` in RHF**
+**Problem:**
 ```cpp
-void RHF::form_D() {
-    density_ops::build_density_from_orbitals(
-        orbitals_msm_->get(0), nalphapi_, density_msm_->get(0));
+// matrix.cc:461 - Current code
+double* block = (double*)malloc(nrows * ncols * sizeof(double));
+// malloc() gives ~16 byte alignment
+// AVX-512 needs 64 bytes (cache line size)
+```
+
+**Solution:**
+```cpp
+// matrix.cc:461 - New code
+static constexpr size_t CACHE_LINE_SIZE = 64;  // x86-64 standard
+
+double* block = nullptr;
+int ret = posix_memalign((void**)&block, CACHE_LINE_SIZE,
+                         nrows * ncols * sizeof(double));
+if (ret != 0) {
+    throw PSIEXCEPTION("posix_memalign failed");
 }
 ```
-- Test: all RHF tests pass
 
-**2.3 Use `build_density_from_orbitals` in UHF**
+**Files to modify:**
+- `psi4/src/psi4/libmints/matrix.cc:461` (Matrix::alloc)
+- `psi4/src/psi4/libmints/matrix.cc:3562` (linalg::detail::matrix)
+
+**Cache line size:** Hardcoded 64 bytes (Intel/AMD/ARM standard). Could use runtime:
 ```cpp
-void UHF::form_D() {
-    for (int s = 0; s < 2; ++s) {
-        density_ops::build_density_from_orbitals(
-            orbitals_msm_->get(s),
-            s == 0 ? nalphapi_ : nbetapi_,
-            density_msm_->get(s));
-    }
-}
+// Optional: runtime detection (overkill)
+#include <unistd.h>
+size_t cache_line = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);  // Usually 64
 ```
-- Test: all UHF tests pass
+But 64 is safe for 99.9% of systems.
 
-**Time:** ~4 hours | **Risk:** LOW (simple extraction)
+**Test:** Compile + run RHF/UHF tests. Performance should improve 10-30% on DGEMM-heavy systems.
 
 ---
 
-### Phase 3: JK Operations (Multi-State Contraction)
-**Goal:** Single JK call for ALL densities, store results in `JKContainer`
+### 0.2: Vectorize get_block() ⚡⚡ **CRITICAL**
 
-**3.1 Create `JKContainer` class**
-- Stores J[i], K[i], wK[i] for i=0..N-1
-- Methods: `get_J(i)`, `get_K(i)`, `get_wK(i)`, `n_states()`
-- Location: `psi4/src/psi4/libscf_solver/jk_container.h`
+**Time:** 4 hours | **Gain:** 10-20x for subset operations
 
-**3.2 Create `compute_jk_multistate()` function**
+**Problem:**
 ```cpp
-void compute_jk_multistate(
-    std::shared_ptr<JK> jk,
-    const std::vector<SharedMatrix>& C_occ_list,  // [C_a_occ, C_b_occ, ...]
-    JKContainer& jk_results  // output: J[i], K[i], wK[i]
-) {
-    jk->C_left().clear();
-    for (const auto& C : C_occ_list) {
-        jk->C_left().push_back(C);
-    }
-    jk->compute();  // ONE CALL FOR ALL!
-
-    for (int i = 0; i < C_occ_list.size(); ++i) {
-        jk_results.set_J(jk->J()[i], i);
-        jk_results.set_K(jk->K()[i], i);
-        if (jk->wK().size() > 0) {
-            jk_results.set_wK(jk->wK()[i], i);
-        }
+// matrix.cc:666 - Current code (DISASTER!)
+for (int p = 0; p < max_p; p++) {
+    for (int q = 0; q < max_q; q++) {
+        double val = get(h, p + rows_begin[h], q + cols_begin[h]);
+        block->set(h, p, q, val);  // Element-wise! O(n²) operations!
     }
 }
+// Used in Ca_subset("SO", "OCC") → EVERY SCF ITERATION!
 ```
-- Test: unit test
 
-**3.3 Use in RHF::form_G() (opt-in)**
+**Solution:**
 ```cpp
-void RHF::form_G() {
-    auto C_occ = Ca_subset("SO", "OCC");
-    JKContainer jk_results(1);  // 1 state
-    jk_ops::compute_jk_multistate(jk_, {C_occ}, jk_results);
+// matrix.cc:666 - New code
+for (int h = 0; h < nirrep_; ++h) {
+    if (rows_per_h[h] == 0 || cols_per_h[h] == 0) continue;
 
-    G_->zero();
-    if (functional_->needs_xc()) { G_->add(Va_); }
-    G_->axpy(2.0, jk_results.get_J(0));
-    G_->axpy(-alpha, jk_results.get_K(0));
+    const int row_offset = rows_begin[h];
+    const int col_offset = cols_begin[h];
+    const size_t bytes_per_row = cols_per_h[h] * sizeof(double);
+
+    // Vectorized memcpy per row (10-20x faster!)
+    for (int i = 0; i < rows_per_h[h]; ++i) {
+        std::memcpy(&block->matrix_[h][i][0],
+                   &matrix_[h][i + row_offset][col_offset],
+                   bytes_per_row);
+    }
 }
 ```
-- Test: RHF passes
 
-**3.4 Use in UHF::form_G() - KEY OPTIMIZATION!**
-```cpp
-void UHF::form_G() {
-    auto Ca_occ = Ca_subset("SO", "OCC");
-    auto Cb_occ = Cb_subset("SO", "OCC");
+**Files to modify:**
+- `psi4/src/psi4/libmints/matrix.cc:666` (Matrix::get_block)
+- Similar pattern in other block operations
 
-    JKContainer jk_results(2);  // 2 states
-    jk_ops::compute_jk_multistate(jk_, {Ca_occ, Cb_occ}, jk_results);  // ONE CALL!
-
-    // J_total = J_a + J_b
-    auto J_total = jk_results.get_J(0)->clone();
-    J_total->add(jk_results.get_J(1));
-
-    // F_a = H + J_total - K_a
-    // F_b = H + J_total - K_b
-    Ga_->copy(Va_);
-    Ga_->add(J_total);
-    Ga_->axpy(-alpha, jk_results.get_K(0));
-
-    Gb_->copy(Vb_);
-    Gb_->add(J_total);
-    Gb_->axpy(-alpha, jk_results.get_K(1));
-}
-```
-- Test: UHF passes, **verify performance gain!**
-
-**Time:** ~6 hours | **Risk:** MEDIUM (core performance optimization)
+**Test:** Benchmark `Ca_subset("SO", "OCC")` - should be 10-20x faster.
 
 ---
 
-### Phase 4: Fock Operations (Assembly)
-**Goal:** Standardize Fock = H + G + V_ext construction
+### 0.3: Multi-State Contiguous Storage ⚡⚡⚡ **GAME CHANGER**
 
-**4.1 Create `build_fock_from_components()` function**
-```cpp
-void build_fock_from_components(
-    const SharedMatrix& H,
-    const SharedMatrix& G,
-    const std::vector<SharedMatrix>& external_pots,
-    SharedMatrix& F_out
-) {
-    F_out->copy(H);
-    F_out->add(G);
-    for (const auto& V : external_pots) { F_out->add(V); }
-}
-```
-- Location: `psi4/src/psi4/libscf_solver/fock_builder.h`
+**Time:** 2-3 days | **Gain:** 2-3x for multi-state (REKS critical!)
 
-**4.2 Use in RHF::form_F()**
+**Problem:**
 ```cpp
-void RHF::form_F() {
-    fock_ops::build_fock_from_components(H_, G_, external_potentials_, Fa_);
-}
+// Current UHF: Da and Db in different memory locations
+SharedMatrix Da_;  // address: 0x1000
+SharedMatrix Db_;  // address: 0x9000 (8KB+ gap!)
+// Access pattern: Da[i] → Db[i] → CACHE MISS every time!
 ```
 
-**4.3 Use in UHF::form_F()**
+**Solution: MultiStateMatrix with contiguous storage**
+
 ```cpp
-void UHF::form_F() {
-    fock_ops::build_fock_from_components(H_, Ga_, external_potentials_, Fa_);
-    fock_ops::build_fock_from_components(H_, Gb_, external_potentials_, Fb_);
-}
-```
-- Test: RHF, UHF pass
+// New file: psi4/src/psi4/libscf_solver/multistate_matrix.h
 
-**Time:** ~3 hours | **Risk:** LOW
+class MultiStateMatrix {
+    int n_states_;
+    int nirrep_;
+    std::vector<Dimension> rowspi_;
+    std::vector<Dimension> colspi_;
 
----
+    // KEY: Single aligned allocation for ALL states
+    double* data_contiguous_;
+    size_t total_elements_;
 
-### Phase 5: Theory Abstraction (FockTheory Interface)
-**Goal:** Encapsulate theory-specific logic (RHF/UHF/REKS) behind interface
-
-**5.1 Create `FockTheory` abstract base class**
-```cpp
-class FockTheory {
-public:
-    virtual ~FockTheory() = default;
-
-    virtual int n_states() const = 0;  // 1, 2, N
-
-    virtual void build_all_densities(
-        const MultiStateMatrix& orbitals,
-        const std::vector<Dimension>& nocc,
-        MultiStateMatrix& densities_out
-    ) = 0;
-
-    virtual void build_all_focks(
-        std::shared_ptr<JK> jk,
-        std::shared_ptr<VBase> potential,
-        const MultiStateMatrix& densities,
-        const MultiStateMatrix& orbitals,
-        const SharedMatrix& H,
-        const std::vector<SharedMatrix>& external_pots,
-        MultiStateMatrix& focks_out
-    ) = 0;
-};
-```
-
-**5.2 Implement `RHFTheory : public FockTheory`**
-```cpp
-class RHFTheory : public FockTheory {
-    int n_states() const override { return 1; }
-
-    void build_all_densities(...) override {
-        density_ops::build_density_from_orbitals(
-            orbitals.get(0), nocc[0], densities_out.get(0));
-    }
-
-    void build_all_focks(...) override {
-        // 1. Compute JK (1 state)
-        auto C_occ = extract_occupied(orbitals.get(0), nocc[0]);
-        JKContainer jk_results(1);
-        jk_ops::compute_jk_multistate(jk, {C_occ}, jk_results);
-
-        // 2. Build G = V_xc + 2J - αK
-        auto G = focks_out.get(0);
-        G->zero();
-        if (potential) { /* add V_xc */ }
-        G->axpy(2.0, jk_results.get_J(0));
-        G->axpy(-alpha, jk_results.get_K(0));
-
-        // 3. F = H + G + V_ext
-        fock_ops::build_fock_from_components(H, G, external_pots, focks_out.get(0));
-    }
-};
-```
-
-**5.3 Implement `UHFTheory : public FockTheory`**
-```cpp
-class UHFTheory : public FockTheory {
-    int n_states() const override { return 2; }
-
-    void build_all_densities(...) override {
-        for (int s = 0; s < 2; ++s) {
-            density_ops::build_density_from_orbitals(
-                orbitals.get(s), nocc[s], densities_out.get(s));
-        }
-    }
-
-    void build_all_focks(...) override {
-        // 1. Compute JK (2 states) - ONE CALL!
-        auto Ca_occ = extract_occupied(orbitals.get(0), nocc[0]);
-        auto Cb_occ = extract_occupied(orbitals.get(1), nocc[1]);
-        JKContainer jk_results(2);
-        jk_ops::compute_jk_multistate(jk, {Ca_occ, Cb_occ}, jk_results);
-
-        // 2. J_total = J_a + J_b
-        auto J_total = jk_results.get_J(0)->clone();
-        J_total->add(jk_results.get_J(1));
-
-        // 3. Build Ga, Gb
-        // Ga = V_xc_a + J_total - αK_a
-        // Gb = V_xc_b + J_total - αK_b
-        // ...
-
-        // 4. Fa = H + Ga, Fb = H + Gb
-        fock_ops::build_fock_from_components(H, Ga, external_pots, focks_out.get(0));
-        fock_ops::build_fock_from_components(H, Gb, external_pots, focks_out.get(1));
-    }
-};
-```
-
-**5.4 Integrate `FockTheory` into RHF (opt-in)**
-```cpp
-// In rhf.h
-protected:
-    std::shared_ptr<FockTheory> fock_theory_;
-    bool use_fock_theory_ = false;
-
-// In rhf.cc constructor
-fock_theory_ = std::make_shared<RHFTheory>();
-
-// In form_D(), form_F()
-if (use_fock_theory_) {
-    fock_theory_->build_all_densities(...);
-    fock_theory_->build_all_focks(...);
-} else {
-    // old path
-}
-```
-- Test: both paths work
-
-**5.5 Switch RHF to `FockTheory` fully**
-- Remove old `form_D()`, `form_G()`, `form_F()` code
-- Keep only `fock_theory_->build_all_*()` calls
-- Test: all RHF tests pass
-
-**5.6 Switch UHF to `FockTheory` fully**
-- Test: all UHF tests pass
-
-**Time:** ~12 hours | **Risk:** MEDIUM-HIGH (major refactor)
-
----
-
-### Phase 6: SCF Driver (Algorithm Separation)
-**Goal:** Extract convergence logic from HF into standalone driver
-
-**6.1 Create `SCFDriver` class**
-```cpp
-class SCFDriver {
-    std::shared_ptr<FockTheory> theory_;
-    std::shared_ptr<DIISManager> diis_;
-    double E_convergence_;
-    double D_convergence_;
+    // Views (SharedMatrix) pointing into data_contiguous_
+    std::vector<SharedMatrix> state_views_;
 
 public:
-    double iterate_to_convergence() {
-        for (int iter = 0; iter < max_iter_; ++iter) {
-            // 1. Build densities
-            theory_->build_all_densities(...);
+    MultiStateMatrix(const std::string& name, int n_states,
+                     int nirrep, const std::vector<Dimension>& dims);
 
-            // 2. Build Focks
-            theory_->build_all_focks(...);
+    ~MultiStateMatrix() {
+        if (data_contiguous_) free(data_contiguous_);
+    }
 
-            // 3. DIIS extrapolation
-            if (diis_) { diis_->extrapolate(...); }
+    // Access
+    SharedMatrix get(int state) const { return state_views_[state]; }
+    int n_states() const { return n_states_; }
 
-            // 4. Diagonalize
-            for (int s = 0; s < theory_->n_states(); ++s) {
-                diagonalize_fock(focks_.get(s), orbitals_.get(s), epsilon_.get(s));
-            }
+    // Contiguous pointer for advanced operations
+    double* contiguous_data() { return data_contiguous_; }
 
-            // 5. Compute energy
-            double E = theory_->compute_energy(...);
-
-            // 6. Check convergence
-            if (converged(E, D)) break;
-        }
+    // Zero all states efficiently
+    void zero_all() {
+        std::memset(data_contiguous_, 0, total_elements_ * sizeof(double));
     }
 };
 ```
 
-**6.2 Integrate into RHF (opt-in)**
-**6.3 Switch RHF to SCFDriver fully**
-**6.4 Switch UHF to SCFDriver fully**
+**Memory layout:**
+```
+Single allocation:
+[State0_h0_data][State0_h1_data]...[State1_h0_data][State1_h1_data]...
+^                                  ^
+Da (view)                          Db (view)
 
-**Time:** ~10 hours | **Risk:** HIGH (complete separation)
+All data contiguous → excellent cache locality!
+```
+
+**Files to create:**
+- `psi4/src/psi4/libscf_solver/multistate_matrix.h`
+- `psi4/src/psi4/libscf_solver/multistate_matrix.cc`
+- Update `CMakeLists.txt`
+
+**Integration:** Phase 1 will use this in RHF/UHF
+
+**Test:** Benchmark multi-state operations - expect 2-3x speedup vs separate matrices.
+
+---
+
+### 0.4: Cache-Aware Tiling (Optional, later)
+
+**Time:** 1-2 weeks | **Gain:** 30-50% for large systems (>500 basis functions)
+
+**Idea:** Block DGEMM to fit in L2 cache (typical: 256KB → tile ~128x128)
+
+**Status:** Defer to Phase 2 or later. Profile first to confirm benefit.
+
+---
+
+## Phase 0 Summary
+
+| Step | Time | Gain | Priority | Status |
+|------|------|------|----------|--------|
+| **0.1 Aligned allocation** | 1h | 10-30% | ⚠️ HIGH | 📍 NEXT |
+| **0.2 Vectorize get_block** | 4h | 10-20x | ⚠️ CRITICAL | Pending |
+| **0.3 Contiguous multi-state** | 2-3d | 2-3x | ⚠️ CRITICAL | Pending |
+| **0.4 Cache tiling** | 1-2w | 30-50% | MEDIUM | Deferred |
+| **Total Phase 0** | ~3-4 days | **3-5x overall** | - | 0% |
+
+**After Phase 0:** Matrix infrastructure optimized, ready for refactoring.
+
+---
+
+## Phases 1-6: SCF Refactoring (Brief Overview)
+
+**After Phase 0 HPC optimization**, we proceed with architectural refactoring:
+
+**Phase 1:** Matrix Containers (10h) - Use MultiStateMatrix from Phase 0.3 in RHF/UHF
+**Phase 2:** Density Operations (4h) - Extract `form_D()` to standalone functions
+**Phase 3:** JK Multi-State (6h) - Systematize shared JK contraction (UHF already does this)
+**Phase 4:** Fock Assembly (3h) - Standardize F = H + G + V_ext
+**Phase 5:** Theory Abstraction (12h) - FockTheory interface (RHF/UHF/REKS)
+**Phase 6:** SCF Driver (10h) - Separate convergence algorithm from theory
+
+**Total:** ~45 hours after Phase 0
+
+**Detailed plan:** See IMPLEMENTATION_PLAN.md (old version, needs update after Phase 0)
 
 ---
 
 ## Implementation Roadmap
 
-| Phase | Focus | Steps | Time | Risk | Status |
-|-------|-------|-------|------|------|--------|
-| 0 | Analysis | - | 2h | - | ✅ DONE |
-| 1 | Matrix Containers | 6 | 10h | LOW | 📍 NEXT |
-| 2 | Density Ops | 3 | 4h | LOW | Pending |
-| 3 | JK Ops (Multi-State!) | 4 | 6h | MED | Pending |
-| 4 | Fock Ops | 3 | 3h | LOW | Pending |
-| 5 | Theory Abstraction | 6 | 12h | MED-HIGH | Pending |
-| 6 | SCF Driver | 4 | 10h | HIGH | Pending |
-| **Total** | **RHF+UHF refactored** | **26** | **~45h** | - | 0% |
+| Phase | Focus | Time | Gain | Status |
+|-------|-------|------|------|--------|
+| **0** | **HPC Optimization** | **3-4d** | **3-5x** | **📍 ACTIVE** |
+| 0.1 | Aligned allocation | 1h | 10-30% | 📍 NEXT |
+| 0.2 | Vectorize get_block | 4h | 10-20x | Pending |
+| 0.3 | Contiguous multi-state | 2-3d | 2-3x | Pending |
+| 1 | Matrix Containers | 10h | - | Pending |
+| 2 | Density Ops | 4h | - | Pending |
+| 3 | JK Multi-State | 6h | - | Pending |
+| 4 | Fock Assembly | 3h | - | Pending |
+| 5 | Theory Abstraction | 12h | - | Pending |
+| 6 | SCF Driver | 10h | - | Pending |
+| **TOTAL** | **All phases** | **~50h** | **3-5x** | **0%** |
 
 ---
 
 ## Success Criteria (User Validates)
 
-### Phase 1
-- [ ] `MultiStateMatrix` compiles
-- [ ] RHF with `*_msm_` passes all tests
-- [ ] UHF with `*_msm_` (n=2) passes all tests
+### Phase 0 ⭐ **PRIORITY**
+- [ ] **0.1:** Aligned allocation works, BLAS 10-30% faster
+- [ ] **0.2:** get_block() 10-20x faster, subset operations validated
+- [ ] **0.3:** MultiStateMatrix with contiguous storage, 2-3x speedup for multi-state
+- [ ] All RHF/UHF tests pass with exact energy match (< 1e-10)
+- [ ] **Performance validated:** User benchmarks show expected gains
 
-### Phase 2
-- [ ] Density formation extracted to standalone function
-- [ ] RHF, UHF use `density_ops::build_density_from_orbitals()`
-- [ ] All tests pass
-
-### Phase 3 ⭐ **KEY PHASE**
-- [ ] `JKContainer` works
-- [ ] UHF uses single JK call for both α and β
-- [ ] **Performance:** UHF JK time reduced by ~40-50%
-- [ ] All tests pass
-
-### Phase 4
-- [ ] Fock assembly standardized
-- [ ] All tests pass
-
-### Phase 5
-- [ ] `FockTheory` interface complete
-- [ ] `RHFTheory`, `UHFTheory` implemented
-- [ ] RHF, UHF use `FockTheory`
-- [ ] All tests pass, exact energy match (< 1e-10)
-
-### Phase 6
-- [ ] `SCFDriver` functional
-- [ ] RHF, UHF use `SCFDriver`
-- [ ] All tests pass
-- [ ] **Architecture ready for REKS!**
+### Phases 1-6 (After Phase 0)
+- [ ] Architecture refactored: FockTheory, SCFDriver, multi-Fock
+- [ ] All tests pass (< 1e-10 energy match)
+- [ ] REKS-ready architecture
+- [ ] Performance maintained or improved
 
 ---
 
 ## Next Steps
 
-**Immediate:**
-1. Review this plan with User
-2. Adjust if needed
-3. Begin Phase 1.1: Create `MultiStateMatrix`
-
-**Questions for User:**
-1. Agree with bottom-up approach (no HFNew)?
-2. Agree with multi-Fock architecture?
-3. Phase 3 (multi-state JK) is critical - concerns?
-4. Any missing aspects?
+**Immediate (Phase 0.1):**
+1. ✅ Plan approved: HPC optimization first
+2. Modify `matrix.cc:461` - aligned allocation
+3. Commit → push → User tests performance
+4. If successful → proceed to 0.2 (vectorize get_block)
 
 ---
 
-## Technical Notes
+## Technical Notes: HPC Details
 
-### Why Multi-State JK is Efficient
+### Cache Line Size
 
-**Current UHF:**
+**Standard:** 64 bytes for x86-64 (Intel, AMD), ARM
+**Detection (optional):**
 ```cpp
-// Two separate JK calls
-jk->C_left() = {Ca_occ};  jk->compute();  // ~T seconds
-jk->C_left() = {Cb_occ};  jk->compute();  // ~T seconds
-// Total: 2T
+#include <unistd.h>
+size_t cache_line = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
+```
+**Recommendation:** Hardcode 64 - universally safe
+
+### SIMD Alignment Requirements
+
+| Instruction Set | Alignment | Performance Loss if Misaligned |
+|-----------------|-----------|-------------------------------|
+| SSE | 16 bytes | -10% |
+| AVX | 32 bytes | -15-20% |
+| AVX-512 | 64 bytes | -20-30% |
+
+**Current:** `malloc()` gives ~16 bytes → losing AVX-512 performance
+
+### Memory Layout Comparison
+
+**Current (separate matrices):**
+```
+Memory: [Da_______gap______][Db_______gap______]
+Access: Da[i] → cache miss → Db[i] → cache miss
 ```
 
-**New UHF:**
-```cpp
-// Single JK call
-jk->C_left() = {Ca_occ, Cb_occ};  jk->compute();  // ~T seconds (not 2T!)
-// Total: T  (2x faster!)
+**Contiguous (MultiStateMatrix):**
+```
+Memory: [Da][Db] (adjacent)
+Access: Da[i] → Db[i] (likely in same cache line!)
+Speedup: 2-3x for alternating access patterns
 ```
 
-**Why?** JK internally:
-- Builds Schwarz screening once
-- Loops over shell quartets once
-- Contracts with multiple densities in inner loop (vectorized)
+### Why get_block() is Slow
 
-**Real-world check (current UHF):**
+**Element-wise (current):**
 ```cpp
-// In uhf.cc line 184-200
-std::vector<SharedMatrix>& C = jk_->C_left();
-C.clear();
-C.push_back(Ca_subset("SO", "OCC"));
-C.push_back(Cb_subset("SO", "OCC"));  // Already supports multi-state!
-jk_->compute();  // ONE call
+for (i) for (j)  // O(n²) operations
+    dst[i][j] = src[i+offset][j+offset];  // Individual set() calls
 ```
-✅ **Good news:** Current UHF already does this! But we'll systematize it for REKS.
+
+**memcpy (new):**
+```cpp
+for (i)  // O(n) operations
+    memcpy(&dst[i][0], &src[i+offset][offset], n_cols * 8);  // Hardware-accelerated
+```
+
+**Why 10-20x faster:**
+- Hardware memcpy (SIMD, prefetch)
+- Eliminates function call overhead
+- Eliminates bounds checks per element
 
 ---
 
@@ -603,55 +450,28 @@ jk_->compute();  // ONE call
 - Special: incremental Fock, DIIS, damping, MOM, fractional occupation
 
 **Per-Phase Thresholds:**
-- Phase 1: Compilation success, no crashes
-- Phase 2: Compilation + all tests pass
-- Phase 3: Energy deviation < 1e-10 (exact match)
-- Phase 4: Energy deviation < 1e-10
-- Phase 5: Energy deviation < 1e-10 + exact iteration match
-- Phase 6: Full equivalence + performance acceptable
+- **Phase 0:** Performance gains validated (CRITICAL)
+- **Phase 1-6:** Energy < 1e-10, performance maintained
 
 ---
 
-## Future: REKS Implementation
+## Key Insights from Code Analysis
 
-After Phase 6, the architecture will support REKS naturally:
+**Matrix class (psi4/libmints/matrix.*):**
+- Per-irrep contiguous blocks (good)
+- No SIMD alignment (BAD - losing 10-30%)
+- get_block() element-wise (DISASTER - 10-20x slow)
+- Symmetry via XOR mapping (elegant)
 
+**BLAS integration:**
+- Direct C_DGEMM calls (efficient)
+- Row-major → column-major handled in wrapper
+- Per-irrep DGEMM (natural parallelism)
+
+**UHF JK:** Already uses multi-state pattern (uhf.cc:184-200)
 ```cpp
-class REKSTheory : public FockTheory {
-    int n_states() const override { return n_ensemble_; }  // 2-6 typically
-
-    void build_all_focks(...) override {
-        // 1. Build sub-densities D_I, D_J from ensemble
-        // 2. Compute JK for all sub-densities (ONE call)
-        JKContainer jk_results(n_states_);
-        jk_ops::compute_jk_multistate(jk, {D_I, D_J, ...}, jk_results);
-
-        // 3. Build state-averaged Fock or multiple Fock matrices
-        // F = Σ w_K * (H + J_total - K_K)
-        // ...
-    }
-};
+jk_->C_left() = {Ca_occ, Cb_occ};  // Both at once!
+jk_->compute();  // Single call
 ```
 
-**Estimated time:** ~15-20 hours after Phase 6 complete.
-
----
-
-## Appendix: Current Code Structure
-
-### RHF key methods (rhf.cc)
-- `form_D()` line 352: D = C × C^T via DGEMM ✅ already optimal
-- `form_G()` line 187: JK contraction + DFT
-- `form_F()` line 277: F = H + G + V_ext
-- `form_C()` line 317: Diagonalize F
-- `compute_E()` line 398: Energy calculation
-
-### UHF key methods (uhf.cc)
-- `form_D()` line 427: Da, Db separately
-- `form_G()` line 184: **Already multi-state JK!** (α and β in one call)
-- `form_F()` line 156: Fa, Fb separately
-
-### Key observation:
-✅ UHF already uses multi-state JK contraction efficiently
-❌ But architecture is not generalized for N states (REKS)
-→ Our refactoring systematizes this pattern
+**Our goal:** Systematize for REKS (N states) + optimize underlying Matrix
