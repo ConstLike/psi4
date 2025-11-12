@@ -17,7 +17,7 @@ Each step: Claude codes → commits → pushes; User compiles → tests → vali
 **Claude (AI):** Modifies code, commits, pushes (does NOT compile/test)
 **User:** Pulls, compiles (`cd build && ninja psi4`), tests, reports results
 
-**Branch:** `kk/refactor_scf` ← **ACTIVE DEVELOPMENT**
+**Branch:** `claude/scf_optimization-011CV3EdN9C37wMjH8pg4vTe` ← **ACTIVE DEVELOPMENT**
 
 ---
 
