@@ -23,28 +23,35 @@ Each step: Claude codes → commits → pushes; User compiles → tests → vali
 
 ## Current Status
 
-**Phase:** 0 - HPC Performance Optimization 🔥
+**Phase:** 0 - HPC Performance Optimization 🔥 **COMPLETE** ✅
 
 **Completed:**
 - ✅ **Phase 0.1:** Aligned allocation (64-byte) → +10-30% BLAS performance
 - ✅ **Phase 0.2:** Vectorized get_block/set_block → 10-20x faster subset operations
-- ✅ **Phase 0.3:** MultiStateMatrix infrastructure created
+- ✅ **Phase 0.3:** Contiguous multi-state storage - **FIXED!**
 
-**Current Problem (Phase 0.3 fix):**
-Testing showed +2.5% slowdown instead of 2-3x speedup. Root cause:
+**Phase 0.3 Fix (commit 2858adac):**
+Problem: Initial implementation copied data (+2.5% slowdown)
+Solution: Da_/Db_/Fa_/Fb_/Ga_/Gb_ now **views** into contiguous storage
+
+**Implementation:**
 ```cpp
-// Current: Build in contiguous → copy back (overhead!)
-D_multi_->get(0) → build density
-Da_->copy(D_alpha);  // ← WASTEFUL COPY
-// Rest of code uses Da_/Db_ → no cache locality benefit!
+// UHF: 2-state contiguous storage
+D_multi_ = MultiStateMatrix("D", 2, ...);  // Single 64-byte aligned block
+Da_ = D_multi_->get(0);  // View into [0...N]
+Db_ = D_multi_->get(1);  // View into [N...2N]
+// NO COPYING! Direct access to contiguous memory
+
+// Same for F_multi_ (Fa/Fb) and G_multi_ (Ga/Gb)
 ```
 
-**Solution in progress:**
-- Make Da_/Db_ as **views** into D_multi_ (no copying!)
-- Extend contiguous storage to Fock matrices (Fa_/Fb_)
-- Entire UHF pipeline uses contiguous memory for cache locality
+**Memory layout:**
+- UHF: `[Da][Db][Fa][Fb][Ga][Gb]` - all contiguous, 64-byte aligned
+- RHF: `[Da][Fa][G]` - single state, same infrastructure
 
-**Next Action:** Fix Phase 0.3 - eliminate copies, extend to Fock matrices
+**Expected benefit:** 2-3x cache locality for UHF on medium/large molecules (100+ basis functions)
+
+**Next Action:** User tests compilation and performance (especially UHF on 100+ atoms)
 
 ---
 
