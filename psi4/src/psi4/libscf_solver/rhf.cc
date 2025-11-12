@@ -117,6 +117,13 @@ void RHF::common_init() {
     K_ = SharedMatrix(factory_->create_matrix("K"));
     wK_ = SharedMatrix(factory_->create_matrix("wK"));
 
+    // Phase 0.3: Multi-state contiguous storage (opt-in)
+    use_multistate_matrices_ = options_.get_bool("USE_MULTISTATE_MATRICES");
+    if (use_multistate_matrices_) {
+        D_multi_ = std::make_shared<MultiStateMatrix>("D (multi-state)", 1, nirrep_, nsopi_, nsopi_, 0);
+        outfile->Printf("  Using MultiStateMatrix for density (Phase 0.3 HPC optimization)\n");
+    }
+
     same_a_b_dens_ = true;
     same_a_b_orbs_ = true;
 
@@ -277,19 +284,42 @@ void RHF::form_C(double shift) {
 }
 
 void RHF::form_D() {
-    Da_->zero();
+    if (use_multistate_matrices_) {
+        // Phase 0.3: Use contiguous multi-state storage
+        D_multi_->zero_all();
+        SharedMatrix D_state0 = D_multi_->get(0);
 
-    for (int h = 0; h < nirrep_; ++h) {
-        int nso = nsopi_[h];
-        int nmo = nmopi_[h];
-        int na = nalphapi_[h];
+        for (int h = 0; h < nirrep_; ++h) {
+            int nso = nsopi_[h];
+            int nmo = nmopi_[h];
+            int na = nalphapi_[h];
 
-        if (nso == 0 || nmo == 0) continue;
+            if (nso == 0 || nmo == 0) continue;
 
-        auto Ca = Ca_->pointer(h);
-        auto D = Da_->pointer(h);
+            auto Ca = Ca_->pointer(h);
+            auto D = D_state0->pointer(h);
 
-        C_DGEMM('N', 'T', nso, nso, na, 1.0, Ca[0], nmo, Ca[0], nmo, 0.0, D[0], nso);
+            C_DGEMM('N', 'T', nso, nso, na, 1.0, Ca[0], nmo, Ca[0], nmo, 0.0, D[0], nso);
+        }
+
+        // Copy to Da_ for compatibility with rest of code
+        Da_->copy(D_state0);
+    } else {
+        // Original code path
+        Da_->zero();
+
+        for (int h = 0; h < nirrep_; ++h) {
+            int nso = nsopi_[h];
+            int nmo = nmopi_[h];
+            int na = nalphapi_[h];
+
+            if (nso == 0 || nmo == 0) continue;
+
+            auto Ca = Ca_->pointer(h);
+            auto D = Da_->pointer(h);
+
+            C_DGEMM('N', 'T', nso, nso, na, 1.0, Ca[0], nmo, Ca[0], nmo, 0.0, D[0], nso);
+        }
     }
 
     if (debug_) {

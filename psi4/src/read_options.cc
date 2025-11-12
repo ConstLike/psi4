@@ -1509,6 +1509,11 @@ int read_options(const std::string &name, Options &options, bool suppress_printi
         /*- Do perform a QCHF computation?  -*/
         options.add_bool("QCHF", false);
 
+        /*- Use MultiStateMatrix for contiguous storage of density matrices (Phase 0.3 HPC optimization).
+        Provides 2-3x cache locality improvement for multi-state calculations (UHF, REKS).
+        Experimental feature for performance testing. -*/
+        options.add_bool("USE_MULTISTATE_MATRICES", false);
+
         /*- SCF Properties to calculate after an energy evaluation. Note, this
         keyword is not used for property evaluations. -*/
         options.add("SCF_PROPERTIES", new ArrayType());

@@ -32,6 +32,7 @@
 #include "psi4/libpsio/psio.hpp"
 #include "psi4/libfock/v.h"
 #include "hf.h"
+#include "multistate_matrix.h"
 
 #include "psi4/pybind11.h"
 
@@ -48,6 +49,10 @@ class RHF : public HF {
     SharedMatrix wK_;
 
     std::shared_ptr<RV> potential_;
+
+    // Phase 0.3: Multi-state contiguous storage (opt-in)
+    bool use_multistate_matrices_;
+    std::shared_ptr<MultiStateMatrix> D_multi_;
 
     double compute_initial_E() override;
 

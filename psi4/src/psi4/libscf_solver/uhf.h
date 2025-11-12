@@ -32,6 +32,7 @@
 #include "psi4/libpsio/psio.hpp"
 #include "psi4/libfock/v.h"
 #include "hf.h"
+#include "multistate_matrix.h"
 
 namespace psi {
 namespace scf {
@@ -42,6 +43,10 @@ class UHF : public HF {
     SharedMatrix Ga_, Gb_, J_, Ka_, Kb_, wKa_, wKb_;
 
     std::shared_ptr<UV> potential_;
+
+    // Phase 0.3: Multi-state contiguous storage (opt-in)
+    bool use_multistate_matrices_;
+    std::shared_ptr<MultiStateMatrix> D_multi_;
 
     double compute_initial_E() override;
 
