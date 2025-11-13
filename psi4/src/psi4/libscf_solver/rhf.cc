@@ -201,24 +201,38 @@ void RHF::form_G() {
         G_->zero();
     }
 
-    /// Push the C matrix on
-    std::vector<SharedMatrix>& C = jk_->C_left();
-    C.clear();
-    C.push_back(Ca_subset("SO", "OCC"));
+    // Multi-cycle JK: use pre-computed J/K if available
+    if (use_precomputed_jk_) {
+        // Python multi_cycle_scf_iterate() provided pre-computed J/K
+        J_ = precomputed_J_[0];
+        if (functional_->is_x_hybrid()) {
+            K_ = precomputed_K_[0];
+        }
+        // Note: wK not supported in multi-cycle yet (would need separate API)
+        if (functional_->is_x_lrc()) {
+            throw PSIEXCEPTION("Multi-cycle JK with LRC functionals not yet supported");
+        }
+    } else {
+        // Normal path: compute J/K using JK builder
+        /// Push the C matrix on
+        std::vector<SharedMatrix>& C = jk_->C_left();
+        C.clear();
+        C.push_back(Ca_subset("SO", "OCC"));
 
-    // Run the JK object
-    jk_->compute();
+        // Run the JK object
+        jk_->compute();
 
-    // Pull the J and K matrices off
-    const std::vector<SharedMatrix>& J = jk_->J();
-    const std::vector<SharedMatrix>& K = jk_->K();
-    const std::vector<SharedMatrix>& wK = jk_->wK();
-    J_ = J[0];
-    if (functional_->is_x_hybrid()) {
-        K_ = K[0];
-    }
-    if (functional_->is_x_lrc()) {
-        wK_ = wK[0];
+        // Pull the J and K matrices off
+        const std::vector<SharedMatrix>& J = jk_->J();
+        const std::vector<SharedMatrix>& K = jk_->K();
+        const std::vector<SharedMatrix>& wK = jk_->wK();
+        J_ = J[0];
+        if (functional_->is_x_hybrid()) {
+            K_ = K[0];
+        }
+        if (functional_->is_x_lrc()) {
+            wK_ = wK[0];
+        }
     }
 
     G_->axpy(2.0, J_);

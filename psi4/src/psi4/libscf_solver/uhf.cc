@@ -201,27 +201,45 @@ void UHF::form_G() {
         Gb_->zero();
     }
 
-    // Push the C matrix on
-    std::vector<SharedMatrix>& C = jk_->C_left();
-    C.clear();
-    C.push_back(Ca_subset("SO", "OCC"));
-    C.push_back(Cb_subset("SO", "OCC"));
-    // Run the JK object
-    jk_->compute();
-    // Pull the J and K matrices off
-    const std::vector<SharedMatrix>& J = jk_->J();
-    const std::vector<SharedMatrix>& K = jk_->K();
-    const std::vector<SharedMatrix>& wK = jk_->wK();
-    J_->copy(J[0]);
-    J_->add(J[1]);
-    if (functional_->is_x_hybrid()) {
-        Ka_ = K[0];
-        Kb_ = K[1];
+    // Multi-cycle JK: use pre-computed J/K if available
+    if (use_precomputed_jk_) {
+        // Python multi_cycle_scf_iterate() provided pre-computed J/K
+        // UHF has 2 states: J[0] for alpha, J[1] for beta
+        J_->copy(precomputed_J_[0]);
+        J_->add(precomputed_J_[1]);  // Total J = J_alpha + J_beta
+        if (functional_->is_x_hybrid()) {
+            Ka_ = precomputed_K_[0];
+            Kb_ = precomputed_K_[1];
+        }
+        // Note: wK not supported in multi-cycle yet (would need separate API)
+        if (functional_->is_x_lrc()) {
+            throw PSIEXCEPTION("Multi-cycle JK with LRC functionals not yet supported");
+        }
+    } else {
+        // Normal path: compute J/K using JK builder
+        // Push the C matrix on
+        std::vector<SharedMatrix>& C = jk_->C_left();
+        C.clear();
+        C.push_back(Ca_subset("SO", "OCC"));
+        C.push_back(Cb_subset("SO", "OCC"));
+        // Run the JK object
+        jk_->compute();
+        // Pull the J and K matrices off
+        const std::vector<SharedMatrix>& J = jk_->J();
+        const std::vector<SharedMatrix>& K = jk_->K();
+        const std::vector<SharedMatrix>& wK = jk_->wK();
+        J_->copy(J[0]);
+        J_->add(J[1]);
+        if (functional_->is_x_hybrid()) {
+            Ka_ = K[0];
+            Kb_ = K[1];
+        }
+        if (functional_->is_x_lrc()) {
+            wKa_ = wK[0];
+            wKb_ = wK[1];
+        }
     }
-    if (functional_->is_x_lrc()) {
-        wKa_ = wK[0];
-        wKb_ = wK[1];
-    }
+
     Ga_->add(J_);
     Gb_->add(J_);
 

@@ -947,34 +947,52 @@ int ROHF::soscf_update(double soscf_conv, int soscf_min_iter, int soscf_max_iter
 void ROHF::form_G() {
     Dimension dim_zero(nirrep_, "Zero Dim");
 
-    auto& C = jk_->C_left();
-    C.clear();
+    // Multi-cycle JK: use pre-computed J/K if available
+    if (use_precomputed_jk_) {
+        // Python multi_cycle_scf_iterate() provided pre-computed J/K
+        // ROHF has 2 states: J[0] for docc, J[1] for socc
+        Ga_->copy(precomputed_J_[0]);
+        Ga_->scale(2.0);
+        Ga_->add(precomputed_J_[1]);
 
-    // Push back docc orbitals
-    SharedMatrix Cdocc = Ca_->get_block({dim_zero, nsopi_}, {dim_zero, nbetapi_});
-    C.push_back(Cdocc);
+        Ka_->copy(precomputed_K_[0]);
+        Ka_->add(precomputed_K_[1]);
+        Kb_ = precomputed_K_[0];
 
-    // Push back socc orbitals
-    SharedMatrix Csocc = Ca_->get_block({dim_zero, nsopi_}, {nbetapi_, nalphapi_});
-    C.push_back(Csocc);
+        Gb_->copy(Ga_);
+        Ga_->subtract(Ka_);
+        Gb_->subtract(Kb_);
+    } else {
+        // Normal path: compute J/K using JK builder
+        auto& C = jk_->C_left();
+        C.clear();
 
-    // Run the JK object
-    jk_->compute();
+        // Push back docc orbitals
+        SharedMatrix Cdocc = Ca_->get_block({dim_zero, nsopi_}, {dim_zero, nbetapi_});
+        C.push_back(Cdocc);
 
-    // Pull the J and K matrices off
-    const std::vector<SharedMatrix>& J = jk_->J();
-    const std::vector<SharedMatrix>& K = jk_->K();
-    Ga_->copy(J[0]);
-    Ga_->scale(2.0);
-    Ga_->add(J[1]);
+        // Push back socc orbitals
+        SharedMatrix Csocc = Ca_->get_block({dim_zero, nsopi_}, {nbetapi_, nalphapi_});
+        C.push_back(Csocc);
 
-    Ka_->copy(K[0]);
-    Ka_->add(K[1]);
-    Kb_ = K[0];
+        // Run the JK object
+        jk_->compute();
 
-    Gb_->copy(Ga_);
-    Ga_->subtract(Ka_);
-    Gb_->subtract(Kb_);
+        // Pull the J and K matrices off
+        const std::vector<SharedMatrix>& J = jk_->J();
+        const std::vector<SharedMatrix>& K = jk_->K();
+        Ga_->copy(J[0]);
+        Ga_->scale(2.0);
+        Ga_->add(J[1]);
+
+        Ka_->copy(K[0]);
+        Ka_->add(K[1]);
+        Kb_ = K[0];
+
+        Gb_->copy(Ga_);
+        Ga_->subtract(Ka_);
+        Gb_->subtract(Kb_);
+    }
 }
 
 bool ROHF::stability_analysis() {
