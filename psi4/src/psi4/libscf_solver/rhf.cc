@@ -203,7 +203,7 @@ void RHF::form_G() {
 
     // Multi-cycle JK: use pre-computed J/K if available
     if (use_precomputed_jk_) {
-        // Python multi_cycle_scf_iterate() provided pre-computed J/K
+        // Python multi_scf() provided pre-computed J/K
         J_ = precomputed_J_[0];
         if (functional_->is_x_hybrid()) {
             K_ = precomputed_K_[0];

@@ -331,7 +331,7 @@ class HF : public Wavefunction {
     virtual int n_states() const { return 1; }
 
     /// Returns list of orbital matrices for multi-cycle JK computation
-    /// Used by Python multi_cycle_scf_iterate() to collect C matrices
+    /// Used by Python multi_scf() to collect C matrices
     /// RHF: returns {Ca_}
     /// UHF: returns {Ca_, Cb_}
     /// ROHF: returns {Ca_, Cb_}
@@ -341,7 +341,7 @@ class HF : public Wavefunction {
     }
 
     /// Sets pre-computed J/K matrices for multi-cycle JK computation
-    /// Used by Python multi_cycle_scf_iterate() to distribute shared JK results
+    /// Used by Python multi_scf() to distribute shared JK results
     /// After calling this, form_G() should use these matrices instead of computing new ones
     /// @param J_list: List of J matrices (length = n_states())
     /// @param K_list: List of K matrices (length = n_states())

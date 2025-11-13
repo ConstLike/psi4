@@ -203,7 +203,7 @@ void UHF::form_G() {
 
     // Multi-cycle JK: use pre-computed J/K if available
     if (use_precomputed_jk_) {
-        // Python multi_cycle_scf_iterate() provided pre-computed J/K
+        // Python multi_scf() provided pre-computed J/K
         // UHF has 2 states: J[0] for alpha, J[1] for beta
         J_->copy(precomputed_J_[0]);
         J_->add(precomputed_J_[1]);  // Total J = J_alpha + J_beta
