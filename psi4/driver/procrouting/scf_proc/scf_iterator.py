@@ -1232,6 +1232,10 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
     if jk is None:
         raise ValidationError("JK object not initialized. Call wfn.initialize() first.")
 
+    # Ensure JK is configured to compute J and K matrices
+    jk.set_do_J(True)
+    jk.set_do_K(True)  # Needed for hybrid functionals (HF exchange)
+
     # Initialize iteration state for each wavefunction
     for wfn in wfn_list:
         wfn._scf_initialize_iteration_state(e_conv, d_conv)
@@ -1262,8 +1266,10 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
 
         # Step 2: Shared JK computation (KEY OPTIMIZATION!)
         jk.C_left().clear()
+        jk.C_right().clear()  # Need to clear both for symmetric JK
         for C_occ in all_C_occ_matrices:
             jk.C_left().append(C_occ)
+            jk.C_right().append(C_occ)  # For symmetric JK: C_left == C_right
 
         # Single JK call for ALL wavefunctions!
         jk.compute()
@@ -1272,6 +1278,15 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
         jk_index = 0
         J_all = jk.J()
         K_all = jk.K()
+
+        # Diagnostic check (can be removed after testing)
+        expected_matrices = len(all_C_occ_matrices)
+        if len(J_all) != expected_matrices or len(K_all) != expected_matrices:
+            raise ValidationError(
+                f"JK compute failed: expected {expected_matrices} J/K matrices, "
+                f"got {len(J_all)} J and {len(K_all)} K matrices. "
+                f"C_left has {len(jk.C_left())} matrices, C_right has {len(jk.C_right())} matrices."
+            )
 
         for wfn, n_states in zip(wfn_list, wfn_state_counts):
             J_list = [J_all[jk_index + i] for i in range(n_states)]
