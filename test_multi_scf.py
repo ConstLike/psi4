@@ -14,6 +14,7 @@ Expected behavior:
 import psi4
 import time
 from psi4.driver.procrouting.scf_proc.scf_iterator import multi_scf
+from psi4.driver.procrouting.proc import build_functional_and_disp
 
 # Set memory and output
 psi4.set_memory('2 GB')
@@ -42,13 +43,14 @@ symmetry c1
 
 # Create molecules
 mol1 = psi4.geometry(mol1_str)
-mol2 = psi4.geometry(mol2_str)
+mol1.update_geometry()
 
-# Set basis
-basis = psi4.core.BasisSet.build(mol1, "ORBITAL", "cc-pvdz")
+mol2 = psi4.geometry(mol2_str)
+mol2.update_geometry()
 
 # Set options
 psi4.set_options({
+    'basis': 'cc-pvdz',
     'scf_type': 'df',
     'e_convergence': 1e-8,
     'd_convergence': 1e-6,
@@ -85,8 +87,28 @@ print("Test 2: Multi-cycle SCF (shared JK)")
 print("-" * 70 + "\n")
 
 # Create fresh wavefunctions
-wfn1 = psi4.core.RHF(psi4.core.Wavefunction.build(mol1, basis), psi4.core.get_global_option('REFERENCE'))
-wfn2 = psi4.core.RHF(psi4.core.Wavefunction.build(mol2, basis), psi4.core.get_global_option('REFERENCE'))
+ref_wfn1 = psi4.core.Wavefunction.build(mol1, psi4.core.get_global_option('BASIS'))
+ref_wfn2 = psi4.core.Wavefunction.build(mol2, psi4.core.get_global_option('BASIS'))
+
+# Build superfunctional for HF
+psi4.core.prepare_options_for_module("SCF")
+superfunc, _ = build_functional_and_disp('HF', restricted=True)
+
+wfn1 = psi4.core.RHF(ref_wfn1, superfunc)
+wfn2 = psi4.core.RHF(ref_wfn2, superfunc)
+
+# Set DF auxiliary basis (THIS WAS MISSING!)
+aux_basis1 = psi4.core.BasisSet.build(wfn1.molecule(), "DF_BASIS_SCF",
+                                     psi4.core.get_option("SCF", "DF_BASIS_SCF"),
+                                     "JKFIT", psi4.core.get_global_option('BASIS'),
+                                     puream=wfn1.basisset().has_puream())
+wfn1.set_basisset("DF_BASIS_SCF", aux_basis1)
+
+aux_basis2 = psi4.core.BasisSet.build(wfn2.molecule(), "DF_BASIS_SCF",
+                                     psi4.core.get_option("SCF", "DF_BASIS_SCF"),
+                                     "JKFIT", psi4.core.get_global_option('BASIS'),
+                                     puream=wfn2.basisset().has_puream())
+wfn2.set_basisset("DF_BASIS_SCF", aux_basis2)
 
 # Initialize both
 print("Initializing wavefunctions...")
@@ -95,7 +117,6 @@ wfn2.initialize()
 
 # Run multi-cycle SCF
 print("\nRunning multi_scf() with NEW architecture...\n")
-print("NOTE: Requires C++ recompilation for Phase 0.6 pybind11 exports\n")
 t0 = time.time()
 
 energies_multi = multi_scf([wfn1, wfn2], e_conv=1e-8, d_conv=1e-6, verbose=True)
