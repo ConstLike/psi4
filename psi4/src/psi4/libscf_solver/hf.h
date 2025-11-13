@@ -131,6 +131,14 @@ class HF : public Wavefunction {
     /// The soon to be ubiquitous JK object
     std::shared_ptr<JK> jk_;
 
+    /// Multi-cycle JK: pre-computed J/K matrices from shared JK computation
+    /// Used when multiple SCF calculations share a single JK builder
+    std::vector<SharedMatrix> precomputed_J_;
+    std::vector<SharedMatrix> precomputed_K_;
+    /// Flag: use pre-computed J/K instead of calling jk_->compute()
+    /// Enables backward compatibility (default: false, compute J/K normally)
+    bool use_precomputed_jk_;
+
     /// Are we to do MOM?
     bool MOM_enabled_;
     /// Are we to do excited-state MOM?
@@ -321,6 +329,29 @@ class HF : public Wavefunction {
     /// ROHF: 2 (alpha, beta with different occupations)
     /// SA-REKS: N (multiple electronic states)
     virtual int n_states() const { return 1; }
+
+    /// Returns list of orbital matrices for multi-cycle JK computation
+    /// Used by Python multi_cycle_scf_iterate() to collect C matrices
+    /// RHF: returns {Ca_}
+    /// UHF: returns {Ca_, Cb_}
+    /// ROHF: returns {Ca_, Cb_}
+    /// SA-REKS: returns {C_state0, C_state1, ..., C_stateN}
+    virtual std::vector<SharedMatrix> get_orbital_matrices() const {
+        return {Ca_};  // Default: RHF-like behavior
+    }
+
+    /// Sets pre-computed J/K matrices for multi-cycle JK computation
+    /// Used by Python multi_cycle_scf_iterate() to distribute shared JK results
+    /// After calling this, form_G() should use these matrices instead of computing new ones
+    /// @param J_list: List of J matrices (length = n_states())
+    /// @param K_list: List of K matrices (length = n_states())
+    virtual void set_jk_matrices(const std::vector<SharedMatrix>& J_list,
+                                  const std::vector<SharedMatrix>& K_list) {
+        // Store pre-computed J/K and enable flag for form_G() to use them
+        precomputed_J_ = J_list;
+        precomputed_K_ = K_list;
+        use_precomputed_jk_ = true;
+    }
 
     /// Save the current density and energy.
     virtual void save_density_and_energy();

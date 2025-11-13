@@ -83,6 +83,11 @@ class UHF : public HF {
     /// UHF handles 2 states (alpha and beta spins)
     int n_states() const override { return 2; }
 
+    /// Returns {Ca_, Cb_} for multi-cycle JK computation
+    std::vector<SharedMatrix> get_orbital_matrices() const override {
+        return {Ca_, Cb_};
+    }
+
     void save_density_and_energy() override;
 
     void form_C(double shift = 0.0) override;

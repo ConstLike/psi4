@@ -101,6 +101,7 @@ void HF::common_init() {
     sad_ = false;
     module_ = "scf";
     frac_performed_ = false;
+    use_precomputed_jk_ = false;  // Multi-cycle JK: default to normal JK computation
 
     // This quantity is needed fairly soon
     nirrep_ = factory_->nirrep();
