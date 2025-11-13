@@ -83,48 +83,35 @@ Phase 0.5: Унификация базы ✅ DONE
   ├─> UHF: MultiStateMatrix (n=2) ✓
   └─> ROHF: MultiStateMatrix (n=2) ✓
 
-Phase 0.6: SCFEngine Foundation 📍 CURRENT
+Phase 0.6: API Foundation ✅ DONE
   ├─> 0.6.1: n_states() API ✅ DONE
   ├─> 0.6.2: Basic API tests ✅ DONE (user)
-  ├─> 0.6.3: Fix SCFEngine skeleton ← NOW
-  └─> 0.6.4: First real SCF run (H2 RHF)
+  └─> 0.6.3: Strategic decision: Python-first approach ✅ DONE
 
-Phase 1: Multi-State Support
-  ├─> 1.1: MultiStateSCFEngine (n_states tracking)
-  ├─> 1.2: Per-state convergence
-  └─> 1.3: Test with UHF/ROHF (n=2)
+Phase 1: Python Multi-Cycle Coordinator 📍 NEXT
+  ├─> 1.1: Design multi_cycle_scf_iterate() API
+  ├─> 1.2: Implement shared JK collection
+  ├─> 1.3: Per-wfn SCF iteration
+  └─> 1.4: Test: 2 independent RHF cycles
 
-Phase 2: Multi-Cycle Coordinator
-  ├─> 2.1: MultiCycleSCF class
-  ├─> 2.2: Shared JK for all cycles
-  └─> 2.3: Test: 2 independent RHF cycles
-
-Phase 3: SA-REKS Theory Stub
-  ├─> 3.1: SAREKS class skeleton
-  ├─> 3.2: MultiStateMatrix for N states
-  └─> 3.3: Basic REKS occupation pattern
-
-Phase 4: Full SA-REKS
-  ├─> 4.1: Complete REKS occupation logic
-  ├─> 4.2: Ensemble density for DFT
-  └─> 4.3: Code generation templates
-
-Phase 5: Multi-Spin Integration 🎯 GOAL
-  └─> Run Singlet + Triplet + Quintet simultaneously with shared JK
+Phase 2: Multi-Spin SA-REKS 🎯 GOAL
+  ├─> 2.1: SA-REKS theory stub (n_states = N)
+  ├─> 2.2: Ensemble density for shared JK
+  ├─> 2.3: Complete REKS occupation logic
+  └─> 2.4: Test: Singlet + Triplet + Quintet simultaneously
 ```
 
 **Estimated Timeline:**
-- Phase 0.6: ~2-3 days (fixing skeleton + first run)
-- Phase 1-2: ~1 week
-- Phase 3-4: ~2-3 weeks
-- Phase 5: ~2 days
+- Phase 0.6: ✅ DONE (n_states() API + strategic decision)
+- Phase 1: ~1 week (Python multi-cycle coordinator)
+- Phase 2: ~2-3 weeks (SA-REKS implementation)
 - **Total: ~1 month**
 
 ---
 
-## Current Status Summary (UPDATED 2025-01-XX)
+## Current Status Summary (UPDATED 2025-01-13)
 
-**What is READY and TESTED:** ✅
+**Phase 0: HPC Optimization ✅ COMPLETE**
 1. **MultiStateMatrix infrastructure** (Phase 0.3)
    - 64-byte aligned allocation
    - Contiguous storage for cache locality
@@ -135,26 +122,29 @@ Phase 5: Multi-Spin Integration 🎯 GOAL
    - RHF: n=1, UHF: n=2, ROHF: n=2
    - Tested and validated
 
-3. **n_states() API** (Phase 0.6.1)
+3. **n_states() API** (Phase 0.6)
    - HF base class: virtual int n_states() const
    - RHF/UHF/ROHF override correctly
    - Tested via user's unit tests
 
-**What is SKELETON (not ready for use):** ⚠️
-1. **SCFEngine class** (created in Layer 1, but incomplete)
-   - ✅ Compiles and links
-   - ✅ Correct method signatures
-   - ✅ Calls HF virtual methods
-   - ❌ compute_density_rms() is placeholder (TODO)
-   - ❌ Cannot access Da_/Dold_ through HF* (no API)
-   - ❌ Not integrated in workflow
-   - ❌ Cannot be tested without modifications
+**Strategic Decision: Python-First Approach** ✅
 
-**What is NOT started:** ❌
-- MultiStateSCFEngine
-- MultiCycleSCF
-- SA-REKS theory
-- Python integration
+**Key Insight:** Existing `scf_iterate()` in Python ALREADY provides the abstraction we need!
+- RHF/UHF/ROHF all work through ONE mechanism: Python scf_iterate() + HF virtual methods
+- DIIS, convergence, damping - all working features in Python
+- **Only addition needed:** Multi-cycle coordinator for shared JK computation
+- **No need to rebuild SCF in C++** - would be code duplication with workarounds
+
+**Next Phase: Python Multi-Cycle** 📍
+- Design `multi_cycle_scf_iterate()` in scf_iterator.py
+- Collect C matrices from multiple wavefunction objects
+- Single shared JK call: `jk.C_left() = [all C matrices]`
+- Distribute J/K results back to each wavefunction
+- Use existing scf_iterate() infrastructure for each cycle
+
+**Files to Note:**
+- `SCFEngine` (scf_engine.{h,cc}): Exists but not used in new strategy
+- Python approach uses: `psi4/driver/procrouting/scf_proc/scf_iterator.py`
 
 ---
 
@@ -171,11 +161,9 @@ Phase 5: Multi-Spin Integration 🎯 GOAL
 
 ---
 
-## Phase 0.6: SCFEngine Foundation (IN PROGRESS) 🚧
+## Phase 0.6: API Foundation ✅ COMPLETE
 
-**Goal:** Make SCFEngine actually usable for real SCF calculations.
-
-**Strategy:** Fix skeleton issues, then test with RHF on H2.
+**Goal:** Add necessary APIs for multi-cycle support and decide on architecture strategy.
 
 ### Step 0.6.1: Add n_states() API ✅ DONE
 
@@ -194,65 +182,183 @@ Phase 5: Multi-Spin Integration 🎯 GOAL
 
 **All tests pass!** ✓
 
-### Step 0.6.3: Fix SCFEngine skeleton ← CURRENT
+### Step 0.6.3: Strategic Decision - Python-First Approach ✅ DONE
 
-**Problem:** SCFEngine exists but has critical gaps preventing real use.
+**Analysis:**
+- Initially considered building SCFEngine foundation in C++
+- Realized existing Python `scf_iterate()` ALREADY provides needed abstraction
+- RHF/UHF/ROHF all work through: Python scf_iterate() + HF virtual methods
+- All features (DIIS, convergence, damping) already work in Python
 
-**Issues to fix:**
+**Decision:**
+- ✅ Use existing `scf_iterate()` infrastructure
+- ✅ Create `multi_cycle_scf_iterate()` in Python for shared JK coordination
+- ❌ No need to rebuild SCF in C++ (would duplicate working code)
 
-1. **compute_density_rms() - placeholder**
+**Why This is Better:**
+- No code duplication
+- Uses all existing tested features (DIIS, convergence, etc.)
+- Clean separation: C++ for theory, Python for coordination
+- Faster to implement and test
+
+**Note on SCFEngine:**
+- Files `scf_engine.{h,cc}` exist from exploratory work
+- Compile and link correctly but have placeholder implementations
+- Not used in new Python-first strategy
+- May be useful for future C++-level iteration control, but not needed now
+
+---
+
+## Phase 1: Python Multi-Cycle Strategy 📍 NEXT
+
+**Goal:** Enable multiple SCF calculations to share a single JK computation for ~1.8-2x speedup.
+
+### Why Python-First Approach?
+
+**Existing Infrastructure that WORKS:**
+```python
+# psi4/driver/procrouting/scf_proc/scf_iterator.py
+def scf_iterate(wfn, options):
+    # This ALREADY works for RHF/UHF/ROHF via HF virtual methods!
+    while not converged:
+        wfn.form_G()   # Build two-electron contribution (J, K, XC)
+        wfn.form_F()   # Assemble Fock matrix
+        wfn.form_C()   # Diagonalize Fock
+        wfn.form_D()   # Build density from orbitals
+        E = wfn.compute_E()
+        # DIIS, damping, convergence checking, etc.
+```
+
+**Key Observation:** All three theories (RHF/UHF/ROHF) already work through the SAME mechanism!
+- Python calls virtual methods on HF base class
+- Each theory implements the methods appropriately
+- DIIS, convergence, damping - all tested and working
+
+**What's Missing:** Ability to run multiple SCF cycles with shared JK
+- Currently: Each wfn builds its own J/K matrices independently
+- Goal: Collect all C matrices, single JK call, distribute results
+
+### Architecture: Multi-Cycle Coordinator
+
+```python
+# psi4/driver/procrouting/scf_proc/scf_iterator.py
+
+def multi_cycle_scf_iterate(wfn_list, options):
+    """
+    Run multiple SCF calculations with shared JK computation.
+
+    Args:
+        wfn_list: List of HF wavefunction objects (RHF, UHF, ROHF, SA-REKS)
+        options: Options object
+
+    Returns:
+        List of final energies
+    """
+    # 1. Initialize all wavefunctions
+    for wfn in wfn_list:
+        wfn.initialize_scf()
+
+    # 2. Main iteration loop
+    for iteration in range(max_iter):
+        # 3. Collect all C matrices from all wavefunctions
+        all_C_matrices = []
+        for wfn in wfn_list:
+            # For RHF: 1 C matrix (Ca)
+            # For UHF/ROHF: 2 C matrices (Ca, Cb)
+            # For SA-REKS: N C matrices (one per state)
+            C_list = wfn.get_orbital_matrices()  # Returns list based on n_states()
+            all_C_matrices.extend(C_list)
+
+        # 4. SHARED JK COMPUTATION (KEY OPTIMIZATION!)
+        jk = wfn_list[0].jk()  # Get JK builder from any wfn (all use same basis)
+        jk.C_left().clear()
+        for C in all_C_matrices:
+            jk.C_left().append(C)
+        jk.compute()  # Single call for ALL matrices!
+
+        # 5. Distribute J/K results back to each wavefunction
+        jk_index = 0
+        for wfn in wfn_list:
+            n = wfn.n_states()  # How many J/K pairs this wfn needs
+            J_list = [jk.J()[jk_index + i] for i in range(n)]
+            K_list = [jk.K()[jk_index + i] for i in range(n)]
+            wfn.set_jk_matrices(J_list, K_list)
+            jk_index += n
+
+        # 6. Each wavefunction completes its SCF step
+        for wfn in wfn_list:
+            wfn.form_F()   # Assemble Fock from J/K
+            wfn.form_C()   # Diagonalize
+            wfn.form_D()   # Build new density
+            wfn.compute_E()
+
+        # 7. Check convergence for all wavefunctions
+        all_converged = all(wfn.is_converged() for wfn in wfn_list)
+        if all_converged:
+            break
+
+    return [wfn.energy() for wfn in wfn_list]
+```
+
+### Required C++ APIs (Minimal)
+
+Most infrastructure already exists! Only need:
+
+1. **n_states() API** ✅ DONE (Phase 0.6.1)
    ```cpp
-   // Current: rough approximation
-   double compute_density_rms() {
-       // TODO: Implement proper density RMS
-       return std::sqrt(delta_E) * 10.0;  // WRONG!
+   virtual int n_states() const { return 1; }  // RHF: 1, UHF: 2, ROHF: 2
+   ```
+
+2. **get_orbital_matrices()** - NEW
+   ```cpp
+   // HF base class
+   virtual std::vector<SharedMatrix> get_orbital_matrices() const {
+       // RHF: return {Ca_}
+       // UHF: return {Ca_, Cb_}
+       // ROHF: return {Ca_, Cb_}
    }
    ```
 
-   **Solution needed:**
-   - Get access to current and old density matrices
-   - Compute RMS: sqrt(sum((D_new - D_old)^2) / n_elements)
-
-2. **No access to Da_/Dold_ through HF***
+3. **set_jk_matrices()** - NEW
    ```cpp
-   // Problem: HF* doesn't expose Da() or Dold()
-   theory_->Da();    // ← Doesn't exist!
-   theory_->Dold_();  // ← Doesn't exist!
+   // HF base class
+   virtual void set_jk_matrices(const std::vector<SharedMatrix>& J_list,
+                                 const std::vector<SharedMatrix>& K_list) {
+       // Store J/K for use in form_F()
+       // RHF: J_[0], K_[0]
+       // UHF: J_[0,1], K_[0,1]
+   }
    ```
 
-   **Solution needed:**
-   - Add Da()/Db() accessors to HF base class
-   - Or use save_density_and_energy() + compute difference
+4. **Modify form_G()** - SMALL CHANGE
+   ```cpp
+   // Current: form_G() builds J/K internally
+   // New: form_G() uses pre-computed J/K from set_jk_matrices()
+   //      OR builds them if not provided (backward compatibility)
+   ```
 
-3. **Missing initialization**
-   - No guess() call
-   - No form_H() call
-   - Just jumps into iteration loop
+### Benefits of This Approach
 
-4. **No DIIS integration**
-   - SCFEngine doesn't call DIIS
-   - But HF already has diis_manager_ !
+1. **Minimal C++ changes** - Only 2-3 new methods in HF base class
+2. **No code duplication** - Uses all existing tested features
+3. **Backward compatible** - Existing scf_iterate() still works unchanged
+4. **Clean separation** - C++ for theory, Python for coordination
+5. **Easy to test** - Can test with 2 independent RHF calculations first
+6. **Extensible** - Works for any number of wavefunctions
 
-**Next actions:**
-1. Fix compute_density_rms() properly
-2. Add Da()/Db() accessors to HF (or alternative approach)
-3. Add initialization in iterate()
-4. Test on H2 RHF
+### Testing Strategy
 
-### Step 0.6.4: First real SCF run (NEXT)
+**Phase 1.1:** Test with 2 independent RHF calculations
+```python
+h2o_singlet = psi4.energy('scf/6-31g', molecule=h2o_singlet, return_wfn=True)[1]
+h2o_triplet = psi4.energy('scf/6-31g', molecule=h2o_triplet, return_wfn=True)[1]
 
-After fixes, run actual test:
-```cpp
-auto rhf = make_shared<RHF>(h2_molecule, ...);
-SCFEngine engine(rhf.get(), options);
-int iters = engine.iterate();  // REAL SCF!
-double E = rhf->compute_E();
-REQUIRE(abs(E - (-1.126...)) < 1e-6);  // H2 energy
+# Should give same energies as running separately, but faster
+energies = multi_cycle_scf_iterate([h2o_singlet, h2o_triplet], options)
 ```
 
-**Architecture Documents:**
-- `skelet.md` - Abstract pseudocode skeleton (theory-agnostic design)
-- `skelet_psi4.md` - Psi4-specific implementation plan (6 layers)
+**Phase 1.2:** Test with UHF (already uses n=2 internally)
+**Phase 1.3:** Test with SA-REKS (n=N states)
 
 ---
 
