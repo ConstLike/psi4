@@ -88,6 +88,14 @@ void export_fock(py::module &m) {
              })
         .def("C_left_add", [](JK &jk, SharedMatrix Cl) { jk.C_left().push_back(Cl); })
         .def("C_right_add", [](JK &jk, SharedMatrix Cr) { jk.C_right().push_back(Cr); })
+        .def("C_left",
+             py::overload_cast<>(&JK::C_left),
+             py::return_value_policy::reference_internal,
+             "Returns the left orbital matrix list for multi-cycle JK computation.")
+        .def("C_right",
+             py::overload_cast<>(&JK::C_right),
+             py::return_value_policy::reference_internal,
+             "Returns the right orbital matrix list for multi-cycle JK computation.")
         .def("J", &JK::J, py::return_value_policy::reference_internal)
         .def("K", &JK::K, py::return_value_policy::reference_internal)
         .def("wK", &JK::wK, py::return_value_policy::reference_internal)
