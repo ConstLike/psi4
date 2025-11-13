@@ -72,26 +72,27 @@ Db_ = D_multi_->get(1);  // View into [N...2N]
 **Философия:** Минимальные, контролируемые шаги с тестированием после каждого.
 **Цель:** Уменьшить число неизвестных ошибок, идти от проверенного фундамента.
 
-### Roadmap: От Phase 0 до Multi-Cycle SA-REKS
+### Roadmap: От Phase 0 до Multi-Cycle SA-REKS (UPDATED)
 
 ```
 Phase 0: HPC Optimization ✅ DONE
   └─> +15.9% speedup, MultiStateMatrix infrastructure proven
 
-Phase 0.5: Унификация базы 📍 CURRENT
-  ├─> 0.5.1: RHF → MultiStateMatrix (n=1) ← СЕЙЧАС
-  ├─> 0.5.2: ROHF проверка/унификация
-  └─> 0.5.3: Единый паттерн RHF/UHF/ROHF
+Phase 0.5: Унификация базы ✅ DONE
+  ├─> RHF: MultiStateMatrix (n=1) ✓
+  ├─> UHF: MultiStateMatrix (n=2) ✓
+  └─> ROHF: MultiStateMatrix (n=2) ✓
 
-Phase 0.6: Интеграция SCFEngine
-  ├─> 0.6.1: SCFEngine + RHF (test)
-  ├─> 0.6.2: SCFEngine + UHF (test)
-  └─> 0.6.3: SCFEngine proven working
+Phase 0.6: SCFEngine Foundation 📍 CURRENT
+  ├─> 0.6.1: n_states() API ✅ DONE
+  ├─> 0.6.2: Basic API tests ✅ DONE (user)
+  ├─> 0.6.3: Fix SCFEngine skeleton ← NOW
+  └─> 0.6.4: First real SCF run (H2 RHF)
 
 Phase 1: Multi-State Support
   ├─> 1.1: MultiStateSCFEngine (n_states tracking)
-  ├─> 1.2: HF::n_states() virtual method
-  └─> 1.3: Per-state convergence
+  ├─> 1.2: Per-state convergence
+  └─> 1.3: Test with UHF/ROHF (n=2)
 
 Phase 2: Multi-Cycle Coordinator
   ├─> 2.1: MultiCycleSCF class
@@ -113,7 +114,7 @@ Phase 5: Multi-Spin Integration 🎯 GOAL
 ```
 
 **Estimated Timeline:**
-- Phase 0.5-0.6: ~3-5 days
+- Phase 0.6: ~2-3 days (fixing skeleton + first run)
 - Phase 1-2: ~1 week
 - Phase 3-4: ~2-3 weeks
 - Phase 5: ~2 days
@@ -121,157 +122,133 @@ Phase 5: Multi-Spin Integration 🎯 GOAL
 
 ---
 
+## Current Status Summary (UPDATED 2025-01-XX)
+
+**What is READY and TESTED:** ✅
+1. **MultiStateMatrix infrastructure** (Phase 0.3)
+   - 64-byte aligned allocation
+   - Contiguous storage for cache locality
+   - Proven +15.9% speedup on naphthalene
+
+2. **Unified base for RHF/UHF/ROHF** (Phase 0.5)
+   - All three use MultiStateMatrix pattern
+   - RHF: n=1, UHF: n=2, ROHF: n=2
+   - Tested and validated
+
+3. **n_states() API** (Phase 0.6.1)
+   - HF base class: virtual int n_states() const
+   - RHF/UHF/ROHF override correctly
+   - Tested via user's unit tests
+
+**What is SKELETON (not ready for use):** ⚠️
+1. **SCFEngine class** (created in Layer 1, but incomplete)
+   - ✅ Compiles and links
+   - ✅ Correct method signatures
+   - ✅ Calls HF virtual methods
+   - ❌ compute_density_rms() is placeholder (TODO)
+   - ❌ Cannot access Da_/Dold_ through HF* (no API)
+   - ❌ Not integrated in workflow
+   - ❌ Cannot be tested without modifications
+
+**What is NOT started:** ❌
+- MultiStateSCFEngine
+- MultiCycleSCF
+- SA-REKS theory
+- Python integration
+
+---
+
 ## Phase 0.5: Унификация базы ✅ COMPLETE
 
 **Status:** Tested and validated! All three (RHF/UHF/ROHF) use MultiStateMatrix.
 
----
-
-## Phase 0.6: SCFEngine API Integration (IN PROGRESS) 🚧
-
-**Status:** Step 1 - n_states() API complete, awaiting compilation test
-
-**Goal:** Make SCFEngine usable with existing theories through clean API.
-
-**Strategy:** Opt-in pattern, full backward compatibility, no Python changes yet.
-
-### Step 0.6.1: Add n_states() API ✅ DONE (awaiting test)
-
-**What was done:**
-1. ✅ Added `virtual int n_states() const` to HF base class (default return 1)
-2. ✅ Override in RHF: `return 1` (closed-shell, alpha = beta)
-3. ✅ Override in UHF: `return 2` (alpha, beta spins)
-4. ✅ Override in ROHF: `return 2` (alpha, beta different occupations)
-
-**Changes:**
-```cpp
-// hf.h - Base class
-virtual int n_states() const { return 1; }
-
-// rhf.h
-int n_states() const override { return 1; }  // Closed-shell
-
-// uhf.h
-int n_states() const override { return 2; }  // Open-shell (alpha, beta)
-
-// rohf.h
-int n_states() const override { return 2; }  // Restricted open-shell
-```
-
-**Purpose:**
-- SCFEngine can query theory: "how many states do you handle?"
-- Foundation for future multi-state/multi-cycle support
-- No logic changes, pure API extension
-
-**Validation (AWAITING USER):**
-- Compilation should succeed
-- All existing tests should pass (no behavior change)
-- API is ready for next step
-
-### Step 0.6.2: Basic SCFEngine test (NEXT)
-
-After Step 0.6.1 validates, create minimal C++ test:
-- Instantiate SCFEngine with RHF
-- Call n_states()
-- Verify API works
-
-**NO real SCF run yet** - just API verification.
-
-### Step 0.5.1: RHF → MultiStateMatrix ✅ DONE
-
-**RHF already migrated!** (commit `fe0d483c` from Phase 0.3)
-
-**Current RHF:**
-```cpp
-// rhf.h - ALREADY on MultiStateMatrix!
-std::shared_ptr<MultiStateMatrix> D_multi_;  // n=1, 64-byte aligned
-std::shared_ptr<MultiStateMatrix> F_multi_;  // n=1
-std::shared_ptr<MultiStateMatrix> G_multi_;  // n=1
-
-SharedMatrix Da_ = D_multi_->get(0);  // View (no copy)
-SharedMatrix Fa_ = F_multi_->get(0);  // View
-SharedMatrix G_  = G_multi_->get(0);  // View
-```
-
-**Minor naming difference:**
-- RHF: `G_` (single state)
-- UHF: `Ga_`, `Gb_` (two states)
-- Both are views into G_multi_, just different naming
-- Not blocking, can unify later if needed
-
-### Step 0.5.2: ROHF → MultiStateMatrix (n=2) ✅ DONE
-
-**ROHF successfully migrated!**
-
-**Changes Made:**
-1. ✅ `rohf.h`: Added D_multi_, F_multi_, G_multi_ (n=2)
-2. ✅ `rohf.cc:common_init()`: Initialize MultiStateMatrix, create views
-   - Da_, Db_, Fa_, Fb_, Ga_, Gb_ are now views (no copying!)
-3. ✅ `rohf.cc:form_D()`: Use D_multi_->zero_all() for efficient zeroing
-4. ✅ `rohf.cc:finalize()`: Reset multi-state matrices properly
-5. ✅ Dt_ kept separate (algorithm requirement)
-
-**New ROHF Pattern (unified with UHF):**
-```cpp
-// rohf.h - MultiStateMatrix pattern
-std::shared_ptr<MultiStateMatrix> D_multi_;  // n=2 (Da, Db views)
-std::shared_ptr<MultiStateMatrix> F_multi_;  // n=2 (Fa, Fb views)
-std::shared_ptr<MultiStateMatrix> G_multi_;  // n=2 (Ga, Gb views)
-
-// Views into contiguous storage (Phase 0.5)
-SharedMatrix Da_ = D_multi_->get(0);  // View, no copy
-SharedMatrix Db_ = D_multi_->get(1);  // View, no copy
-SharedMatrix Fa_ = F_multi_->get(0);  // View, no copy
-SharedMatrix Fb_ = F_multi_->get(1);  // View, no copy
-SharedMatrix Ga_ = G_multi_->get(0);  // View, no copy
-SharedMatrix Gb_ = G_multi_->get(1);  // View, no copy
-```
-
-**Benefits:**
-- ✅ Same pattern as UHF (n=2)
-- ✅ 64-byte alignment from Phase 0.1
-- ✅ Cache locality for Da_/Db_, Fa_/Fb_, Ga_/Gb_
-- ✅ Ready for SCFEngine integration
-
-**Validation (AWAITING USER TEST):**
-- Energy match < 1e-10 Hartree expected
-- All ROHF tests should pass
-- Performance: same or better expected
-
-### Step 0.5.3: Verify unified pattern (NEXT)
-
-After ROHF migration, verify:
-- RHF (n=1), UHF (n=2), ROHF (n=2) all use MultiStateMatrix
-- Compatible patterns for SCFEngine integration
-- Ready for Phase 0.6
+**Achievements:**
+- ✅ RHF uses MultiStateMatrix (n=1) - from Phase 0.3
+- ✅ UHF uses MultiStateMatrix (n=2) - from Phase 0.3
+- ✅ ROHF uses MultiStateMatrix (n=2) - Phase 0.5
+- ✅ Unified pattern ready for SCFEngine
+- ✅ All existing tests pass
 
 ---
 
-## SCFEngine Status
+## Phase 0.6: SCFEngine Foundation (IN PROGRESS) 🚧
 
-**Current State:** ✅ Compiled, all tests pass, but NOT USED YET
+**Goal:** Make SCFEngine actually usable for real SCF calculations.
 
-**Design:**
+**Strategy:** Fix skeleton issues, then test with RHF on H2.
+
+### Step 0.6.1: Add n_states() API ✅ DONE
+
+**Completed:**
+- Added virtual int n_states() const to HF base
+- RHF returns 1, UHF returns 2, ROHF returns 2
+- Compilation successful, tests pass
+
+### Step 0.6.2: Basic API tests ✅ DONE (by user)
+
+**User created 4 tests:**
+1. test_scf_engine_basic_api() - wavefunction infrastructure
+2. test_rhf_n_states() - confirms n_states() = 1
+3. test_uhf_n_states() - confirms n_states() = 2
+4. test_rohf_n_states() - confirms n_states() = 2
+
+**All tests pass!** ✓
+
+### Step 0.6.3: Fix SCFEngine skeleton ← CURRENT
+
+**Problem:** SCFEngine exists but has critical gaps preventing real use.
+
+**Issues to fix:**
+
+1. **compute_density_rms() - placeholder**
+   ```cpp
+   // Current: rough approximation
+   double compute_density_rms() {
+       // TODO: Implement proper density RMS
+       return std::sqrt(delta_E) * 10.0;  // WRONG!
+   }
+   ```
+
+   **Solution needed:**
+   - Get access to current and old density matrices
+   - Compute RMS: sqrt(sum((D_new - D_old)^2) / n_elements)
+
+2. **No access to Da_/Dold_ through HF***
+   ```cpp
+   // Problem: HF* doesn't expose Da() or Dold()
+   theory_->Da();    // ← Doesn't exist!
+   theory_->Dold_();  // ← Doesn't exist!
+   ```
+
+   **Solution needed:**
+   - Add Da()/Db() accessors to HF base class
+   - Or use save_density_and_energy() + compute difference
+
+3. **Missing initialization**
+   - No guess() call
+   - No form_H() call
+   - Just jumps into iteration loop
+
+4. **No DIIS integration**
+   - SCFEngine doesn't call DIIS
+   - But HF already has diis_manager_ !
+
+**Next actions:**
+1. Fix compute_density_rms() properly
+2. Add Da()/Db() accessors to HF (or alternative approach)
+3. Add initialization in iterate()
+4. Test on H2 RHF
+
+### Step 0.6.4: First real SCF run (NEXT)
+
+After fixes, run actual test:
 ```cpp
-class SCFEngine {
-    HF* theory_;  // Uses existing RHF/UHF/etc via virtual methods
-
-    virtual int iterate() {
-        while (iteration_ < max && !converged_) {
-            theory_->save_density_and_energy();
-            theory_->form_G();  // JK + XC
-            theory_->form_F();  // Fock assembly
-            theory_->form_C();  // Diagonalize
-            theory_->form_D();  // Build density
-            check_convergence();
-        }
-    }
-};
+auto rhf = make_shared<RHF>(h2_molecule, ...);
+SCFEngine engine(rhf.get(), options);
+int iters = engine.iterate();  // REAL SCF!
+double E = rhf->compute_E();
+REQUIRE(abs(E - (-1.126...)) < 1e-6);  // H2 energy
 ```
-
-**Why not using yet:** Waiting for unified RHF/UHF/ROHF base (Phase 0.5).
-
-**Next Integration:** Phase 0.6 after unification complete.
 
 **Architecture Documents:**
 - `skelet.md` - Abstract pseudocode skeleton (theory-agnostic design)
