@@ -349,8 +349,20 @@ def scf_iterate(self, e_conv=None, d_conv=None):
     # SCF iterations!
     SCFE_old = 0.0
     Dnorm = 0.0
+    Ediff = 0.0  # For error reporting
     scf_iter_post_screening = 0
-    while True:
+
+    def scf_iteration():
+        """
+        Performs ONE SCF iteration.
+
+        Returns:
+            tuple: (continue_flag, reason)
+                continue_flag: True to continue iterations, False to stop
+                reason: 'converged' | 'max_iter' | 'early_screening_maxiter' | 'mom_not_started' | 'frac_not_started'
+        """
+        nonlocal SCFE_old, Dnorm, Ediff, scf_iter_post_screening
+
         self.iteration_ += 1
 
         diis_performed = False
@@ -565,17 +577,17 @@ def scf_iterate(self, e_conv=None, d_conv=None):
         # if a an excited MOM is requested but not started, don't stop yet
         # Note that MOM_performed_ just checks initialization, and our convergence measures used the pre-MOM orbitals
         if self.MOM_excited_ and ((not self.MOM_performed_) or self.iteration_ == core.get_option('SCF', "MOM_START")):
-            continue
+            return (True, 'mom_not_started')
 
         # if a fractional occupation is requested but not started, don't stop yet
         if frac_enabled and not self.frac_performed_:
-            continue
+            return (True, 'frac_not_started')
 
         # have we completed our post-early screening SCF iterations?
         if early_screening_disabled:
             scf_iter_post_screening += 1
             if scf_iter_post_screening >= scf_maxiter_post_screening and scf_maxiter_post_screening > 0:
-                break
+                return (False, 'early_screening_maxiter')
 
         # Call any postiteration callbacks
         if not ((self.iteration_ == 0) and self.sad_) and _converged(Ediff, Dnorm, e_conv=e_conv, d_conv=d_conv):
@@ -598,12 +610,22 @@ def scf_iterate(self, e_conv=None, d_conv=None):
                     self.jk().clear_D_prev()
 
                 if scf_maxiter_post_screening == 0:
-                    break
+                    return (False, 'converged')
                 else:
                     core.print_out("  Energy and wave function converged with early screening.\n")
                     core.print_out("  Continuing SCF iterations with tighter screening.\n\n")
             else:
-                break
+                return (False, 'converged')
+
+        # Continue iterating
+        return (True, 'continue')
+
+    # Main SCF iteration loop
+    while True:
+        should_continue, reason = scf_iteration()
+
+        if not should_continue:
+            break
 
         if self.iteration_ >= core.get_option('SCF', 'MAXITER'):
             raise SCFConvergenceError("""SCF iterations""", self.iteration_, self, Ediff, Dnorm)

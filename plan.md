@@ -88,11 +88,27 @@ Phase 0.6: API Foundation ✅ DONE
   ├─> 0.6.2: Basic API tests ✅ DONE (user)
   └─> 0.6.3: Strategic decision: Python-first approach ✅ DONE
 
-Phase 1: Python Multi-Cycle Coordinator ✅ DONE
-  ├─> 1.1: Add C++ multi-cycle JK API ✅ DONE
-  ├─> 1.2: Modify form_G() for precomputed J/K ✅ DONE
-  ├─> 1.3: Implement Python multi_cycle_scf_iterate() ✅ DONE
-  └─> 1.4: Test: 2 independent RHF cycles ← NEXT
+Phase 1: Python Multi-Cycle Coordinator 📍 IN PROGRESS - NEW APPROACH
+  ├─> 1.1: Refactor scf_iterate() → scf_iteration() ← NOW
+  ├─> 1.2: Add shared_jk_compute() helper
+  ├─> 1.3: Create multi_scf() coordinator
+  └─> 1.4: Test with 2 independent RHF cycles
+
+**NEW STRATEGY (correct approach):**
+Instead of creating separate multi_cycle_scf_iterate(), we refactor existing
+scf_iterate() to enable multi-SCF coordination while keeping ALL features
+(DIIS, damping, MOM, SOSCF, convergence checks, etc.)
+
+**Step 1.1 Plan:**
+- Extract while True loop body into scf_iteration(self)
+- scf_iterate() becomes: while True: scf_iteration()
+- ZERO logic changes - pure refactoring
+- All existing tests must pass unchanged
+
+**Previous multi_cycle_scf_iterate() implementation:**
+- Created but NOT integrated into workflow
+- Missing DIIS, damping, and other critical features
+- Will be deprecated/removed after proper implementation
 
 Phase 2: Multi-Spin SA-REKS 🎯 GOAL
   ├─> 2.1: SA-REKS theory stub (n_states = N)
