@@ -88,10 +88,10 @@ Phase 0.6: API Foundation ✅ DONE
   ├─> 0.6.2: Basic API tests ✅ DONE (user)
   └─> 0.6.3: Strategic decision: Python-first approach ✅ DONE
 
-Phase 1: Python Multi-Cycle Coordinator 📍 NEXT
-  ├─> 1.1: Design multi_cycle_scf_iterate() API
-  ├─> 1.2: Implement shared JK collection
-  ├─> 1.3: Per-wfn SCF iteration
+Phase 1: Python Multi-Cycle Coordinator 📍 IN PROGRESS
+  ├─> 1.1: Add C++ multi-cycle JK API ✅ DONE
+  ├─> 1.2: Modify form_G() for precomputed J/K ✅ DONE
+  ├─> 1.3: Implement Python multi_cycle_scf_iterate() ← NOW
   └─> 1.4: Test: 2 independent RHF cycles
 
 Phase 2: Multi-Spin SA-REKS 🎯 GOAL
