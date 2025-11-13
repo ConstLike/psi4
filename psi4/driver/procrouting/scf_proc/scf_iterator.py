@@ -362,6 +362,7 @@ def scf_iterate(self, e_conv=None, d_conv=None):
                 reason: 'converged' | 'max_iter' | 'early_screening_maxiter' | 'mom_not_started' | 'frac_not_started'
         """
         nonlocal SCFE_old, Dnorm, Ediff, scf_iter_post_screening
+        nonlocal early_screening, early_screening_disabled
 
         self.iteration_ += 1
 
