@@ -94,7 +94,8 @@ wfn1.initialize()
 wfn2.initialize()
 
 # Run multi-cycle SCF
-print("\nRunning multi_scf()...\n")
+print("\nRunning multi_scf() with NEW architecture...\n")
+print("NOTE: Requires C++ recompilation for Phase 0.6 pybind11 exports\n")
 t0 = time.time()
 
 energies_multi = multi_scf([wfn1, wfn2], e_conv=1e-8, d_conv=1e-6, verbose=True)
