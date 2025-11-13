@@ -89,9 +89,9 @@ Phase 0.6: API Foundation ✅ DONE
   └─> 0.6.3: Strategic decision: Python-first approach ✅ DONE
 
 Phase 1: Python Multi-Cycle Coordinator 📍 IN PROGRESS - NEW APPROACH
-  ├─> 1.1: Refactor scf_iterate() → scf_iteration() ← NOW
-  ├─> 1.2: Add shared_jk_compute() helper
-  ├─> 1.3: Create multi_scf() coordinator
+  ├─> 1.1: Refactor scf_iterate() → extract scf_iteration() ✅ DONE (commit ddd77ddc + fix 6db3bae6)
+  ├─> 1.2: Convert scf_iteration() to _scf_iteration() method ✅ DONE (commit f53d3d9d) ← TESTED (78 tests passed!)
+  ├─> 1.3: Create multi_scf() coordinator ← NOW
   └─> 1.4: Test with 2 independent RHF cycles
 
 **NEW STRATEGY (correct approach):**
@@ -99,16 +99,29 @@ Instead of creating separate multi_cycle_scf_iterate(), we refactor existing
 scf_iterate() to enable multi-SCF coordination while keeping ALL features
 (DIIS, damping, MOM, SOSCF, convergence checks, etc.)
 
-**Step 1.1 Plan:**
-- Extract while True loop body into scf_iteration(self)
-- scf_iterate() becomes: while True: scf_iteration()
+**Step 1.1:** ✅ DONE
+- Extracted while loop body into scf_iteration() closure
+- Used nonlocal variables for state
 - ZERO logic changes - pure refactoring
-- All existing tests must pass unchanged
+- All 78 tests pass! (after fix 6db3bae6)
+
+**Step 1.2:** ✅ DONE (commit f53d3d9d) ← LAST COMPLETED
+- Created _scf_initialize_iteration_state(e_conv, d_conv)
+- Converted closure scf_iteration() → method _scf_iteration()
+- Moved state to self._scf_* members
+- Method can now be called externally
+- All 78 tests pass! ✅
+
+**Step 1.3:** ← IN PROGRESS
+- Create multi_scf() coordinator function
+- Uses _scf_iteration() for each wfn
+- Shared JK computation via jk.compute()
+- Distribution via set_jk_matrices()
 
 **Previous multi_cycle_scf_iterate() implementation:**
-- Created but NOT integrated into workflow
+- Created but NOT integrated into workflow (Phase 1.3, commit 45426f98)
 - Missing DIIS, damping, and other critical features
-- Will be deprecated/removed after proper implementation
+- Will be replaced by proper multi_scf() coordinator
 
 Phase 2: Multi-Spin SA-REKS 🎯 GOAL
   ├─> 2.1: SA-REKS theory stub (n_states = N)
