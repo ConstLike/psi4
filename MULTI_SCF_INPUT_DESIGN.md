@@ -151,12 +151,13 @@ def multi_scf_wavefunction_factory(name, molecule, reference='RHF', options=None
 
 ### 2. User API (3 levels of convenience)
 
-#### Level 1: Automatic (99% users) - NO CHANGES NEEDED
+#### Level 1: Automatic (99% users) - API UNCHANGED
 
 ```python
 # Existing code works without modification
 psi4.set_options({'basis': 'cc-pvdz', 'scf_type': 'df'})
-E = psi4.energy('scf')  # Uses single-cycle SCF (no multi-SCF)
+E = psi4.energy('scf')  # Internally: scf_helper() → multi_scf_helper([wfn]) with N=1
+                         # User sees: No changes, same API, same performance
 ```
 
 #### Level 2: Simple multi-SCF (same options for all)
@@ -209,17 +210,19 @@ wfn2 = multi_scf_wavefunction_factory(
 energies = multi_scf([wfn1, wfn2])
 ```
 
-### 3. Backward compatibility
+### 3. Unified Architecture (CRITICAL DESIGN DECISION)
 
-**IMPORTANT:** Existing `psi4.energy('scf')` continues to work EXACTLY as before!
+**IMPORTANT:** ALL SCF calculations go through multi-SCF coordinator!
 
-- Single-cycle SCF → uses scf_helper() → NO CHANGES
-- multi_scf() → NEW code path → uses snapshot pattern
-- User chooses: `psi4.energy('scf')` vs `multi_scf_helper()`
+- Single-cycle SCF → `scf_helper()` → `multi_scf_helper([wfn])` with N=1
+- Multi-state SCF → `multi_scf_helper([wfn1, wfn2, ...])` with N>1
+- **NO separate code paths** → single unified implementation
+- User API unchanged: `psi4.energy('scf')` works out of box
+- Internally: ALL use same coordinator with options snapshot pattern
 
 ## Implementation Plan
 
-### Phase A: Infrastructure (backward compatible)
+### Phase A: Infrastructure (unified architecture)
 
 1. Create `psi4/driver/procrouting/scf_proc/scf_options_snapshot.py`
    - `snapshot_scf_options()` function
@@ -229,17 +232,21 @@ energies = multi_scf([wfn1, wfn2])
    - `multi_scf_wavefunction_factory()` - creates wfn with snapshot
    - `multi_scf_helper()` - high-level API
 
-3. Modify `scf_iterator.py` `_scf_initialize_iteration_state()`
-   - Check if `wfn._options_snapshot` exists
-   - If yes: use snapshot values
-   - If no: read from global (backward compatible!)
+3. Modify `scf_helper()` in `proc.py`
+   - Always calls `multi_scf_helper([wfn])` for N=1 case
+   - User API unchanged, internally unified
+
+4. Modify `scf_iterator.py` `_scf_initialize_iteration_state()`
+   - Read from `wfn._options_snapshot` (ALWAYS present)
+   - No fallback to global options (snapshot always set by multi_scf_wavefunction_factory)
 
 ### Phase B: Testing
 
-1. Test single-cycle SCF still works (backward compat)
-2. Test multi-SCF with same options
-3. Test multi-SCF with different options
-4. Test that baseline pollution is eliminated
+1. Test single-cycle SCF (N=1) works through unified coordinator
+2. Test multi-SCF (N=2) with same options for all states
+3. Test multi-SCF (N=2) with different options per state
+4. Test that baseline pollution is eliminated (determinism across 100 runs)
+5. Verify performance: single-cycle same speed, multi-state ~2x faster
 
 ### Phase C: Documentation
 
@@ -249,12 +256,14 @@ energies = multi_scf([wfn1, wfn2])
 
 ## Benefits
 
-✅ **No changes for 99% users** - backward compatible
+✅ **No changes for 99% users** - `psi4.energy('scf')` API unchanged
+✅ **Unified architecture** - single code path for N=1 and N>1 (easier maintenance)
 ✅ **Eliminates global state pollution** - each wfn has frozen options
-✅ **Flexible for advanced users** - can override per-wfn
-✅ **Minimal code changes** - adds new layer, doesn't modify existing
+✅ **Flexible for advanced users** - can override per-state options
+✅ **No code duplication** - single coordinator handles all cases
 ✅ **Forward compatible with SA-REKS** - snapshot per state
-✅ **Testable** - can verify snapshot isolation
+✅ **Testable** - can verify snapshot isolation and determinism
+✅ **Performance** - single-cycle unchanged, multi-state ~2x faster
 
 ## File Structure
 

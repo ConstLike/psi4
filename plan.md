@@ -123,10 +123,12 @@ state1 = {'multiplicity': 1, 'nalpha': 5, 'nbeta': 5}  # Singlet
 state2 = {'multiplicity': 3, 'nalpha': 6, 'nbeta': 4}  # Triplet
 ```
 
-**NEW STRATEGY (correct approach):**
-Instead of creating separate multi_cycle_scf_iterate(), we refactor existing
-scf_iterate() to enable multi-SCF coordination while keeping ALL features
-(DIIS, damping, MOM, SOSCF, convergence checks, etc.)
+**UNIFIED ARCHITECTURE (correct approach):**
+Single code path for ALL SCF calculations (N=1 or N>1):
+- Refactored scf_iterate() to enable multi-SCF coordination
+- Keeps ALL features (DIIS, damping, MOM, SOSCF, convergence checks)
+- Single-cycle SCF is just multi-SCF with N=1 (no special case code)
+- Multi-state SCF uses exact same coordinator with N>1
 
 **Step 1.1:** ✅ DONE
 - Extracted while loop body into scf_iteration() closure
@@ -171,29 +173,49 @@ Solution: Options Snapshot Pattern
 - Each wfn has independent option copy
 - No global state pollution
 
+**CRITICAL ARCHITECTURAL DECISION:**
+ALL SCF calculations (even single-cycle) go through multi-SCF coordinator!
+- Single-cycle SCF = special case of multi-SCF with N=1
+- NO separate "old SCF" code path
+- Unified implementation → easier maintenance, no duplication
+
 Implementation:
 1. Create scf_options_snapshot.py:
    - snapshot_scf_options() - freeze current global options
    - apply_options_snapshot(wfn, snapshot) - set wfn-local copy
 2. Create multi_scf_helper.py:
    - multi_scf_wavefunction_factory() - create wfn with snapshot
-   - multi_scf_helper() - high-level API
-3. Modify _scf_initialize_iteration_state():
-   - Check if wfn._options_snapshot exists
-   - If yes: use snapshot, if no: read global (backward compat)
+   - multi_scf_helper() - high-level API (handles N=1 and N>1 cases)
+3. Modify scf_helper() in proc.py:
+   - Internally calls multi_scf_helper() with single wfn (N=1)
+   - User code unchanged: psi4.energy('scf') → scf_helper() → multi_scf_helper([wfn])
+4. Modify _scf_initialize_iteration_state():
+   - Read from wfn._options_snapshot (ALWAYS set by multi_scf_wavefunction_factory)
 
-User API levels:
-- Level 1 (99%): psi4.energy('scf') - no changes, works out of box
-- Level 2 (simple): multi_scf_helper(molecules, method) - auto snapshot
+User API - Three Levels (same coordinator underneath):
+- Level 1 (99%): psi4.energy('scf')
+  → Internally: scf_helper() → multi_scf_helper([wfn]) with N=1
+  → User sees: No changes, works out of box
+- Level 2 (simple multi-SCF): multi_scf_helper([mol1, mol2], method)
+  → Explicit multi-SCF call with automatic options snapshot
 - Level 3 (advanced): multi_scf_wavefunction_factory(..., options={...})
+  → Full control over per-state options
+
+**Naming Convention (matches Psi4 style):**
+- scf_helper() → multi_scf_helper() ✓
+- scf_wavefunction_factory() → multi_scf_wavefunction_factory() ✓
+- scf_iterate() → scf_iterator.py functions ✓
 
 Files:
 ```
 psi4/driver/procrouting/scf_proc/
-├── scf_options_snapshot.py  # NEW
-├── multi_scf_helper.py      # NEW
-└── scf_iterator.py          # modify _scf_initialize_iteration_state
-```
+├── scf_options_snapshot.py      # NEW - snapshot/apply functions
+├── multi_scf_helper.py          # NEW - unified multi-SCF coordinator (N≥1)
+├── scf_iterator.py              # MODIFY - read from snapshot
+└── __init__.py                  # MODIFY - export new functions
+
+psi4/driver/procrouting/
+└── proc.py                      # MODIFY - scf_helper() calls multi_scf_helper()
 
 **Step 1.6:** Validation & Testing
 1. Add validate_multi_scf_compatibility():
