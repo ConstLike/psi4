@@ -1320,11 +1320,6 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
     converged_flags = [False] * len(wfn_list)
     final_energies = [0.0] * len(wfn_list)
 
-    # PERFORMANCE OPTIMIZATION: Cache J/K matrices for converged wfn
-    # Critical for large systems (4000+ basis functions) to avoid recomputing
-    # JK integrals for frozen densities (~O(n³) wasted per iteration)
-    cached_JK = {}  # {wfn_index: {'J': [J_list], 'K': [K_list], 'wK': [wK_list]}}
-
     if verbose:
         header = "  " + "Iter".rjust(4)
         for i in range(len(wfn_list)):
@@ -1336,84 +1331,74 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
     # Main multi-cycle SCF iteration loop
     for iteration in range(1, max_iter + 1):
 
-        # Step 1: SELECTIVE JK collection (PERFORMANCE CRITICAL for large systems)
-        # Strategy: Recompute JK ONLY for active (non-converged) wfn, use cached J/K for converged
+        # Step 1: Collect occupied orbital matrices from ALL wavefunctions
+        # CRITICAL: ALL wfn must participate in JK (including converged ones)
+        # to maintain consistent indexing and prevent discontinuous Fock changes.
         #
-        # For large systems (4000 basis functions):
-        # - JK cost: ~O(n³) DF-SCF ≈ 64 billion FLOPs
-        # - Avoid recomputing for frozen densities → ~10-50x speedup after partial convergence
+        # When a wfn converges early and exits JK, remaining wfn receive
+        # J/K matrices at different indices, which invalidates DIIS history
+        # and causes re-convergence (+8 extra iterations observed in UHF+ROHF test).
         #
-        # Algorithm:
-        # 1. Collect C matrices from ACTIVE wfn only
-        # 2. Compute JK for active wfn
-        # 3. For converged wfn: use cached J/K (density frozen → integrals unchanged)
-        # 4. Distribute ALL J/K (active + cached) to maintain consistent indexing
-
-        active_C_matrices = []  # C matrices for active (non-converged) wfn
-        active_wfn_indices = []  # Indices of active wfn
-        wfn_state_counts = []  # Number of states for each wfn (all, not just active)
+        # Cost: ~1-2% overhead for computing JK of converged (frozen) densities
+        # Benefit: Prevents +50% iteration increase, maintains coupled convergence
+        all_C_occ_matrices = []
+        wfn_state_counts = []  # Track how many states each wfn has
+        active_wfn_indices = []  # Track which wfn need iteration (non-converged)
 
         for i, wfn in enumerate(wfn_list):
-            n_states = wfn.n_states()
-            wfn_state_counts.append(n_states)
+            # ALWAYS collect C matrices (converged + active)
+            C_matrices = wfn.get_orbital_matrices()
+            all_C_occ_matrices.extend(C_matrices)
+            wfn_state_counts.append(len(C_matrices))
 
+            # Track which wfn still need iteration
             if not converged_flags[i]:
-                # Active wfn: collect C matrices for JK computation
-                C_matrices = wfn.get_orbital_matrices()
-                active_C_matrices.extend(C_matrices)
                 active_wfn_indices.append(i)
-            # Converged wfn: will use cached J/K (no C collection needed)
 
-        # Early exit if all converged
+        # Early exit if all converged (no active wfn left)
         if not active_wfn_indices:
             if verbose:
                 core.print_out("\n  All wavefunctions converged!\n\n")
             break
 
-        # Step 2: Shared JK computation for ACTIVE wavefunctions ONLY
-        # Converged wfn densities are frozen → no need to recompute integrals
+        # Step 2: Shared JK computation for ALL wavefunctions (coupled convergence)
+        # Use exported wrapper methods instead of direct vector manipulation
+        # C_clear() clears both C_left and C_right
+        # C_add() appends to both C_left and C_right (symmetric JK)
         jk.C_clear()
-        for C_occ in active_C_matrices:
+        for C_occ in all_C_occ_matrices:
             jk.C_add(C_occ)
 
-        # Single JK call for ACTIVE wfn (massive savings for large systems!)
+        # Single JK call for ALL wavefunctions (including converged)
         jk.compute()
 
-        # Step 3: Distribute J/K/wK to ALL wavefunctions (active + converged)
-        # Key: Maintain consistent indexing by using cached J/K for converged wfn
-        J_active = jk.J()
-        K_active = jk.K()
-        wK_active = jk.wK()
+        # Step 3: Distribute J/K/wK results back to ALL wavefunctions
+        # This maintains consistent Fock operators even after some wfn converge
+        jk_index = 0
+        J_all = jk.J()
+        K_all = jk.K()
+        wK_all = jk.wK()  # Long-range K for LRC functionals (empty if not LRC)
 
-        # Index into active J/K results
-        active_jk_index = 0
+        # Diagnostic check (can be removed after testing)
+        expected_matrices = len(all_C_occ_matrices)
+        if len(J_all) != expected_matrices or len(K_all) != expected_matrices:
+            raise ValidationError(
+                f"JK compute failed: expected {expected_matrices} J/K matrices, "
+                f"got {len(J_all)} J and {len(K_all)} K matrices. "
+                f"C_left has {len(jk.C_left())} matrices, C_right has {len(jk.C_right())} matrices."
+            )
 
+        # Note: wK_all may be empty if not using LRC functional, that's OK
+        # C++ set_jk_matrices() has default empty vector for wK_list
+
+        # Distribute to ALL wfn (maintains consistent indexing)
         for i, wfn in enumerate(wfn_list):
             n_states = wfn_state_counts[i]
-
-            if converged_flags[i]:
-                # CONVERGED: Use cached J/K (frozen density optimization)
-                if i in cached_JK:
-                    J_list = cached_JK[i]['J']
-                    K_list = cached_JK[i]['K']
-                    wK_list = cached_JK[i]['wK']
-                else:
-                    raise ValidationError(
-                        f"Internal error: wfn {i} marked converged but no cached J/K found. "
-                        f"This should not happen - check convergence logic."
-                    )
-            else:
-                # ACTIVE: Extract from fresh JK computation and CACHE for future
-                J_list = [J_active[active_jk_index + j] for j in range(n_states)]
-                K_list = [K_active[active_jk_index + j] for j in range(n_states)]
-                wK_list = [wK_active[active_jk_index + j] for j in range(n_states)] if wK_active else []
-                active_jk_index += n_states
-
-                # Note: Don't cache yet - only cache when wfn actually converges
-                # This avoids memory bloat for slowly-converging wfn
-
-            # Distribute to wfn (uses precomputed or cached)
+            J_list = [J_all[jk_index + j] for j in range(n_states)]
+            K_list = [K_all[jk_index + j] for j in range(n_states)]
+            wK_list = [wK_all[jk_index + j] for j in range(n_states)] if wK_all else []
             wfn.set_jk_matrices(J_list, K_list, wK_list)
+            jk_index += n_states
 
         # Step 4: Each wavefunction completes its SCF iteration
         # Iterate through ALL wfn (to track status), but only active ones call _scf_iteration()
@@ -1436,23 +1421,6 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
                     converged_flags[i] = True
                     final_energies[i] = wfn.get_energies("Total Energy")
                     status_strs.append("CONV")
-
-                    # CRITICAL: Cache J/K matrices for this converged wfn
-                    # Frozen density → J/K won't change → reuse cached values
-                    # Massive performance gain for large systems (4000+ basis)
-                    n_states = wfn.n_states()
-                    # Retrieve J/K that were just set via set_jk_matrices()
-                    # Note: We need to get them from the wfn's internal storage
-                    # For now, extract from active arrays (we just computed them)
-                    idx_in_active = active_wfn_indices.index(i)
-                    start_idx = sum(wfn_state_counts[active_wfn_indices[j]] for j in range(idx_in_active))
-
-                    cached_JK[i] = {
-                        'J': [J_active[start_idx + j] for j in range(n_states)],
-                        'K': [K_active[start_idx + j] for j in range(n_states)],
-                        'wK': [wK_active[start_idx + j] for j in range(n_states)] if wK_active else []
-                    }
-
                 elif reason in ['mom_not_started', 'frac_not_started']:
                     # Special cases - keep iterating
                     all_converged = False
@@ -1462,17 +1430,6 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
                     converged_flags[i] = True
                     final_energies[i] = wfn.get_energies("Total Energy")
                     status_strs.append("COSX")
-
-                    # Cache J/K for COSX early exit too
-                    n_states = wfn.n_states()
-                    idx_in_active = active_wfn_indices.index(i)
-                    start_idx = sum(wfn_state_counts[active_wfn_indices[j]] for j in range(idx_in_active))
-
-                    cached_JK[i] = {
-                        'J': [J_active[start_idx + j] for j in range(n_states)],
-                        'K': [K_active[start_idx + j] for j in range(n_states)],
-                        'wK': [wK_active[start_idx + j] for j in range(n_states)] if wK_active else []
-                    }
                 else:
                     # Unknown reason
                     status_strs.append(reason[:4].upper())
