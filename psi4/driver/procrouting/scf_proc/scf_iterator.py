@@ -283,13 +283,13 @@ def _scf_initialize_iteration_state(self, e_conv, d_conv):
 
     # Store configuration flags
     self._scf_is_dfjk = core.get_global_option('SCF_TYPE').endswith('DF')
-    self._scf_verbose = core.get_option('SCF', "PRINT")
-    self._scf_reference = core.get_option('SCF', "REFERENCE")
+    self._scf_verbose = get_option_from_snapshot(self, 'PRINT')
+    self._scf_reference = core.get_option('SCF', "REFERENCE")  # OK from global (doesn't change)
     self._scf_damping_enabled = _validate_damping()
     self._scf_soscf_enabled = _validate_soscf()
     self._scf_frac_enabled = _validate_frac()
     self._scf_efp_enabled = hasattr(self.molecule(), 'EFP')
-    self._scf_cosx_enabled = "COSX" in core.get_option('SCF', 'SCF_TYPE')
+    self._scf_cosx_enabled = "COSX" in core.get_option('SCF', 'SCF_TYPE')  # OK from global
 
     # CRITICAL: Set DIIS/MOM members that are used by _scf_iteration()
     # These were originally in scf_iterate() but needed for multi_scf() too
@@ -303,7 +303,7 @@ def _scf_initialize_iteration_state(self, e_conv, d_conv):
         self._scf_early_screening = True
         self.jk().set_COSX_grid("Initial")
 
-    self._scf_maxiter_post_screening = core.get_option('SCF', 'COSX_MAXITER_FINAL')
+    self._scf_maxiter_post_screening = get_option_from_snapshot(self, 'COSX_MAXITER_FINAL')
     if self._scf_maxiter_post_screening < -1:
         raise ValidationError('COSX_MAXITER_FINAL ({}) must be -1 or above. If you wish to attempt full SCF converge on the final COSX grid, set COSX_MAXITER_FINAL to -1.'.format(self._scf_maxiter_post_screening))
 
@@ -521,7 +521,7 @@ def _scf_iteration(self):
             nmicro = self.soscf_update(get_option_from_snapshot(self, 'SOSCF_CONV'),
                                        get_option_from_snapshot(self, 'SOSCF_MIN_ITER'),
                                        get_option_from_snapshot(self, 'SOSCF_MAX_ITER'),
-                                       core.get_option('SCF', 'SOSCF_PRINT'))
+                                       get_option_from_snapshot(self, 'SOSCF_PRINT'))
             # if zero, the soscf call bounced for some reason
             soscf_performed = (nmicro > 0)
 
@@ -573,8 +573,8 @@ def _scf_iteration(self):
 
             # frac, MOM invoked here from Wfn::HF::find_occupation
             core.timer_on("HF: Form C")
-            level_shift = core.get_option("SCF", "LEVEL_SHIFT")
-            if level_shift > 0 and self._scf_Dnorm > core.get_option('SCF', 'LEVEL_SHIFT_CUTOFF'):
+            level_shift = get_option_from_snapshot(self, 'LEVEL_SHIFT')
+            if level_shift > 0 and self._scf_Dnorm > get_option_from_snapshot(self, 'LEVEL_SHIFT_CUTOFF'):
                 status.append("SHIFT")
                 self.form_C(level_shift)
             else:

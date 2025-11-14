@@ -53,6 +53,7 @@ def snapshot_scf_options():
     snapshot['SOSCF_CONV'] = core.get_option('SCF', 'SOSCF_CONV')
     snapshot['SOSCF_MIN_ITER'] = core.get_option('SCF', 'SOSCF_MIN_ITER')
     snapshot['SOSCF_MAX_ITER'] = core.get_option('SCF', 'SOSCF_MAX_ITER')
+    snapshot['SOSCF_PRINT'] = core.get_option('SCF', 'SOSCF_PRINT')
 
     # ===== MOM Options =====
     snapshot['MOM_START'] = core.get_option('SCF', 'MOM_START')
@@ -72,6 +73,7 @@ def snapshot_scf_options():
 
     # ===== Other Options =====
     snapshot['LEVEL_SHIFT'] = core.get_option('SCF', 'LEVEL_SHIFT')
+    snapshot['LEVEL_SHIFT_CUTOFF'] = core.get_option('SCF', 'LEVEL_SHIFT_CUTOFF')
     snapshot['PRINT'] = core.get_option('SCF', 'PRINT')
 
     # ===== COSX Options =====
