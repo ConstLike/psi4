@@ -201,16 +201,19 @@ void RHF::form_G() {
         G_->zero();
     }
 
-    // Multi-cycle JK: use pre-computed J/K if available
+    // Multi-cycle JK: use pre-computed J/K/wK if available
     if (use_precomputed_jk_) {
-        // Python multi_scf() provided pre-computed J/K
+        // Python multi_scf() provided pre-computed J/K/wK
         J_ = precomputed_J_[0];
         if (functional_->is_x_hybrid()) {
             K_ = precomputed_K_[0];
         }
-        // Note: wK not supported in multi-cycle yet (would need separate API)
         if (functional_->is_x_lrc()) {
-            throw PSIEXCEPTION("Multi-cycle JK with LRC functionals not yet supported");
+            if (!precomputed_wK_.empty()) {
+                wK_ = precomputed_wK_[0];
+            } else {
+                throw PSIEXCEPTION("LRC functional requires wK matrices in multi_scf()");
+            }
         }
     } else {
         // Normal path: compute J/K using JK builder

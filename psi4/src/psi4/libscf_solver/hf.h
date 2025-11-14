@@ -131,11 +131,12 @@ class HF : public Wavefunction {
     /// The soon to be ubiquitous JK object
     std::shared_ptr<JK> jk_;
 
-    /// Multi-cycle JK: pre-computed J/K matrices from shared JK computation
+    /// Multi-cycle JK: pre-computed J/K/wK matrices from shared JK computation
     /// Used when multiple SCF calculations share a single JK builder
     std::vector<SharedMatrix> precomputed_J_;
     std::vector<SharedMatrix> precomputed_K_;
-    /// Flag: use pre-computed J/K instead of calling jk_->compute()
+    std::vector<SharedMatrix> precomputed_wK_;  // Long-range K for LRC functionals (ωB97X-V, CAM-B3LYP)
+    /// Flag: use pre-computed J/K/wK instead of calling jk_->compute()
     /// Enables backward compatibility (default: false, compute J/K normally)
     bool use_precomputed_jk_;
 
@@ -342,16 +343,19 @@ class HF : public Wavefunction {
         return {Ca_subset("SO", "OCC")};
     }
 
-    /// Sets pre-computed J/K matrices for multi-cycle JK computation
+    /// Sets pre-computed J/K/wK matrices for multi-cycle JK computation
     /// Used by Python multi_scf() to distribute shared JK results
     /// After calling this, form_G() should use these matrices instead of computing new ones
     /// @param J_list: List of J matrices (length = n_states())
     /// @param K_list: List of K matrices (length = n_states())
+    /// @param wK_list: List of long-range K matrices (length = n_states(), empty if not LRC functional)
     virtual void set_jk_matrices(const std::vector<SharedMatrix>& J_list,
-                                  const std::vector<SharedMatrix>& K_list) {
-        // Store pre-computed J/K and enable flag for form_G() to use them
+                                  const std::vector<SharedMatrix>& K_list,
+                                  const std::vector<SharedMatrix>& wK_list = std::vector<SharedMatrix>()) {
+        // Store pre-computed J/K/wK and enable flag for form_G() to use them
         precomputed_J_ = J_list;
         precomputed_K_ = K_list;
+        precomputed_wK_ = wK_list;
         use_precomputed_jk_ = true;
     }
 

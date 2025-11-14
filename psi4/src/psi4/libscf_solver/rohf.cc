@@ -947,9 +947,9 @@ int ROHF::soscf_update(double soscf_conv, int soscf_min_iter, int soscf_max_iter
 void ROHF::form_G() {
     Dimension dim_zero(nirrep_, "Zero Dim");
 
-    // Multi-cycle JK: use pre-computed J/K if available
+    // Multi-cycle JK: use pre-computed J/K/wK if available
     if (use_precomputed_jk_) {
-        // Python multi_scf() provided pre-computed J/K
+        // Python multi_scf() provided pre-computed J/K/wK
         // ROHF has 2 states: J[0] for docc, J[1] for socc
         Ga_->copy(precomputed_J_[0]);
         Ga_->scale(2.0);
@@ -962,6 +962,11 @@ void ROHF::form_G() {
         Gb_->copy(Ga_);
         Ga_->subtract(Ka_);
         Gb_->subtract(Kb_);
+
+        // Note: ROHF does not support LRC functionals (no wKa_/wKb_ members)
+        if (functional_->is_x_lrc()) {
+            throw PSIEXCEPTION("ROHF does not support LRC functionals in multi_scf()");
+        }
     } else {
         // Normal path: compute J/K using JK builder
         auto& C = jk_->C_left();

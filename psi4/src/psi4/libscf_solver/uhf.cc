@@ -201,9 +201,9 @@ void UHF::form_G() {
         Gb_->zero();
     }
 
-    // Multi-cycle JK: use pre-computed J/K if available
+    // Multi-cycle JK: use pre-computed J/K/wK if available
     if (use_precomputed_jk_) {
-        // Python multi_scf() provided pre-computed J/K
+        // Python multi_scf() provided pre-computed J/K/wK
         // UHF has 2 states: J[0] for alpha, J[1] for beta
         J_->copy(precomputed_J_[0]);
         J_->add(precomputed_J_[1]);  // Total J = J_alpha + J_beta
@@ -211,9 +211,13 @@ void UHF::form_G() {
             Ka_ = precomputed_K_[0];
             Kb_ = precomputed_K_[1];
         }
-        // Note: wK not supported in multi-cycle yet (would need separate API)
         if (functional_->is_x_lrc()) {
-            throw PSIEXCEPTION("Multi-cycle JK with LRC functionals not yet supported");
+            if (!precomputed_wK_.empty() && precomputed_wK_.size() >= 2) {
+                wKa_ = precomputed_wK_[0];
+                wKb_ = precomputed_wK_[1];
+            } else {
+                throw PSIEXCEPTION("LRC functional requires wK matrices in multi_scf()");
+            }
         }
     } else {
         // Normal path: compute J/K using JK builder

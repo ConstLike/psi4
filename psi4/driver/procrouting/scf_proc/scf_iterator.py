@@ -1287,10 +1287,11 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
         # Single JK call for all ACTIVE wavefunctions!
         jk.compute()
 
-        # Step 3: Distribute J/K results back to ACTIVE wavefunctions only
+        # Step 3: Distribute J/K/wK results back to ACTIVE wavefunctions only
         jk_index = 0
         J_all = jk.J()
         K_all = jk.K()
+        wK_all = jk.wK()  # Long-range K for LRC functionals (empty if not LRC)
 
         # Diagnostic check (can be removed after testing)
         expected_matrices = len(all_C_occ_matrices)
@@ -1301,13 +1302,17 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
                 f"C_left has {len(jk.C_left())} matrices, C_right has {len(jk.C_right())} matrices."
             )
 
+        # Note: wK_all may be empty if not using LRC functional, that's OK
+        # C++ set_jk_matrices() has default empty vector for wK_list
+
         # Distribute to active wfn only
         for idx_in_active_list, wfn_idx in enumerate(active_wfn_indices):
             wfn = wfn_list[wfn_idx]
             n_states = wfn_state_counts[idx_in_active_list]
             J_list = [J_all[jk_index + i] for i in range(n_states)]
             K_list = [K_all[jk_index + i] for i in range(n_states)]
-            wfn.set_jk_matrices(J_list, K_list)
+            wK_list = [wK_all[jk_index + i] for i in range(n_states)] if wK_all else []
+            wfn.set_jk_matrices(J_list, K_list, wK_list)
             jk_index += n_states
 
         # Step 4: Each wavefunction completes its SCF iteration
