@@ -32,31 +32,31 @@
 
 ### ✅ COMPLETED (2025-01-14)
 
-**1. Coupled Convergence + Cached JK Pattern** ✅ PRODUCTION-GRADE FIX
-- **Problem v1:** Converged wfn exiting JK caused +8 extra iterations (DIIS invalidation)
-- **Problem v2:** Recomputing JK for frozen densities wastes O(n³) compute on large systems
-- **Solution:** Selective JK recomputation + caching
-  - Compute JK ONLY for active (non-converged) wfn
-  - Cache J/K when wfn converges (frozen density optimization)
-  - Reuse cached J/K for converged wfn (no recomputation!)
+**1. Coupled Convergence Pattern** ✅ FIXED
+- **Problem:** Converged wfn exiting JK caused +8 extra iterations (DIIS invalidation)
+- **Solution:** Keep ALL wfn in JK until ALL converge
   - Maintains consistent indexing (prevents DIIS invalidation)
+  - Cost: ~1-2% overhead (computing JK for frozen densities)
+  - Benefit: Prevents +50% iteration penalty
+  - SA-REKS ready: Essential for multi-state convergence
 
-**Performance (Large Systems - 4000 basis functions):**
-- Small systems (25 basis): 0% overhead (optimal)
-- Large systems (4000 basis): 10-50x speedup after partial convergence
-- Example: UHF+ROHF, ROHF converges iter 6, UHF iter 16
-  - Before: 640 billion wasted FLOPs (10 iters × 64B FLOPs)
-  - After: 0 wasted FLOPs (cached J/K reused)
-  - Speedup: ~2x per iteration after ROHF convergence
-- Multi-wfn (5 systems): ~40% average speedup, up to 80% late-stage
-
-**Memory:** ~128 MB per wfn state (4000 basis), 1-2 GB for 5-wfn system (acceptable on HPC)
-
-**100% CPU Utilization:** No wasted JK computation, production-grade HPC code!
+**Large System Optimization (Future Work):**
+- Explicit Python-level caching was attempted (commit 8a4649c9) but reverted (86a8e7a8)
+- Critical issues identified:
+  1. Index mapping bugs (active_wfn_indices complexity)
+  2. Matrix lifetime management (SharedMatrix vs deep copy needed)
+  3. COSX/INCFOCK compatibility (grid switching, incremental builds)
+  4. Thread safety concerns for future parallelization
+  5. Memory management complexity (~GB-scale cache)
+- Current approach: Rely on JK builder internal optimization
+  - Modern DF-JK builders may cache internally (density-based)
+  - Need testing on large systems to quantify
+  - If insufficient, Phase 2.5 can add explicit cache with proper design
 
 **Commits:**
-- 46ea1dd1: Initial coupled convergence (maintains indexing)
-- 8a4649c9: Production optimization (cached JK for large systems)
+- 46ea1dd1: Coupled convergence fix (maintains indexing)
+- 8a4649c9: Cached JK attempt (reverted in 86a8e7a8)
+- 86a8e7a8: Revert - needs design review
 
 ### HIGH PRIORITY (Phase 1.6 - Next)
 
@@ -579,12 +579,13 @@ def test_scf_iteration_single_step():
 **Что было достигнуто:**
 - Phase 0: +15.9% from MultiStateMatrix (cache locality)
 - Phase 1: +1.8-2x from shared JK batching
-- Bug fix v1 (2025-01-14): Coupled convergence prevents +50% iteration penalty
-- **Bug fix v2 (2025-01-14): Cached JK for large systems**
-  - Small systems (25 basis): 0% overhead
-  - Large systems (4000 basis): 10-50x speedup after partial convergence
-  - Multi-wfn (5 systems): ~40% average speedup
-- **Total potential: 3-5x speedup vs original for large multi-wfn calculations!**
+- Bug fix (2025-01-14): Coupled convergence prevents +50% iteration penalty
+- **Total potential: 2-2.5x speedup vs original!**
+
+**Large system optimization (deferred to Phase 2.5):**
+- Explicit JK caching attempted but reverted due to complexity
+- Will test JK builder internal optimization first
+- If needed, proper cache design in Phase 2.5 after threading
 
 **Следующие шаги:**
 - Phase 1.6: Validation & determinism testing (HIGH priority)

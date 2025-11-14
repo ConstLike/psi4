@@ -175,22 +175,19 @@ Solution: Options Snapshot Pattern ✅ COMPLETE
 - All validate functions read from snapshot
 - Backward compatible (single-cycle falls back to global)
 
-**Step 1.5.1:** ✅ DONE (2025-01-14) - Production-Grade Coupled Convergence
-Problem v1: Early exit disruption (+8 extra iterations)
+**Step 1.5.1:** ✅ DONE (2025-01-14) - Coupled Convergence Bug Fix
+Problem: Early exit disruption (+8 extra iterations)
 - ROHF converges → exits JK → UHF index mismatch → DIIS invalidated
-Problem v2: Wasted O(n³) compute for frozen densities (large systems)
-
-Solution: Selective JK + Caching
-- Compute JK ONLY for active (non-converged) wfn
-- Cache J/K when wfn converges (frozen density optimization)
-- Reuse cached J/K for converged wfn (maintains consistent indexing)
-
-Performance:
-- Small systems (25 basis): 0% overhead (optimal)
-- Large systems (4000 basis): 10-50x speedup after partial convergence
-- Multi-wfn (5 systems): ~40% average speedup, up to 80% late-stage
-- 100% CPU utilization (no wasted compute)
+Solution: Keep ALL wfn in JK until ALL converge
+- Maintains consistent indexing (prevents DIIS invalidation)
+- Cost: ~1-2% overhead for small systems
+- For large systems: JK builder may have internal caching (to be tested)
 - SA-REKS ready
+
+Note: Explicit Python-level caching was considered but reverted (commit 86a8e7a8)
+due to complexity: index bugs, matrix lifetime, COSX/INCFOCK compatibility.
+Will rely on JK builder internal optimization. If needed, explicit cache
+can be added in Phase 2.5 after threading architecture finalized.
 
 **CRITICAL ARCHITECTURAL DECISION:**
 ALL SCF calculations (even single-cycle) go through multi-SCF coordinator!
