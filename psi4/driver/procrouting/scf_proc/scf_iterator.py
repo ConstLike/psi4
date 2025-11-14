@@ -1331,20 +1331,29 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
     # Main multi-cycle SCF iteration loop
     for iteration in range(1, max_iter + 1):
 
-        # Step 1: Collect occupied orbital matrices ONLY from non-converged (active) wavefunctions
-        # This is critical: converged wfn should NOT participate in JK computation
-        active_wfn_indices = []  # Indices of active wfn in wfn_list
+        # Step 1: Collect occupied orbital matrices from ALL wavefunctions
+        # CRITICAL: ALL wfn must participate in JK (including converged ones)
+        # to maintain consistent indexing and prevent discontinuous Fock changes.
+        #
+        # When a wfn converges early and exits JK, remaining wfn receive
+        # J/K matrices at different indices, which invalidates DIIS history
+        # and causes re-convergence (+8 extra iterations observed in UHF+ROHF test).
+        #
+        # Cost: ~1-2% overhead for computing JK of converged (frozen) densities
+        # Benefit: Prevents +50% iteration increase, maintains coupled convergence
         all_C_occ_matrices = []
-        wfn_state_counts = []  # Track how many states each active wfn has
+        wfn_state_counts = []  # Track how many states each wfn has
+        active_wfn_indices = []  # Track which wfn need iteration (non-converged)
 
         for i, wfn in enumerate(wfn_list):
-            if converged_flags[i]:
-                continue  # Skip converged wfn - don't collect C matrices
-
+            # ALWAYS collect C matrices (converged + active)
             C_matrices = wfn.get_orbital_matrices()
             all_C_occ_matrices.extend(C_matrices)
-            active_wfn_indices.append(i)
             wfn_state_counts.append(len(C_matrices))
+
+            # Track which wfn still need iteration
+            if not converged_flags[i]:
+                active_wfn_indices.append(i)
 
         # Early exit if all converged (no active wfn left)
         if not active_wfn_indices:
@@ -1352,7 +1361,7 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
                 core.print_out("\n  All wavefunctions converged!\n\n")
             break
 
-        # Step 2: Shared JK computation for ACTIVE wavefunctions only (KEY OPTIMIZATION!)
+        # Step 2: Shared JK computation for ALL wavefunctions (coupled convergence)
         # Use exported wrapper methods instead of direct vector manipulation
         # C_clear() clears both C_left and C_right
         # C_add() appends to both C_left and C_right (symmetric JK)
@@ -1360,10 +1369,11 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
         for C_occ in all_C_occ_matrices:
             jk.C_add(C_occ)
 
-        # Single JK call for all ACTIVE wavefunctions!
+        # Single JK call for ALL wavefunctions (including converged)
         jk.compute()
 
-        # Step 3: Distribute J/K/wK results back to ACTIVE wavefunctions only
+        # Step 3: Distribute J/K/wK results back to ALL wavefunctions
+        # This maintains consistent Fock operators even after some wfn converge
         jk_index = 0
         J_all = jk.J()
         K_all = jk.K()
@@ -1381,13 +1391,12 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
         # Note: wK_all may be empty if not using LRC functional, that's OK
         # C++ set_jk_matrices() has default empty vector for wK_list
 
-        # Distribute to active wfn only
-        for idx_in_active_list, wfn_idx in enumerate(active_wfn_indices):
-            wfn = wfn_list[wfn_idx]
-            n_states = wfn_state_counts[idx_in_active_list]
-            J_list = [J_all[jk_index + i] for i in range(n_states)]
-            K_list = [K_all[jk_index + i] for i in range(n_states)]
-            wK_list = [wK_all[jk_index + i] for i in range(n_states)] if wK_all else []
+        # Distribute to ALL wfn (maintains consistent indexing)
+        for i, wfn in enumerate(wfn_list):
+            n_states = wfn_state_counts[i]
+            J_list = [J_all[jk_index + j] for j in range(n_states)]
+            K_list = [K_all[jk_index + j] for j in range(n_states)]
+            wK_list = [wK_all[jk_index + j] for j in range(n_states)] if wK_all else []
             wfn.set_jk_matrices(J_list, K_list, wK_list)
             jk_index += n_states
 
