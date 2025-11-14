@@ -358,9 +358,10 @@ void export_wavefunction(py::module& m) {
              "Returns the occupied orbital matrices for multi-cycle JK computation. "
              "RHF returns [Ca_occ], UHF/ROHF return [Ca_occ, Cb_occ].")
         .def("set_jk_matrices", &scf::HF::set_jk_matrices,
-             "Sets pre-computed J and K matrices for multi-cycle SCF. "
-             "Enables form_G() to use precomputed matrices instead of calling jk.compute().",
-             "J_list"_a, "K_list"_a)
+             "Sets pre-computed J/K/wK matrices for multi-cycle SCF. "
+             "Enables form_G() to use precomputed matrices instead of calling jk.compute(). "
+             "wK_list is optional (for LRC functionals like wB97X-V).",
+             "J_list"_a, "K_list"_a, "wK_list"_a = std::vector<SharedMatrix>())
         .def("functional", &scf::HF::functional, "Returns the internal DFT Superfunctional.")
         .def("V_potential", &scf::HF::V_potential, "Returns the internal DFT V object.")
         .def("finalize", &scf::HF::finalize, "Cleans up the the Wavefunction's temporary data.")
