@@ -1265,11 +1265,12 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
             wfn_state_counts.append(len(C_matrices))
 
         # Step 2: Shared JK computation (KEY OPTIMIZATION!)
-        jk.C_left().clear()
-        jk.C_right().clear()  # Need to clear both for symmetric JK
+        # Use exported wrapper methods instead of direct vector manipulation
+        # C_clear() clears both C_left and C_right
+        # C_add() appends to both C_left and C_right (symmetric JK)
+        jk.C_clear()
         for C_occ in all_C_occ_matrices:
-            jk.C_left().append(C_occ)
-            jk.C_right().append(C_occ)  # For symmetric JK: C_left == C_right
+            jk.C_add(C_occ)
 
         # Single JK call for ALL wavefunctions!
         jk.compute()
