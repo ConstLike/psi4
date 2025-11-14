@@ -88,9 +88,14 @@ class ROHF : public HF {
     /// ROHF handles 2 states (alpha and beta with different occupations)
     int n_states() const override { return 2; }
 
-    /// Returns {Ca_, Cb_} for multi-cycle JK computation
+    /// Returns {Cdocc, Csocc} for multi-cycle JK computation
+    /// IMPORTANT: Returns ONLY occupied orbitals (docc and socc blocks)
     std::vector<SharedMatrix> get_orbital_matrices() const override {
-        return {Ca_, Cb_};
+        // ROHF needs separate docc and socc blocks (same as form_G())
+        Dimension dim_zero(nirrep_, "Zero Dim");
+        SharedMatrix Cdocc = Ca_->get_block({dim_zero, nsopi_}, {dim_zero, nbetapi_});
+        SharedMatrix Csocc = Ca_->get_block({dim_zero, nsopi_}, {nbetapi_, nalphapi_});
+        return {Cdocc, Csocc};
     }
 
     void save_density_and_energy() override;

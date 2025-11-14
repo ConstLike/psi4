@@ -83,9 +83,10 @@ class UHF : public HF {
     /// UHF handles 2 states (alpha and beta spins)
     int n_states() const override { return 2; }
 
-    /// Returns {Ca_, Cb_} for multi-cycle JK computation
+    /// Returns {Ca_occ, Cb_occ} for multi-cycle JK computation
+    /// IMPORTANT: Returns ONLY occupied orbitals
     std::vector<SharedMatrix> get_orbital_matrices() const override {
-        return {Ca_, Cb_};
+        return {Ca_subset("SO", "OCC"), Cb_subset("SO", "OCC")};
     }
 
     void save_density_and_energy() override;

@@ -332,12 +332,14 @@ class HF : public Wavefunction {
 
     /// Returns list of orbital matrices for multi-cycle JK computation
     /// Used by Python multi_scf() to collect C matrices
-    /// RHF: returns {Ca_}
-    /// UHF: returns {Ca_, Cb_}
-    /// ROHF: returns {Ca_, Cb_}
-    /// SA-REKS: returns {C_state0, C_state1, ..., C_stateN}
+    /// IMPORTANT: Returns ONLY OCCUPIED orbitals, not full C matrix
+    /// RHF: returns {Ca_occ}
+    /// UHF: returns {Ca_occ, Cb_occ}
+    /// ROHF: returns {Cdocc, Csocc}
+    /// SA-REKS: returns {C_state0_occ, C_state1_occ, ..., C_stateN_occ}
     virtual std::vector<SharedMatrix> get_orbital_matrices() const {
-        return {Ca_};  // Default: RHF-like behavior
+        // Default: RHF-like behavior - return only occupied orbitals
+        return {Ca_subset("SO", "OCC")};
     }
 
     /// Sets pre-computed J/K matrices for multi-cycle JK computation
