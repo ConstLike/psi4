@@ -1255,16 +1255,28 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
     # Main multi-cycle SCF iteration loop
     for iteration in range(1, max_iter + 1):
 
-        # Step 1: Collect occupied orbital matrices from all wavefunctions
+        # Step 1: Collect occupied orbital matrices ONLY from non-converged (active) wavefunctions
+        # This is critical: converged wfn should NOT participate in JK computation
+        active_wfn_indices = []  # Indices of active wfn in wfn_list
         all_C_occ_matrices = []
-        wfn_state_counts = []  # Track how many states each wfn has
+        wfn_state_counts = []  # Track how many states each active wfn has
 
-        for wfn in wfn_list:
+        for i, wfn in enumerate(wfn_list):
+            if converged_flags[i]:
+                continue  # Skip converged wfn - don't collect C matrices
+
             C_matrices = wfn.get_orbital_matrices()
             all_C_occ_matrices.extend(C_matrices)
+            active_wfn_indices.append(i)
             wfn_state_counts.append(len(C_matrices))
 
-        # Step 2: Shared JK computation (KEY OPTIMIZATION!)
+        # Early exit if all converged (no active wfn left)
+        if not active_wfn_indices:
+            if verbose:
+                core.print_out("\n  All wavefunctions converged!\n\n")
+            break
+
+        # Step 2: Shared JK computation for ACTIVE wavefunctions only (KEY OPTIMIZATION!)
         # Use exported wrapper methods instead of direct vector manipulation
         # C_clear() clears both C_left and C_right
         # C_add() appends to both C_left and C_right (symmetric JK)
@@ -1272,10 +1284,10 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
         for C_occ in all_C_occ_matrices:
             jk.C_add(C_occ)
 
-        # Single JK call for ALL wavefunctions!
+        # Single JK call for all ACTIVE wavefunctions!
         jk.compute()
 
-        # Step 3: Distribute J/K results back to each wavefunction
+        # Step 3: Distribute J/K results back to ACTIVE wavefunctions only
         jk_index = 0
         J_all = jk.J()
         K_all = jk.K()
@@ -1289,20 +1301,24 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
                 f"C_left has {len(jk.C_left())} matrices, C_right has {len(jk.C_right())} matrices."
             )
 
-        for wfn, n_states in zip(wfn_list, wfn_state_counts):
+        # Distribute to active wfn only
+        for idx_in_active_list, wfn_idx in enumerate(active_wfn_indices):
+            wfn = wfn_list[wfn_idx]
+            n_states = wfn_state_counts[idx_in_active_list]
             J_list = [J_all[jk_index + i] for i in range(n_states)]
             K_list = [K_all[jk_index + i] for i in range(n_states)]
             wfn.set_jk_matrices(J_list, K_list)
             jk_index += n_states
 
         # Step 4: Each wavefunction completes its SCF iteration
+        # Iterate through ALL wfn (to track status), but only active ones call _scf_iteration()
         # This is where ALL features work: DIIS, damping, SOSCF, MOM, FRAC, etc.
         all_converged = True
         status_strs = []
 
         for i, wfn in enumerate(wfn_list):
             if converged_flags[i]:
-                # Already converged, skip
+                # Already converged, skip iteration
                 status_strs.append("CONV")
                 continue
 
