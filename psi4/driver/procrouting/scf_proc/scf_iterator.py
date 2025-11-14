@@ -291,6 +291,12 @@ def _scf_initialize_iteration_state(self, e_conv, d_conv):
     self._scf_efp_enabled = hasattr(self.molecule(), 'EFP')
     self._scf_cosx_enabled = "COSX" in core.get_option('SCF', 'SCF_TYPE')
 
+    # CRITICAL: Set DIIS/MOM members that are used by _scf_iteration()
+    # These were originally in scf_iterate() but needed for multi_scf() too
+    self.diis_enabled_ = self.validate_diis()
+    self.MOM_excited_ = _validate_MOM()
+    self.diis_start_ = get_option_from_snapshot(self, 'DIIS_START')
+
     # COSX early screening parameters
     self._scf_early_screening = False
     if self._scf_cosx_enabled:
