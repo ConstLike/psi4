@@ -1218,6 +1218,17 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
     # This prevents non-determinism from global state pollution between wfn creation
     options_snapshot = snapshot_scf_options()
 
+    # CRITICAL: Apply options snapshot to ALL wfn BEFORE any initialization
+    # This ensures wfn.initialize() reads from frozen snapshot, not from global state
+    for wfn in wfn_list:
+        apply_options_snapshot(wfn, options_snapshot)
+
+    # Initialize wavefunctions if not already done
+    # After snapshot applied, wfn.initialize() reads from frozen options
+    for wfn in wfn_list:
+        if wfn.jk() is None:
+            wfn.initialize()
+
     if verbose:
         core.print_out("\n  ==> Multi-Cycle SCF (NEW Architecture) <==\n\n")
         core.print_out("  Number of wavefunctions: {}\n".format(len(wfn_list)))
@@ -1235,17 +1246,15 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
     # Get JK object from first wavefunction (all must use same basis)
     jk = wfn_list[0].jk()
     if jk is None:
-        raise ValidationError("JK object not initialized. Call wfn.initialize() first.")
+        raise ValidationError("JK object not initialized after wfn.initialize(). This should not happen.")
 
     # Ensure JK is configured to compute J and K matrices
     jk.set_do_J(True)
     jk.set_do_K(True)  # Needed for hybrid functionals (HF exchange)
 
     # Initialize iteration state for each wavefunction
-    # CRITICAL: Apply options snapshot to each wfn BEFORE initialization
-    # This ensures all wfn read from frozen snapshot, not from global state
+    # Snapshot already applied above, so reads from frozen options
     for wfn in wfn_list:
-        apply_options_snapshot(wfn, options_snapshot)
         wfn._scf_initialize_iteration_state(e_conv, d_conv)
 
     # Track convergence status for each wfn
