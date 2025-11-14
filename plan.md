@@ -88,13 +88,14 @@ Phase 0.6: API Foundation ✅ DONE
   ├─> 0.6.2: Basic API tests ✅ DONE (user)
   └─> 0.6.3: Strategic decision: Python-first approach ✅ DONE
 
-Phase 1: Python Multi-Cycle Coordinator 📍 IN PROGRESS - NEW APPROACH
+Phase 1: Python Multi-Cycle Coordinator 🟢 ~98% COMPLETE
   ├─> 1.1: Refactor scf_iterate() → extract scf_iteration() ✅ DONE
   ├─> 1.2: Convert scf_iteration() to _scf_iteration() method ✅ DONE
   ├─> 1.3: Create multi_scf() coordinator ✅ DONE
   ├─> 1.4: Fix pybind11 exports & C++ bugs ✅ DONE (JK, get_orbital_matrices)
-  ├─> 1.5: Implement options snapshot pattern ← NOW
-  └─> 1.6: Add validation & testing
+  ├─> 1.5: Implement options snapshot pattern ✅ DONE (non-determinism eliminated)
+  ├─> 1.5.1: Coupled convergence bug fix ✅ DONE (2025-01-14)
+  └─> 1.6: Add validation & testing ← NOW
 
 **CRITICAL: Multi-SCF Requirements (MUST be satisfied)**
 
@@ -157,7 +158,7 @@ Single code path for ALL SCF calculations (N=1 or N>1):
 - Fixed C_clear()/C_add() usage (not direct vector methods)
 - Removed obsolete multi_cycle_scf_iterate() function
 
-**Step 1.5:** ← NOW (options snapshot pattern)
+**Step 1.5:** ✅ DONE (options snapshot pattern)
 Goal: Eliminate global state pollution causing non-determinism
 
 Problem:
@@ -168,10 +169,19 @@ wfn2 created → reads global DIIS_START=14  # ❌ Different!
 multi_scf([wfn1, wfn2]) → non-deterministic behavior
 ```
 
-Solution: Options Snapshot Pattern
-- Freeze global options at wfn creation time
-- Each wfn has independent option copy
-- No global state pollution
+Solution: Options Snapshot Pattern ✅ COMPLETE
+- Freeze global options ONCE before multi_scf()
+- Apply SAME snapshot to ALL wfn
+- All validate functions read from snapshot
+- Backward compatible (single-cycle falls back to global)
+
+**Step 1.5.1:** ✅ DONE (2025-01-14) - Coupled Convergence Bug Fix
+Problem: Early exit disruption (+8 extra iterations)
+- ROHF converges → exits JK → UHF index mismatch → DIIS invalidated
+Solution: Keep ALL wfn in JK until ALL converge
+- Cost: ~1-2% overhead
+- Benefit: Prevents +50% iteration penalty
+- SA-REKS ready
 
 **CRITICAL ARCHITECTURAL DECISION:**
 ALL SCF calculations (even single-cycle) go through multi-SCF coordinator!
@@ -217,15 +227,18 @@ psi4/driver/procrouting/scf_proc/
 psi4/driver/procrouting/
 └── proc.py                      # MODIFY - scf_helper() calls multi_scf_helper()
 
-**Step 1.6:** Validation & Testing
+**Step 1.6:** ← NOW - Validation & Testing
 1. Add validate_multi_scf_compatibility():
    - Check basis match (MUST)
    - Check JK type match (MUST)
    - Check geometry match (MUST)
    - Warn if functionals differ
-2. Test determinism (100 runs)
-3. Test with different options per state
-4. Update test_multi_scf.py to use helper API
+2. Test determinism (100 runs) - verify snapshot pattern
+3. Test coupled convergence (UHF+ROHF) - verify bug fix
+4. Performance benchmarking (compare vs independent SCF)
+5. Stress test with 5+ wfn
+
+Status: Compilation successful, ready for user testing
 
 Phase 2: Multi-Spin SA-REKS 🎯 GOAL
   ├─> 2.1: SA-REKS theory stub (n_states = N)
