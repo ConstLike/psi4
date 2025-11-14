@@ -11,10 +11,31 @@ Expected behavior:
 - Performance gain ~1.5-2x (shared JK saves time)
 """
 
+import sys
+import os
+
+# Ensure we can import psi4 from installed location, not source tree
+# This allows running from any directory
+if 'psi4' in sys.modules:
+    del sys.modules['psi4']
+
+# Add installed psi4 to path if needed
+psi4_install = os.path.join(os.path.dirname(__file__), '..', 'psi4_install', 'lib')
+if os.path.exists(psi4_install) and psi4_install not in sys.path:
+    sys.path.insert(0, psi4_install)
+
 import psi4
 import time
 from psi4.driver.procrouting.scf_proc.scf_iterator import multi_scf
 from psi4.driver.procrouting.proc import build_functional_and_disp
+
+# Enable debug mode for verbose output
+DEBUG = True
+
+def debug_print(msg):
+    """Print debug message if DEBUG is enabled"""
+    if DEBUG:
+        print(f"[DEBUG] {msg}")
 
 # Set memory and output
 psi4.set_memory('2 GB')
@@ -115,15 +136,108 @@ print("Initializing wavefunctions...")
 wfn1.initialize()
 wfn2.initialize()
 
+# DEBUG: Check wavefunction state after initialization
+debug_print("=" * 60)
+debug_print("WAVEFUNCTION STATE AFTER INITIALIZATION")
+debug_print("=" * 60)
+debug_print(f"wfn1.Ca() shape: {wfn1.Ca().shape}")
+debug_print(f"wfn1.nalpha(): {wfn1.nalpha()}")
+debug_print(f"wfn1.nbeta(): {wfn1.nbeta()}")
+debug_print(f"wfn1.nso(): {wfn1.nso()}")
+debug_print(f"wfn1.nmo(): {wfn1.nmo()}")
+debug_print(f"wfn1.Ca_subset('SO', 'OCC') shape: {wfn1.Ca_subset('SO', 'OCC').shape}")
+
+orb_mats1 = wfn1.get_orbital_matrices()
+debug_print(f"\nwfn1.get_orbital_matrices() returned {len(orb_mats1)} matrices")
+for i, mat in enumerate(orb_mats1):
+    debug_print(f"  Matrix {i} shape: {mat.shape}")
+
+orb_mats2 = wfn2.get_orbital_matrices()
+debug_print(f"\nwfn2.get_orbital_matrices() returned {len(orb_mats2)} matrices")
+for i, mat in enumerate(orb_mats2):
+    debug_print(f"  Matrix {i} shape: {mat.shape}")
+
+# DEBUG: Check JK object
+jk = wfn1.jk()
+debug_print(f"\nJK object: {jk}")
+debug_print(f"JK type: {type(jk)}")
+debug_print(f"JK C_left() length before clear: {len(jk.C_left())}")
+debug_print(f"JK C_right() length before clear: {len(jk.C_right())}")
+
+# DEBUG: Test if C_clear() method exists
+debug_print(f"\nChecking available JK methods:")
+debug_print(f"  hasattr(jk, 'C_clear'): {hasattr(jk, 'C_clear')}")
+debug_print(f"  hasattr(jk, 'C_add'): {hasattr(jk, 'C_add')}")
+debug_print(f"  hasattr(jk, 'C_left_add'): {hasattr(jk, 'C_left_add')}")
+debug_print(f"  hasattr(jk, 'C_right_add'): {hasattr(jk, 'C_right_add')}")
+debug_print("=" * 60)
+
 # Run multi-cycle SCF
 print("\nRunning multi_scf() with NEW architecture...\n")
 t0 = time.time()
 
-energies_multi = multi_scf([wfn1, wfn2], e_conv=1e-8, d_conv=1e-6, verbose=True)
+try:
+    energies_multi = multi_scf([wfn1, wfn2], e_conv=1e-8, d_conv=1e-6, verbose=True)
+except Exception as e:
+    print("\n" + "=" * 70)
+    print("ERROR IN multi_scf():")
+    print("=" * 70)
+    print(f"Exception type: {type(e).__name__}")
+    print(f"Exception message: {str(e)}")
+
+    # DEBUG: Check JK state when error occurred
+    debug_print("\n" + "=" * 60)
+    debug_print("JK STATE WHEN ERROR OCCURRED")
+    debug_print("=" * 60)
+    debug_print(f"JK C_left() length: {len(jk.C_left())}")
+    debug_print(f"JK C_right() length: {len(jk.C_right())}")
+    debug_print(f"JK J() length: {len(jk.J())}")
+    debug_print(f"JK K() length: {len(jk.K())}")
+
+    # Test manual JK operation
+    debug_print("\n" + "=" * 60)
+    debug_print("TESTING MANUAL JK OPERATIONS")
+    debug_print("=" * 60)
+
+    # Test 1: Using .append() (known to fail)
+    debug_print("\nTest 1: Using jk.C_left().append() (expected to FAIL)")
+    jk.C_left().clear()
+    debug_print(f"  After clear: C_left length = {len(jk.C_left())}")
+    jk.C_left().append(orb_mats1[0])
+    debug_print(f"  After append: C_left length = {len(jk.C_left())} (should be 1, but is 0)")
+
+    # Test 2: Using C_add() (should work)
+    if hasattr(jk, 'C_clear') and hasattr(jk, 'C_add'):
+        debug_print("\nTest 2: Using jk.C_clear() and jk.C_add() (should WORK)")
+        jk.C_clear()
+        debug_print(f"  After C_clear(): C_left length = {len(jk.C_left())}")
+        jk.C_add(orb_mats1[0])
+        debug_print(f"  After C_add(): C_left length = {len(jk.C_left())} (should be 1)")
+        jk.C_add(orb_mats2[0])
+        debug_print(f"  After C_add(): C_left length = {len(jk.C_left())} (should be 2)")
+
+        if len(jk.C_left()) == 2:
+            debug_print("\n  ✓ C_add() works! Matrices added successfully.")
+            debug_print("  → scf_iterator.py needs to use jk.C_clear() and jk.C_add()")
+        else:
+            debug_print("\n  ✗ C_add() also failed!")
+
+    debug_print("=" * 60)
+    print("\nTest aborted due to error.")
+    sys.exit(1)
 
 t_multi = time.time() - t0
 
 print(f"\nMulti-cycle SCF total time: {t_multi:.3f} seconds\n")
+
+# DEBUG: Success case - show what worked
+debug_print("=" * 60)
+debug_print("SUCCESS - multi_scf() completed")
+debug_print("=" * 60)
+debug_print(f"Returned energies: {energies_multi}")
+debug_print(f"Energy type: {type(energies_multi)}")
+debug_print(f"Number of energies: {len(energies_multi)}")
+debug_print("=" * 60)
 
 # Test 3: Verify results
 print("-" * 70)
