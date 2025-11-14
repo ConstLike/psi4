@@ -285,16 +285,16 @@ def _scf_initialize_iteration_state(self, e_conv, d_conv):
     self._scf_is_dfjk = core.get_global_option('SCF_TYPE').endswith('DF')
     self._scf_verbose = get_option_from_snapshot(self, 'PRINT')
     self._scf_reference = core.get_option('SCF', "REFERENCE")  # OK from global (doesn't change)
-    self._scf_damping_enabled = _validate_damping()
-    self._scf_soscf_enabled = _validate_soscf()
-    self._scf_frac_enabled = _validate_frac()
+    self._scf_damping_enabled = _validate_damping(self)
+    self._scf_soscf_enabled = _validate_soscf(self)
+    self._scf_frac_enabled = _validate_frac(self)
     self._scf_efp_enabled = hasattr(self.molecule(), 'EFP')
     self._scf_cosx_enabled = "COSX" in core.get_option('SCF', 'SCF_TYPE')  # OK from global
 
     # CRITICAL: Set DIIS/MOM members that are used by _scf_iteration()
     # These were originally in scf_iterate() but needed for multi_scf() too
     self.diis_enabled_ = self.validate_diis()
-    self.MOM_excited_ = _validate_MOM()
+    self.MOM_excited_ = _validate_MOM(self)
     self.diis_start_ = get_option_from_snapshot(self, 'DIIS_START')
 
     # COSX early screening parameters
@@ -324,11 +324,11 @@ def scf_iterate(self, e_conv=None, d_conv=None):
 
     # self.member_data_ signals are non-local, used internally by c-side fns
     self.diis_enabled_ = self.validate_diis()
-    self.MOM_excited_ = _validate_MOM()
+    self.MOM_excited_ = _validate_MOM(self)
     self.diis_start_ = get_option_from_snapshot(self, 'DIIS_START')
-    damping_enabled = _validate_damping()
-    soscf_enabled = _validate_soscf()
-    frac_enabled = _validate_frac()
+    damping_enabled = _validate_damping(self)
+    soscf_enabled = _validate_soscf(self)
+    frac_enabled = _validate_frac(self)
     efp_enabled = hasattr(self.molecule(), 'EFP')
     cosx_enabled = "COSX" in core.get_option('SCF', 'SCF_TYPE')
     ooo_scf = core.get_option("SCF", "ORBITAL_OPTIMIZER_PACKAGE") in ["OOO", "OPENORBITALOPTIMIZER"]
@@ -558,7 +558,7 @@ def _scf_iteration(self):
             diis_performed = False
             add_to_diis_subspace = self.diis_enabled_ and self.iteration_ >= self.diis_start_
 
-            self._scf_Dnorm = self.compute_orbital_gradient(add_to_diis_subspace, core.get_option('SCF', 'DIIS_MAX_VECS'))
+            self._scf_Dnorm = self.compute_orbital_gradient(add_to_diis_subspace, get_option_from_snapshot(self, 'DIIS_MAX_VECS'))
 
             if add_to_diis_subspace:
                 for engine_used in self.diis(self._scf_Dnorm):
@@ -1000,8 +1000,14 @@ def _converged(e_delta, d_rms, e_conv=None, d_conv=None):
     return (abs(e_delta) < e_conv and d_rms < d_conv)
 
 
-def _validate_damping():
+def _validate_damping(wfn=None):
     """Sanity-checks DAMPING control options
+
+    Parameters
+    ----------
+    wfn : HF wavefunction, optional
+        If provided, reads options from wfn._options_snapshot instead of global.
+        This ensures deterministic behavior in multi_scf().
 
     Raises
     ------
@@ -1015,22 +1021,29 @@ def _validate_damping():
         Whether DAMPING is enabled during scf.
 
     """
-    # Q: I changed the enabled criterion get_option <-- has_option_changed
-    enabled = (core.get_option('SCF', 'DAMPING_PERCENTAGE') > 0.0)
-    if enabled:
-        parameter = core.get_option('SCF', "DAMPING_PERCENTAGE")
-        if parameter < 0.0 or parameter > 100.0:
-            raise ValidationError('SCF DAMPING_PERCENTAGE ({}) must be between 0 and 100'.format(parameter))
+    # Read from snapshot if available, otherwise from global
+    if wfn is not None:
+        damping_pct = get_option_from_snapshot(wfn, 'DAMPING_PERCENTAGE')
+        damping_conv = get_option_from_snapshot(wfn, 'DAMPING_CONVERGENCE')
+    else:
+        damping_pct = core.get_option('SCF', 'DAMPING_PERCENTAGE')
+        damping_conv = core.get_option('SCF', 'DAMPING_CONVERGENCE')
 
-        stop = core.get_option('SCF', 'DAMPING_CONVERGENCE')
-        if stop < 0.0:
-            raise ValidationError('SCF DAMPING_CONVERGENCE ({}) must be > 0'.format(stop))
+    enabled = (damping_pct > 0.0)
+    if enabled:
+        if damping_pct < 0.0 or damping_pct > 100.0:
+            raise ValidationError('SCF DAMPING_PERCENTAGE ({}) must be between 0 and 100'.format(damping_pct))
+
+        if damping_conv < 0.0:
+            raise ValidationError('SCF DAMPING_CONVERGENCE ({}) must be > 0'.format(damping_conv))
 
     return enabled
 
 
 def _validate_diis(self):
     """Sanity-checks DIIS control options
+
+    Reads options from wfn._options_snapshot if available, otherwise falls back to global.
 
     Raises
     ------
@@ -1045,11 +1058,12 @@ def _validate_diis(self):
     """
 
     restricted_open = self.same_a_b_orbs() and not self.same_a_b_dens()
-    aediis_active = core.get_option('SCF', 'SCF_INITIAL_ACCELERATOR') != "NONE" and not restricted_open
+    aediis_accelerator = get_option_from_snapshot(self, 'SCF_INITIAL_ACCELERATOR')
+    aediis_active = aediis_accelerator != "NONE" and not restricted_open
 
     if aediis_active:
-        start = core.get_option('SCF', 'SCF_INITIAL_START_DIIS_TRANSITION')
-        stop = core.get_option('SCF', 'SCF_INITIAL_FINISH_DIIS_TRANSITION')
+        start = get_option_from_snapshot(self, 'SCF_INITIAL_START_DIIS_TRANSITION')
+        stop = get_option_from_snapshot(self, 'SCF_INITIAL_FINISH_DIIS_TRANSITION')
         if start < stop:
             raise ValidationError('SCF_INITIAL_START_DIIS_TRANSITION error magnitude cannot be less than SCF_INITIAL_FINISH_DIIS_TRANSITION.')
         elif start < 0:
@@ -1057,17 +1071,23 @@ def _validate_diis(self):
         elif stop < 0:
             raise ValidationError('SCF_INITIAL_FINISH_DIIS_TRANSITION cannot be negative.')
 
-    enabled = bool(core.get_option('SCF', 'DIIS')) or aediis_active
+    diis_enabled = get_option_from_snapshot(self, 'DIIS')
+    enabled = bool(diis_enabled) or aediis_active
     if enabled:
-        start = core.get_option('SCF', 'DIIS_START')
+        start = get_option_from_snapshot(self, 'DIIS_START')
         if start < 1:
             raise ValidationError('SCF DIIS_START ({}) must be at least 1'.format(start))
 
     return enabled
 
 
-def _validate_frac():
+def _validate_frac(wfn=None):
     """Sanity-checks FRAC control options
+
+    Parameters
+    ----------
+    wfn : HF wavefunction, optional
+        If provided, reads options from wfn._options_snapshot instead of global.
 
     Raises
     ------
@@ -1080,16 +1100,26 @@ def _validate_frac():
         Whether FRAC is enabled during scf.
 
     """
-    enabled = (core.get_option('SCF', 'FRAC_START') != 0)
+    if wfn is not None:
+        frac_start = get_option_from_snapshot(wfn, 'FRAC_START')
+    else:
+        frac_start = core.get_option('SCF', 'FRAC_START')
+
+    enabled = (frac_start != 0)
     if enabled:
-        if enabled < 0:
-            raise ValidationError('SCF FRAC_START ({}) must be at least 1'.format(enabled))
+        if frac_start < 0:
+            raise ValidationError('SCF FRAC_START ({}) must be at least 1'.format(frac_start))
 
     return enabled
 
 
-def _validate_MOM():
+def _validate_MOM(wfn=None):
     """Sanity-checks MOM control options
+
+    Parameters
+    ----------
+    wfn : HF wavefunction, optional
+        If provided, reads options from wfn._options_snapshot instead of global.
 
     Raises
     ------
@@ -1102,17 +1132,28 @@ def _validate_MOM():
         Whether excited-state MOM (not just the plain stabilizing MOM) is enabled during scf.
 
     """
-    enabled = (core.get_option('SCF', "MOM_START") != 0 and len(core.get_option('SCF', "MOM_OCC")) > 0)
+    if wfn is not None:
+        mom_start = get_option_from_snapshot(wfn, 'MOM_START')
+        mom_occ = get_option_from_snapshot(wfn, 'MOM_OCC')
+    else:
+        mom_start = core.get_option('SCF', "MOM_START")
+        mom_occ = core.get_option('SCF', "MOM_OCC")
+
+    enabled = (mom_start != 0 and len(mom_occ) > 0)
     if enabled:
-        start = core.get_option('SCF', "MOM_START")
-        if enabled < 0:
-            raise ValidationError('SCF MOM_START ({}) must be at least 1'.format(start))
+        if mom_start < 0:
+            raise ValidationError('SCF MOM_START ({}) must be at least 1'.format(mom_start))
 
     return enabled
 
 
-def _validate_soscf():
+def _validate_soscf(wfn=None):
     """Sanity-checks SOSCF control options
+
+    Parameters
+    ----------
+    wfn : HF wavefunction, optional
+        If provided, reads options from wfn._options_snapshot instead of global.
 
     Raises
     ------
@@ -1126,22 +1167,34 @@ def _validate_soscf():
         Whether SOSCF is enabled during scf.
 
     """
-    enabled = core.get_option('SCF', 'SOSCF')
-    if enabled:
+    # Read from snapshot if available
+    if wfn is not None:
+        enabled = get_option_from_snapshot(wfn, 'SOSCF')
+        start = get_option_from_snapshot(wfn, 'SOSCF_START_CONVERGENCE')
+        miniter = get_option_from_snapshot(wfn, 'SOSCF_MIN_ITER')
+    else:
+        enabled = core.get_option('SCF', 'SOSCF')
         start = core.get_option('SCF', 'SOSCF_START_CONVERGENCE')
+        miniter = core.get_option('SCF', 'SOSCF_MIN_ITER')
+
+    if enabled:
         if start < 0.0:
             raise ValidationError('SCF SOSCF_START_CONVERGENCE ({}) must be positive'.format(start))
 
-        miniter = core.get_option('SCF', 'SOSCF_MIN_ITER')
         if miniter < 1:
             raise ValidationError('SCF SOSCF_MIN_ITER ({}) must be at least 1'.format(miniter))
 
-        maxiter = core.get_option('SCF', 'SOSCF_MAX_ITER')
+        if wfn is not None:
+            maxiter = get_option_from_snapshot(wfn, 'SOSCF_MAX_ITER')
+            conv = get_option_from_snapshot(wfn, 'SOSCF_CONV')
+        else:
+            maxiter = core.get_option('SCF', 'SOSCF_MAX_ITER')
+            conv = core.get_option('SCF', 'SOSCF_CONV')
+
         if maxiter < miniter:
             raise ValidationError('SCF SOSCF_MAX_ITER ({}) must be at least SOSCF_MIN_ITER ({})'.format(
                 maxiter, miniter))
 
-        conv = core.get_option('SCF', 'SOSCF_CONV')
         if conv < 1.e-10:
             raise ValidationError('SCF SOSCF_CONV ({}) must be achievable'.format(conv))
 

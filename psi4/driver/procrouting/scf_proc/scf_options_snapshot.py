@@ -39,16 +39,23 @@ def snapshot_scf_options():
     snapshot = {}
 
     # ===== DIIS Options (CRITICAL - main source of non-determinism) =====
+    snapshot['DIIS'] = core.get_option('SCF', 'DIIS')  # Enable flag
     snapshot['DIIS_START'] = core.get_option('SCF', 'DIIS_START')
     snapshot['DIIS_MIN_VECS'] = core.get_option('SCF', 'DIIS_MIN_VECS')
     snapshot['DIIS_MAX_VECS'] = core.get_option('SCF', 'DIIS_MAX_VECS')
     snapshot['DIIS_RMS_ERROR'] = core.get_option('SCF', 'DIIS_RMS_ERROR')
+
+    # AEDIIS (initial accelerator) options
+    snapshot['SCF_INITIAL_ACCELERATOR'] = core.get_option('SCF', 'SCF_INITIAL_ACCELERATOR')
+    snapshot['SCF_INITIAL_START_DIIS_TRANSITION'] = core.get_option('SCF', 'SCF_INITIAL_START_DIIS_TRANSITION')
+    snapshot['SCF_INITIAL_FINISH_DIIS_TRANSITION'] = core.get_option('SCF', 'SCF_INITIAL_FINISH_DIIS_TRANSITION')
 
     # ===== Damping Options =====
     snapshot['DAMPING_PERCENTAGE'] = core.get_option('SCF', 'DAMPING_PERCENTAGE')
     snapshot['DAMPING_CONVERGENCE'] = core.get_option('SCF', 'DAMPING_CONVERGENCE')
 
     # ===== SOSCF Options =====
+    snapshot['SOSCF'] = core.get_option('SCF', 'SOSCF')  # Enable flag
     snapshot['SOSCF_START_CONVERGENCE'] = core.get_option('SCF', 'SOSCF_START_CONVERGENCE')
     snapshot['SOSCF_CONV'] = core.get_option('SCF', 'SOSCF_CONV')
     snapshot['SOSCF_MIN_ITER'] = core.get_option('SCF', 'SOSCF_MIN_ITER')
