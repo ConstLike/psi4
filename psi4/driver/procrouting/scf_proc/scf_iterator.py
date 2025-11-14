@@ -36,6 +36,7 @@ from ... import p4util
 from ...constants import constants
 from ...p4util.exceptions import SCFConvergenceError, ValidationError
 from ..solvent.efp import get_qm_atoms_opts, modify_Fock_induced, modify_Fock_permanent
+from .scf_options_snapshot import get_option_from_snapshot, snapshot_scf_options, apply_options_snapshot
 
 #import logging
 #logger = logging.getLogger("scf.scf_iterator")
@@ -255,7 +256,7 @@ def scf_initialize(self):
 
     # Print iteration header
     is_dfjk = core.get_global_option('SCF_TYPE').endswith('DF')
-    diis_rms = core.get_option('SCF', 'DIIS_RMS_ERROR')
+    diis_rms = get_option_from_snapshot(self, 'DIIS_RMS_ERROR')
     core.print_out("  ==> Iterations <==\n\n")
     core.print_out("%s                        Total Energy        Delta E     %s |[F,P]|\n\n" %
                    ("   " if is_dfjk else "", "RMS" if diis_rms else "MAX"))
@@ -318,7 +319,7 @@ def scf_iterate(self, e_conv=None, d_conv=None):
     # self.member_data_ signals are non-local, used internally by c-side fns
     self.diis_enabled_ = self.validate_diis()
     self.MOM_excited_ = _validate_MOM()
-    self.diis_start_ = core.get_option('SCF', 'DIIS_START')
+    self.diis_start_ = get_option_from_snapshot(self, 'DIIS_START')
     damping_enabled = _validate_damping()
     soscf_enabled = _validate_soscf()
     frac_enabled = _validate_frac()
@@ -389,7 +390,7 @@ def scf_iterate(self, e_conv=None, d_conv=None):
         if not should_continue:
             break
 
-        if self.iteration_ >= core.get_option('SCF', 'MAXITER'):
+        if self.iteration_ >= get_option_from_snapshot(self, 'MAXITER'):
             raise SCFConvergenceError("""SCF iterations""", self.iteration_, self, self._scf_Ediff, self._scf_Dnorm)
 
 
@@ -502,8 +503,8 @@ def _scf_iteration(self):
     status = []
 
     # Check if we are doing SOSCF
-    if (self._scf_soscf_enabled and (self.iteration_ >= 3) and (self._scf_Dnorm < core.get_option('SCF', 'SOSCF_START_CONVERGENCE'))):
-        self._scf_Dnorm = self.compute_orbital_gradient(False, core.get_option('SCF', 'DIIS_MAX_VECS'))
+    if (self._scf_soscf_enabled and (self.iteration_ >= 3) and (self._scf_Dnorm < get_option_from_snapshot(self, 'SOSCF_START_CONVERGENCE'))):
+        self._scf_Dnorm = self.compute_orbital_gradient(False, get_option_from_snapshot(self, 'DIIS_MAX_VECS'))
         diis_performed = False
         if self.functional().needs_xc():
             base_name = "SOKS, nmicro="
@@ -511,9 +512,9 @@ def _scf_iteration(self):
             base_name = "SOSCF, nmicro="
 
         if not _converged(self._scf_Ediff, self._scf_Dnorm, e_conv=self._scf_e_conv, d_conv=self._scf_d_conv):
-            nmicro = self.soscf_update(core.get_option('SCF', 'SOSCF_CONV'),
-                                       core.get_option('SCF', 'SOSCF_MIN_ITER'),
-                                       core.get_option('SCF', 'SOSCF_MAX_ITER'),
+            nmicro = self.soscf_update(get_option_from_snapshot(self, 'SOSCF_CONV'),
+                                       get_option_from_snapshot(self, 'SOSCF_MIN_ITER'),
+                                       get_option_from_snapshot(self, 'SOSCF_MAX_ITER'),
                                        core.get_option('SCF', 'SOSCF_PRINT'))
             # if zero, the soscf call bounced for some reason
             soscf_performed = (nmicro > 0)
@@ -597,8 +598,8 @@ def _scf_iteration(self):
     core.set_variable("SCF D NORM", self._scf_Dnorm)
 
     # After we've built the new D, damp the update
-    if (self._scf_damping_enabled and self.iteration_ > 1 and self._scf_Dnorm > core.get_option('SCF', 'DAMPING_CONVERGENCE')):
-        damping_percentage = core.get_option('SCF', "DAMPING_PERCENTAGE")
+    if (self._scf_damping_enabled and self.iteration_ > 1 and self._scf_Dnorm > get_option_from_snapshot(self, 'DAMPING_CONVERGENCE')):
+        damping_percentage = get_option_from_snapshot(self, 'DAMPING_PERCENTAGE')
         self.damping_update(damping_percentage * 0.01)
         status.append("DAMP={}%".format(round(damping_percentage)))
 
@@ -620,7 +621,7 @@ def _scf_iteration(self):
 
     # if a an excited MOM is requested but not started, don't stop yet
     # Note that MOM_performed_ just checks initialization, and our convergence measures used the pre-MOM orbitals
-    if self.MOM_excited_ and ((not self.MOM_performed_) or self.iteration_ == core.get_option('SCF', "MOM_START")):
+    if self.MOM_excited_ and ((not self.MOM_performed_) or self.iteration_ == get_option_from_snapshot(self, 'MOM_START')):
         return (True, 'mom_not_started')
 
     # if a fractional occupation is requested but not started, don't stop yet
@@ -1213,6 +1214,10 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
     if max_iter is None:
         max_iter = core.get_option('SCF', 'MAXITER')
 
+    # CRITICAL: Snapshot global options ONCE before creating/initializing any wfn
+    # This prevents non-determinism from global state pollution between wfn creation
+    options_snapshot = snapshot_scf_options()
+
     if verbose:
         core.print_out("\n  ==> Multi-Cycle SCF (NEW Architecture) <==\n\n")
         core.print_out("  Number of wavefunctions: {}\n".format(len(wfn_list)))
@@ -1237,7 +1242,10 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
     jk.set_do_K(True)  # Needed for hybrid functionals (HF exchange)
 
     # Initialize iteration state for each wavefunction
+    # CRITICAL: Apply options snapshot to each wfn BEFORE initialization
+    # This ensures all wfn read from frozen snapshot, not from global state
     for wfn in wfn_list:
+        apply_options_snapshot(wfn, options_snapshot)
         wfn._scf_initialize_iteration_state(e_conv, d_conv)
 
     # Track convergence status for each wfn
