@@ -89,10 +89,39 @@ Phase 0.6: API Foundation ✅ DONE
   └─> 0.6.3: Strategic decision: Python-first approach ✅ DONE
 
 Phase 1: Python Multi-Cycle Coordinator 📍 IN PROGRESS - NEW APPROACH
-  ├─> 1.1: Refactor scf_iterate() → extract scf_iteration() ✅ DONE (commit ddd77ddc + fix 6db3bae6)
-  ├─> 1.2: Convert scf_iteration() to _scf_iteration() method ✅ DONE (commit f53d3d9d) ← TESTED (78 tests passed!)
-  ├─> 1.3: Create multi_scf() coordinator ← NOW
-  └─> 1.4: Test with 2 independent RHF cycles
+  ├─> 1.1: Refactor scf_iterate() → extract scf_iteration() ✅ DONE
+  ├─> 1.2: Convert scf_iteration() to _scf_iteration() method ✅ DONE
+  ├─> 1.3: Create multi_scf() coordinator ✅ DONE
+  ├─> 1.4: Fix pybind11 exports & C++ bugs ✅ DONE (JK, get_orbital_matrices)
+  ├─> 1.5: Implement options snapshot pattern ← NOW
+  └─> 1.6: Add validation & testing
+
+**CRITICAL: Multi-SCF Requirements (MUST be satisfied)**
+
+Shared JK depends on:
+- ✅ **SAME geometry** - atomic coordinates MUST be identical (ERI depend on r)
+- ✅ **SAME basis** - primary basis set MUST match (JK built for one basis)
+- ✅ **SAME SCF_TYPE** - DF/DIRECT/CD MUST be same (JK algorithm)
+- ✅ **SAME DF_BASIS_SCF** - auxiliary basis MUST match (if DF)
+
+Can differ (orbital/occupation level):
+- ✓ Multiplicity (singlet/triplet) - affects nalpha/nbeta, not JK
+- ✓ Reference (RHF/UHF/ROHF) - different density construction, same JK
+- ✓ Functional (HF/B3LYP) - XC differs, JK same
+- ✓ Convergence (DIIS/MOM/damping) - acceleration methods
+- ✓ n_alpha/n_beta - electron count per spin
+
+**Correct Terminology for SA-REKS:**
+```python
+# WRONG (implies different geometries):
+mol1 = psi4.geometry("H2O ...")  # ❌
+mol2 = psi4.geometry("H2O ...")  # ❌
+
+# CORRECT (one geometry, multiple states):
+molecule = psi4.geometry("H2O ...")  # ✅ One geometry
+state1 = {'multiplicity': 1, 'nalpha': 5, 'nbeta': 5}  # Singlet
+state2 = {'multiplicity': 3, 'nalpha': 6, 'nbeta': 4}  # Triplet
+```
 
 **NEW STRATEGY (correct approach):**
 Instead of creating separate multi_cycle_scf_iterate(), we refactor existing
@@ -105,23 +134,76 @@ scf_iterate() to enable multi-SCF coordination while keeping ALL features
 - ZERO logic changes - pure refactoring
 - All 78 tests pass! (after fix 6db3bae6)
 
-**Step 1.2:** ✅ DONE (commit f53d3d9d) ← LAST COMPLETED
+**Step 1.2:** ✅ DONE
 - Created _scf_initialize_iteration_state(e_conv, d_conv)
 - Converted closure scf_iteration() → method _scf_iteration()
-- Moved state to self._scf_* members
+- Moved state to self._scf_* members (~15 attributes)
 - Method can now be called externally
 - All 78 tests pass! ✅
 
-**Step 1.3:** ← IN PROGRESS
-- Create multi_scf() coordinator function
+**Step 1.3:** ✅ DONE (commits 4170231d + cleanups)
+- Created multi_scf() coordinator function
 - Uses _scf_iteration() for each wfn
-- Shared JK computation via jk.compute()
+- Shared JK computation via jk.C_clear()/C_add()
 - Distribution via set_jk_matrices()
+- Supports ALL SCF features (DIIS, damping, MOM, etc)
 
-**Previous multi_cycle_scf_iterate() implementation:**
-- Created but NOT integrated into workflow (Phase 1.3, commit 45426f98)
-- Missing DIIS, damping, and other critical features
-- Will be replaced by proper multi_scf() coordinator
+**Step 1.4:** ✅ DONE (critical bug fixes)
+- Added pybind11 exports: n_states(), get_orbital_matrices(), set_jk_matrices()
+- Fixed get_orbital_matrices() to return ONLY occupied orbitals
+- Added JK pybind11 exports: C_left(), C_right(), J(), K()
+- Fixed C_clear()/C_add() usage (not direct vector methods)
+- Removed obsolete multi_cycle_scf_iterate() function
+
+**Step 1.5:** ← NOW (options snapshot pattern)
+Goal: Eliminate global state pollution causing non-determinism
+
+Problem:
+```python
+wfn1 created → reads global DIIS_START=0
+baseline test runs → changes global DIIS_START=14
+wfn2 created → reads global DIIS_START=14  # ❌ Different!
+multi_scf([wfn1, wfn2]) → non-deterministic behavior
+```
+
+Solution: Options Snapshot Pattern
+- Freeze global options at wfn creation time
+- Each wfn has independent option copy
+- No global state pollution
+
+Implementation:
+1. Create scf_options_snapshot.py:
+   - snapshot_scf_options() - freeze current global options
+   - apply_options_snapshot(wfn, snapshot) - set wfn-local copy
+2. Create multi_scf_helper.py:
+   - multi_scf_wavefunction_factory() - create wfn with snapshot
+   - multi_scf_helper() - high-level API
+3. Modify _scf_initialize_iteration_state():
+   - Check if wfn._options_snapshot exists
+   - If yes: use snapshot, if no: read global (backward compat)
+
+User API levels:
+- Level 1 (99%): psi4.energy('scf') - no changes, works out of box
+- Level 2 (simple): multi_scf_helper(molecules, method) - auto snapshot
+- Level 3 (advanced): multi_scf_wavefunction_factory(..., options={...})
+
+Files:
+```
+psi4/driver/procrouting/scf_proc/
+├── scf_options_snapshot.py  # NEW
+├── multi_scf_helper.py      # NEW
+└── scf_iterator.py          # modify _scf_initialize_iteration_state
+```
+
+**Step 1.6:** Validation & Testing
+1. Add validate_multi_scf_compatibility():
+   - Check basis match (MUST)
+   - Check JK type match (MUST)
+   - Check geometry match (MUST)
+   - Warn if functionals differ
+2. Test determinism (100 runs)
+3. Test with different options per state
+4. Update test_multi_scf.py to use helper API
 
 Phase 2: Multi-Spin SA-REKS 🎯 GOAL
   ├─> 2.1: SA-REKS theory stub (n_states = N)
