@@ -1335,19 +1335,34 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
         # CRITICAL: ALL wfn must participate in JK (including converged ones)
         # to maintain consistent indexing and prevent discontinuous Fock changes.
         #
-        # When a wfn converges early and exits JK, remaining wfn receive
-        # J/K matrices at different indices, which invalidates DIIS history
-        # and causes re-convergence (+8 extra iterations observed in UHF+ROHF test).
-        #
-        # Cost: ~1-2% overhead for computing JK of converged (frozen) densities
-        # Benefit: Prevents +50% iteration increase, maintains coupled convergence
+        # FREEZE PATTERN FIX (Step 1.5.1):
+        # When a wfn converges, form_C() updates Ca_ one last time, causing
+        # other wfn to see different J/K on the next iteration (discontinuity).
+        # Solution: Freeze C matrices at the state BEFORE form_C() modified them.
+        # Since get_orbital_matrices() already deep-copies via get_block(),
+        # we just need to save references when wfn converges.
         all_C_occ_matrices = []
         wfn_state_counts = []  # Track how many states each wfn has
         active_wfn_indices = []  # Track which wfn need iteration (non-converged)
 
         for i, wfn in enumerate(wfn_list):
-            # ALWAYS collect C matrices (converged + active)
-            C_matrices = wfn.get_orbital_matrices()
+            if converged_flags[i]:
+                # Use frozen C matrices from convergence iteration
+                # This prevents other wfn from seeing discontinuous J/K
+                C_matrices = wfn._frozen_C_for_jk
+                if verbose >= 2:
+                    core.print_out(f"  [DEBUG iter={iteration}] wfn {i}: FROZEN, using {len(C_matrices)} frozen C matrices\n")
+            else:
+                # Get current C matrices (get_block() already deep-copies data)
+                C_matrices = wfn.get_orbital_matrices()
+
+                # Save snapshot for potential freezing if wfn converges this iteration
+                # No clone() needed - get_orbital_matrices() already returned new matrices
+                wfn._C_snapshot_for_jk = C_matrices
+
+                if verbose >= 2:
+                    core.print_out(f"  [DEBUG iter={iteration}] wfn {i}: ACTIVE, collected {len(C_matrices)} fresh C matrices\n")
+
             all_C_occ_matrices.extend(C_matrices)
             wfn_state_counts.append(len(C_matrices))
 
@@ -1418,9 +1433,14 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
 
             if not should_continue:
                 if reason == 'converged':
+                    # FREEZE PATTERN: Save C matrices from BEFORE form_C() modified them
+                    # This prevents discontinuity in J/K for other wfn on next iteration
+                    wfn._frozen_C_for_jk = wfn._C_snapshot_for_jk
                     converged_flags[i] = True
                     final_energies[i] = wfn.get_energies("Total Energy")
                     status_strs.append("CONV")
+                    if verbose >= 2:
+                        core.print_out(f"  [DEBUG iter={iteration}] wfn {i} CONVERGED, freezing {len(wfn._frozen_C_for_jk)} C matrices\n")
                 elif reason in ['mom_not_started', 'frac_not_started']:
                     # Special cases - keep iterating
                     all_converged = False

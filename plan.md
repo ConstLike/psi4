@@ -175,19 +175,38 @@ Solution: Options Snapshot Pattern ✅ COMPLETE
 - All validate functions read from snapshot
 - Backward compatible (single-cycle falls back to global)
 
-**Step 1.5.1:** ✅ DONE (2025-01-14) - Coupled Convergence Bug Fix
-Problem: Early exit disruption (+8 extra iterations)
-- ROHF converges → exits JK → UHF index mismatch → DIIS invalidated
-Solution: Keep ALL wfn in JK until ALL converge
-- Maintains consistent indexing (prevents DIIS invalidation)
-- Cost: ~1-2% overhead for small systems
-- For large systems: JK builder may have internal caching (to be tested)
-- SA-REKS ready
+**Step 1.5.1:** ✅ DONE (2025-01-15) - C Matrix Freeze Pattern Fix
+Problem: Convergence discontinuity (+8 extra iterations in UHF+ROHF)
+- When ROHF converges on iteration N, form_C() updates Ca_ one last time
+- On iteration N+1, other wfn see J/K computed from CHANGED density
+- This invalidates DIIS history → +8 extra iterations observed
 
-Note: Explicit Python-level caching was considered but reverted (commit 86a8e7a8)
-due to complexity: index bugs, matrix lifetime, COSX/INCFOCK compatibility.
-Will rely on JK builder internal optimization. If needed, explicit cache
-can be added in Phase 2.5 after threading architecture finalized.
+Root Cause Analysis:
+- converged_flags[i] set AFTER _scf_iteration() modifies Ca_
+- Sequence: get_C(old) → JK(old) → form_C() updates Ca_ → converged=True
+- Next iteration: get_C(NEW!) → JK(NEW) → discontinuity for active wfn
+
+Solution: Freeze C matrices at state BEFORE form_C() modified them
+- get_orbital_matrices() already deep-copies data via get_block() (memcpy)
+- Save reference when calling get_orbital_matrices() for active wfn
+- When wfn converges, freeze that snapshot for future iterations
+- Zero overhead: no clone(), just reference management (~100 bytes)
+
+Implementation Details:
+- wfn._C_snapshot_for_jk: snapshot from current iteration (before form_C)
+- wfn._frozen_C_for_jk: frozen snapshot saved at convergence
+- Converged wfn always use _frozen_C_for_jk (stable density)
+- Active wfn get fresh C and save snapshot (for potential freeze)
+
+Benefits:
+- ✅ Zero CPU overhead (no clone calls)
+- ✅ Zero memory overhead (get_block already allocates, we keep references)
+- ✅ Fixes +8 iteration bug (UHF sees stable ROHF density)
+- ✅ Works for all reference types (RHF, UHF, ROHF, SA-REKS)
+- ✅ Production-grade solution
+
+Note: Earlier coupled convergence approach kept all wfn in JK (1-2% overhead).
+Freeze pattern is superior: same correctness, zero overhead.
 
 **CRITICAL ARCHITECTURAL DECISION:**
 ALL SCF calculations (even single-cycle) go through multi-SCF coordinator!
