@@ -1318,7 +1318,8 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
 
     # Track convergence status for each wfn
     converged_flags = [False] * len(wfn_list)
-    just_converged_flags = [False] * len(wfn_list)  # Grace iteration tracking
+    # DIAGNOSTIC TEST: Grace pattern disabled to test if it causes numerical instability
+    # just_converged_flags = [False] * len(wfn_list)  # Grace iteration tracking
     final_energies = [0.0] * len(wfn_list)
 
     if verbose:
@@ -1336,51 +1337,27 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
         # CRITICAL: ALL wfn must participate in JK (including converged ones)
         # to maintain consistent indexing and prevent discontinuous Fock changes.
         #
-        # GRACE ITERATION PATTERN (Step 1.5.1 - FIXED):
-        # When wfn converges on iteration N:
-        #   - Mark as "just_converged" (not fully converged yet)
-        #   - Iteration N+1 (GRACE ITERATION):
-        #     * Get CONVERGED orbitals (after form_C() updated them)
-        #     * Freeze these converged orbitals
-        #     * Skip _scf_iteration (already converged)
-        #     * Other wfn see J/K from converged density for FIRST time
-        #   - Iteration N+2+: Use frozen converged orbitals (stable)
+        # DIAGNOSTIC TEST: Simplified convergence (no grace pattern)
+        # - All wfn participate in JK on every iteration
+        # - Converged wfn continue providing C matrices but don't iterate
+        # - No freezing, no grace period
         all_C_occ_matrices = []
         wfn_state_counts = []  # Track how many states each wfn has
         active_wfn_indices = []  # Track which wfn need iteration (non-converged)
 
         for i, wfn in enumerate(wfn_list):
-            if just_converged_flags[i]:
-                # GRACE ITERATION: Get converged orbitals (after form_C() updated them)
-                # and freeze them for all future iterations
-                C_matrices = wfn.get_orbital_matrices()  # Converged C!
-                wfn._frozen_C_for_jk = C_matrices  # Freeze converged orbitals
+            # DIAGNOSTIC: Always get current C matrices (no freezing)
+            C_matrices = wfn.get_orbital_matrices()
 
-                # Transition to fully converged state
-                just_converged_flags[i] = False
-                converged_flags[i] = True
-
-                if verbose >= 2:
-                    core.print_out(f"  [DEBUG iter={iteration}] wfn {i}: GRACE ITERATION, freezing {len(C_matrices)} CONVERGED C matrices\n")
-
-            elif converged_flags[i]:
-                # Fully converged: use frozen C from grace iteration
-                C_matrices = wfn._frozen_C_for_jk
-                if verbose >= 2:
-                    core.print_out(f"  [DEBUG iter={iteration}] wfn {i}: FROZEN, using {len(C_matrices)} frozen C matrices\n")
-
-            else:
-                # Active: get current C matrices
-                C_matrices = wfn.get_orbital_matrices()
-
-                if verbose >= 2:
-                    core.print_out(f"  [DEBUG iter={iteration}] wfn {i}: ACTIVE, collected {len(C_matrices)} fresh C matrices\n")
+            if verbose >= 2:
+                status = "CONVERGED" if converged_flags[i] else "ACTIVE"
+                core.print_out(f"  [DEBUG iter={iteration}] wfn {i}: {status}, collected {len(C_matrices)} C matrices\n")
 
             all_C_occ_matrices.extend(C_matrices)
             wfn_state_counts.append(len(C_matrices))
 
-            # Track which wfn still need iteration (not converged, not in grace period)
-            if not converged_flags[i] and not just_converged_flags[i]:
+            # Track which wfn still need iteration (not converged)
+            if not converged_flags[i]:
                 active_wfn_indices.append(i)
 
         # Early exit if all converged (no active wfn left)
@@ -1436,15 +1413,11 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
 
         for i, wfn in enumerate(wfn_list):
             if converged_flags[i]:
-                # Fully converged, skip iteration
+                # Converged, skip iteration
                 status_strs.append("CONV")
                 continue
 
-            if just_converged_flags[i]:
-                # In grace period, skip iteration (will freeze on next iteration)
-                final_energies[i] = wfn.get_energies("Total Energy")
-                status_strs.append("GRACE")
-                continue
+            # DIAGNOSTIC: Removed grace period logic (just_converged_flags)
 
             # Call the refactored _scf_iteration() method
             # This uses precomputed J/K automatically (use_precomputed_jk_ flag)
@@ -1452,13 +1425,12 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
 
             if not should_continue:
                 if reason == 'converged':
-                    # GRACE ITERATION PATTERN: Mark as just_converged
-                    # Next iteration will freeze CONVERGED orbitals (after form_C() updated them)
-                    just_converged_flags[i] = True
+                    # DIAGNOSTIC: Directly mark as converged (no grace period)
+                    converged_flags[i] = True
                     final_energies[i] = wfn.get_energies("Total Energy")
                     status_strs.append("CONV")
                     if verbose >= 2:
-                        core.print_out(f"  [DEBUG iter={iteration}] wfn {i} CONVERGED, will freeze on next iteration (grace period)\n")
+                        core.print_out(f"  [DEBUG iter={iteration}] wfn {i} CONVERGED (diagnostic: no grace period)\n")
                 elif reason in ['mom_not_started', 'frac_not_started']:
                     # Special cases - keep iterating
                     all_converged = False
