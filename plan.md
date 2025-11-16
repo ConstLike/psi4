@@ -175,47 +175,78 @@ Solution: Options Snapshot Pattern ✅ COMPLETE
 - All validate functions read from snapshot
 - Backward compatible (single-cycle falls back to global)
 
-**Step 1.5.1:** ✅ DONE (2025-01-15) - Grace Iteration Pattern (FIXED)
-Problem: +9 extra iterations in UHF+ROHF (convergence discontinuity)
-- First attempt: Froze C BEFORE form_C() → WRONG (pre-converged C)
-- Need to freeze CONVERGED C (AFTER form_C() updates it)
+**Step 1.5.1:** 🔧 IN PROGRESS - Coupled Convergence Bug (+9 extra iterations)
+Problem: UHF requires +9 extra iterations when running with ROHF
+- Independent UHF: 7 iterations → E = -74.362669 Ha
+- multi_scf([UHF only]): 8 iterations (+1 framework overhead - acceptable)
+- multi_scf([UHF, ROHF]): 16 iterations (+9 vs independent - BUG!)
 
-Root Cause of First Attempt Failure (commit 549cbfd3):
-- Saved snapshot before _scf_iteration(): C_snapshot = C_5
-- ROHF converges: form_C() → C_6 (converged!)
-- Froze wrong C: _frozen_C = C_5 (pre-converged, not C_6!)
+**Attempt 1 (commit 549cbfd3): C Matrix Freeze Pattern - FAILED** ❌
+- Root cause: Froze C BEFORE form_C() → saved pre-converged C (C_5 instead of C_6)
 - Created discontinuity: iter 6 uses C_5, iter 7+ uses different C
+- Result: Still +9 iterations (bug persists)
 
-Solution: Grace Iteration Pattern (3-state convergence)
+**Attempt 2 (commit d9d0018f): Grace Iteration Pattern - FAILED** ❌
+- Implementation: 3-state convergence (active → just_converged → fully_converged)
+- Correctly freezes CONVERGED C (after form_C() updates it)
+- Grace period mechanics work correctly (verified by debug output)
+- **BUT**: Still +9 iterations! Bug persists despite correct implementation.
+
+Grace Iteration Pattern (correctly implemented but doesn't fix bug):
 ```
 Iter N (convergence):
   - ROHF: form_C() → C_N (converged!)
-  - Mark: just_converged_flags[ROHF] = True (NOT converged yet!)
+  - Mark: just_converged_flags[ROHF] = True
 
 Iter N+1 (GRACE PERIOD):
-  - Check: just_converged_flags[ROHF] = True
   - Get CONVERGED C: get_orbital_matrices() → C_N ✓
   - Freeze: _frozen_C_for_jk = C_N (CONVERGED orbitals!)
   - Transition: converged_flags[ROHF] = True
-  - Skip _scf_iteration (grace period)
-  - UHF sees J/K from C_N for FIRST time
 
 Iter N+2+ (STABLE):
-  - Use: _frozen_C_for_jk = C_N (same every iteration)
-  - UHF sees STABLE J/K ✓
+  - Use: _frozen_C_for_jk = C_N (stable)
 ```
 
-Implementation:
-- `just_converged_flags[i]`: Grace period (converged but not frozen yet)
-- `converged_flags[i]`: Fully converged (frozen C available)
-- `wfn._frozen_C_for_jk`: Frozen CONVERGED orbitals
+**3x Verification Analysis (commit fff5eb45): Root Cause Investigation** 🔍
 
-Benefits:
-- ✅ Freezes CONVERGED orbitals (C_6, not C_5!)
-- ✅ Zero CPU overhead
-- ✅ Zero memory overhead
-- ✅ Fixes +9 iteration bug (expect: 1-2 extra for transition)
-- ✅ Production-grade: simple, correct, maintainable
+Created analysis documents:
+- `ROOT_CAUSE_ANALYSIS.md`: Detailed hypothesis testing framework
+- `CRITICAL_FINDING.md`: **NO physical coupling in JK!** (verified in jk.cc)
+- `FINAL_ANALYSIS.md`: Recommendations and next steps
+
+**CRITICAL DISCOVERY:**
+- Analyzed JK source code (psi4/src/psi4/libfock/jk.cc lines 310-340, 567-577)
+- **J[N] computed from C[N] ONLY** (formula: J[N]_mn = (mn|ls) C[N]_li C[N]_si)
+- NO cross-coupling between wavefunctions
+- Each wfn receives J/K from its OWN density only
+- Batching is computational (efficiency), NOT physical
+
+**Implication:**
+If there's no physical coupling, why +9 iterations? This is a BUG in our implementation!
+
+**Hypothesis 4:** Grace pattern creates numerical instability
+- Even without physical coupling, freezing C might affect numerical behavior
+- DIIS might be disrupted by discontinuous change in batched JK computation
+- Need to test: Does grace pattern itself cause the problem?
+
+**Diagnostic Test (commit fff5eb45): Grace Pattern Disabled** 🧪
+
+Changes:
+- Removed `just_converged_flags` (no grace period)
+- Simplified to direct convergence: active → converged
+- No C matrix freezing (converged wfn continue providing current C to JK)
+- All wfn participate in JK every iteration until all converge
+
+Expected results:
+- **If grace pattern was the problem:** ~8 iterations (fixed!)
+- **If grace pattern was NOT the problem:** ~16 iterations (bug is elsewhere)
+
+Next steps:
+1. Run diagnostic test and observe iteration count
+2. If fixed: Remove grace pattern, accept ~1-2% overhead (simple, robust)
+3. If not fixed: Debug DIIS/options/initialization (deeper investigation needed)
+
+**Status:** Awaiting diagnostic test results before implementation
 
 **CRITICAL ARCHITECTURAL DECISION:**
 ALL SCF calculations (even single-cycle) go through multi-SCF coordinator!
