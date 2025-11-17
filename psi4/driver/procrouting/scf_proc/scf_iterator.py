@@ -547,16 +547,19 @@ def _scf_iteration(self):
         else:
             # Run DIIS
             core.timer_on("HF: DIIS")
-            diis_performed = False
-            add_to_diis_subspace = self.diis_enabled_ and self.iteration_ >= self.diis_start_
+            try:
+                diis_performed = False
+                add_to_diis_subspace = self.diis_enabled_ and self.iteration_ >= self.diis_start_
 
-            self._scf_Dnorm = self.compute_orbital_gradient(add_to_diis_subspace, get_option_from_snapshot(self, 'DIIS_MAX_VECS'))
+                self._scf_Dnorm = self.compute_orbital_gradient(add_to_diis_subspace, get_option_from_snapshot(self, 'DIIS_MAX_VECS'))
 
-            if add_to_diis_subspace:
-                for engine_used in self.diis(self._scf_Dnorm):
-                    status.append(engine_used)
-
-            core.timer_off("HF: DIIS")
+                if add_to_diis_subspace:
+                    for engine_used in self.diis(self._scf_Dnorm):
+                        status.append(engine_used)
+            finally:
+                # CRITICAL: Always turn off timer, even if exception occurs
+                # Prevents "Timer already on" errors in retry scenarios
+                core.timer_off("HF: DIIS")
 
             if self._scf_verbose > 4 and diis_performed:
                 core.print_out("  After DIIS:\n")
@@ -1347,9 +1350,12 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
             wfn.initialize_jk(wfn.memory_jk_)
     else:
         # Normal initialization (no DF guess)
+        # CRITICAL: Always initialize, even if JK exists!
+        # scf_initialize() is idempotent - it reuses existing JK (line 154-156)
+        # and only initializes missing components (DIIS, PSIO, H, S^-1/2, guess).
+        # Old code ALWAYS called initialize() unconditionally in scf_compute_energy().
         for wfn in wfn_list:
-            if wfn.jk() is None:
-                wfn.initialize()
+            wfn.initialize()  # Unconditional - idempotent by design
 
     # Phase 3: Main iterations (DIRECT if using DF guess, otherwise normal)
     return _multi_scf_inner(wfn_list, e_conv, d_conv, max_iter, verbose)
