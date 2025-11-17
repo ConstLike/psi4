@@ -1454,8 +1454,9 @@ bool HF::stability_analysis() {
 
 void HF::set_wfn_name(const std::string& name) {
     // Validate: only alphanumeric, underscore, hyphen allowed
+    // IMPORTANT: Cast to unsigned char to avoid UB with negative char values (e.g., UTF-8)
     for (char c : name) {
-        if (!std::isalnum(c) && c != '_' && c != '-') {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-') {
             throw PSIEXCEPTION("Wavefunction name must contain only letters, digits, '_', or '-'. Got: " + name);
         }
     }
@@ -1468,12 +1469,22 @@ std::string HF::get_orbitals_filename(const std::string& base) const {
     }
 
     // Insert wfn_name before file extension
+    // Pre-allocate to avoid reallocations (HPC optimization)
+    std::string result;
+    result.reserve(base.size() + wfn_name_.size() + 1);
+
     size_t dot_pos = base.rfind('.');
     if (dot_pos != std::string::npos) {
-        return base.substr(0, dot_pos) + "_" + wfn_name_ + base.substr(dot_pos);
+        result.append(base, 0, dot_pos);
+        result += '_';
+        result += wfn_name_;
+        result.append(base, dot_pos, std::string::npos);
     } else {
-        return base + "_" + wfn_name_;
+        result = base;
+        result += '_';
+        result += wfn_name_;
     }
+    return result;
 }
 
 }  // namespace scf
