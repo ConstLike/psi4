@@ -55,48 +55,40 @@ from .scf_options_snapshot import get_option_from_snapshot, snapshot_scf_options
 
 
 def scf_compute_energy(self):
-    """Base class Wavefunction requires this function. Here it is
-    simply a wrapper around initialize(), iterations(), finalize_energy(). It
-    returns the SCF energy computed by finalize_energy().
-
     """
-    if core.get_option('SCF', 'DF_SCF_GUESS') and (core.get_global_option('SCF_TYPE') == 'DIRECT'):
-        # speed up DIRECT algorithm (recomputes full (non-DF) integrals
-        #   each iter) by first converging via fast DF iterations, then
-        #   fully converging in fewer slow DIRECT iterations. aka Andy trick 2.0
-        core.print_out("  Starting with a DF guess...\n\n")
-        with p4util.OptionsStateCM(['SCF_TYPE']):
-            core.set_global_option('SCF_TYPE', 'DF')
-            self.initialize()
-            try:
-                self.iterations()
-            except SCFConvergenceError:
-                self.finalize()
-                raise SCFConvergenceError("""SCF DF preiterations""", self.iteration_, self, 0, 0)
-        core.print_out("\n  DF guess converged.\n\n")
+    Compute SCF energy using multi_scf() framework.
 
-        # reset the DIIS & JK objects in prep for DIRECT
-        if self.initialized_diis_manager_:
-            self.diis_manager_.reset_subspace()
-        self.initialize_jk(self.memory_jk_)
-    else:
-        self.initialize()
+    This is a wrapper that calls multi_scf([self]) to ensure single SCF
+    uses the same code path as multi-cycle SCF. This ensures all features
+    (DIIS, damping, SOSCF, MOM, FRAC, DF_SCF_GUESS, etc.) are automatically
+    available in both modes.
+
+    Single source of truth: All SCF calculations flow through multi_scf().
+
+    Returns
+    -------
+    float
+        SCF energy computed by finalize_energy()
+    """
+    # Initialize iteration_energies for backward compatibility
     self.iteration_energies = []
 
+    # Single SCF is just multi_scf with one wavefunction
+    # This ensures identical behavior and eliminates code duplication
     try:
-        self.iterations()
+        energies = multi_scf([self], verbose=True)
+        scf_energy = energies[0]
     except SCFConvergenceError as e:
         if core.get_option("SCF", "FAIL_ON_MAXITER"):
             core.print_out("  Failed to converge.\n")
-            # energy = 0.0
-            # A P::e fn to either throw or protest upon nonconvergence
-            # die_if_not_converged()
             raise e
         else:
             core.print_out("  Energy and/or wave function did not converge, but proceeding anyway.\n\n")
+            scf_energy = self.get_energies("Total Energy")
     else:
         core.print_out("  Energy and wave function converged.\n\n")
 
+    # Finalize and return
     scf_energy = self.finalize_energy()
     return scf_energy
 
