@@ -27,7 +27,9 @@ def _RHF_orbital_gradient(self, save_fock: bool, max_diis_vectors: int) -> float
     if save_fock:
         if not self.initialized_diis_manager_:
             storage_policy = StoragePolicy.InCore if self.scf_type() == "DIRECT" else StoragePolicy.OnDisk
-            self.diis_manager_ = DIIS(max_diis_vectors, "HF DIIS vector", RemovalPolicy.LargestError, storage_policy, engines=diis_engine_helper(self))
+            # Make DIIS name unique to avoid file collisions in multi_scf
+            diis_name = f"HF DIIS vector {id(self)}"
+            self.diis_manager_ = DIIS(max_diis_vectors, diis_name, RemovalPolicy.LargestError, storage_policy, engines=diis_engine_helper(self))
             self.initialized_diis_manager_ = True
 
         entry = {"target": [self.Fa()]}
@@ -51,7 +53,9 @@ def _UHF_orbital_gradient(self, save_fock: bool, max_diis_vectors: int) -> float
 
     if save_fock:
         if not self.initialized_diis_manager_:
-            self.diis_manager_ = DIIS(max_diis_vectors, "HF DIIS vector", RemovalPolicy.LargestError,
+            # Make DIIS name unique to avoid file collisions in multi_scf
+            diis_name = f"HF DIIS vector {id(self)}"
+            self.diis_manager_ = DIIS(max_diis_vectors, diis_name, RemovalPolicy.LargestError,
                                                           StoragePolicy.OnDisk, False, engines=diis_engine_helper(self))
             self.initialized_diis_manager_ = True
 
@@ -98,7 +102,9 @@ def _ROHF_orbital_gradient(self, save_fock: bool, max_diis_vectors: int) -> floa
 
     if save_fock:
         if not self.initialized_diis_manager_:
-            self.diis_manager_ = DIIS(max_diis_vectors, "HF DIIS vector", RemovalPolicy.LargestError, StoragePolicy.OnDisk, engines=diis_engine_helper(self))
+            # Make DIIS name unique to avoid file collisions in multi_scf
+            diis_name = f"HF DIIS vector {id(self)}"
+            self.diis_manager_ = DIIS(max_diis_vectors, diis_name, RemovalPolicy.LargestError, StoragePolicy.OnDisk, engines=diis_engine_helper(self))
             self.diis_manager_.set_error_vector_size(gradient)
             self.diis_manager_.set_vector_size(self.soFeff())
             self.initialized_diis_manager_ = True
