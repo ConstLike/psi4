@@ -98,21 +98,30 @@ void RHF::common_init() {
 
     if (multiplicity_ != 1) throw PSIEXCEPTION("RHF: RHF reference is only for singlets.");
 
-    // Allocate matrix memory
-    Fa_ = SharedMatrix(factory_->create_matrix("F"));
-    Fb_ = Fa_;
+    // Phase 0.3: Create contiguous storage (n=1 for RHF, but benefits from 64-byte alignment)
+    D_multi_ = std::make_shared<MultiStateMatrix>("D", 1, nirrep_, nsopi_, nsopi_, 0);
+    F_multi_ = std::make_shared<MultiStateMatrix>("F", 1, nirrep_, nsopi_, nsopi_, 0);
+    G_multi_ = std::make_shared<MultiStateMatrix>("G", 1, nirrep_, nsopi_, nsopi_, 0);
+
+    // Da_/Fa_/G_ are VIEWS into contiguous storage
+    Da_ = D_multi_->get(0);
+    Db_ = Da_;  // RHF: beta = alpha
+    Fa_ = F_multi_->get(0);
+    Fb_ = Fa_;  // RHF: beta = alpha
+    G_ = G_multi_->get(0);
+
+    // Orbitals
     Ca_ = SharedMatrix(factory_->create_matrix("MO coefficients (C)"));
     Cb_ = Ca_;
     epsilon_a_ = SharedVector(factory_->create_vector());
     epsilon_a_->set_name("orbital energies");
     epsilon_b_ = epsilon_a_;
-    Da_ = SharedMatrix(factory_->create_matrix("SCF density"));
-    Db_ = Da_;
+
+    // Other matrices
     Lagrangian_ = SharedMatrix(factory_->create_matrix("X"));
     Dold_ = SharedMatrix(factory_->create_matrix("D old"));
     Va_ = SharedMatrix(factory_->create_matrix("V"));
     Vb_ = Va_;
-    G_ = SharedMatrix(factory_->create_matrix("G"));
     J_ = SharedMatrix(factory_->create_matrix("J"));
     K_ = SharedMatrix(factory_->create_matrix("K"));
     wK_ = SharedMatrix(factory_->create_matrix("wK"));
@@ -192,24 +201,41 @@ void RHF::form_G() {
         G_->zero();
     }
 
-    /// Push the C matrix on
-    std::vector<SharedMatrix>& C = jk_->C_left();
-    C.clear();
-    C.push_back(Ca_subset("SO", "OCC"));
+    // Multi-cycle JK: use pre-computed J/K/wK if available
+    if (use_precomputed_jk_) {
+        // Python multi_scf() provided pre-computed J/K/wK
+        J_ = precomputed_J_[0];
+        if (functional_->is_x_hybrid()) {
+            K_ = precomputed_K_[0];
+        }
+        if (functional_->is_x_lrc()) {
+            if (!precomputed_wK_.empty()) {
+                wK_ = precomputed_wK_[0];
+            } else {
+                throw PSIEXCEPTION("LRC functional requires wK matrices in multi_scf()");
+            }
+        }
+    } else {
+        // Normal path: compute J/K using JK builder
+        /// Push the C matrix on
+        std::vector<SharedMatrix>& C = jk_->C_left();
+        C.clear();
+        C.push_back(Ca_subset("SO", "OCC"));
 
-    // Run the JK object
-    jk_->compute();
+        // Run the JK object
+        jk_->compute();
 
-    // Pull the J and K matrices off
-    const std::vector<SharedMatrix>& J = jk_->J();
-    const std::vector<SharedMatrix>& K = jk_->K();
-    const std::vector<SharedMatrix>& wK = jk_->wK();
-    J_ = J[0];
-    if (functional_->is_x_hybrid()) {
-        K_ = K[0];
-    }
-    if (functional_->is_x_lrc()) {
-        wK_ = wK[0];
+        // Pull the J and K matrices off
+        const std::vector<SharedMatrix>& J = jk_->J();
+        const std::vector<SharedMatrix>& K = jk_->K();
+        const std::vector<SharedMatrix>& wK = jk_->wK();
+        J_ = J[0];
+        if (functional_->is_x_hybrid()) {
+            K_ = K[0];
+        }
+        if (functional_->is_x_lrc()) {
+            wK_ = wK[0];
+        }
     }
 
     G_->axpy(2.0, J_);
@@ -277,7 +303,9 @@ void RHF::form_C(double shift) {
 }
 
 void RHF::form_D() {
-    Da_->zero();
+    // Phase 0.3: Da_ is a view into contiguous storage
+    // Zero efficiently with single memset
+    D_multi_->zero_all();
 
     for (int h = 0; h < nirrep_; ++h) {
         int nso = nsopi_[h];
@@ -287,8 +315,9 @@ void RHF::form_D() {
         if (nso == 0 || nmo == 0) continue;
 
         auto Ca = Ca_->pointer(h);
-        auto D = Da_->pointer(h);
+        auto D = Da_->pointer(h);  // Points directly into D_multi_ contiguous storage
 
+        // DGEMM writes directly to contiguous memory (no copy needed!)
         C_DGEMM('N', 'T', nso, nso, na, 1.0, Ca[0], nmo, Ca[0], nmo, 0.0, D[0], nso);
     }
 

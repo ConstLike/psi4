@@ -32,6 +32,7 @@
 #include <vector>
 #include "psi4/libpsio/psio.hpp"
 #include "hf.h"
+#include "multistate_matrix.h"
 
 namespace psi {
 class VBase;
@@ -39,6 +40,11 @@ namespace scf {
 
 class ROHF : public HF {
    protected:
+    // Phase 0.5: Multi-state contiguous storage for cache locality (n=2 like UHF)
+    std::shared_ptr<MultiStateMatrix> D_multi_;  // Da, Db as views
+    std::shared_ptr<MultiStateMatrix> F_multi_;  // Fa, Fb as views
+    std::shared_ptr<MultiStateMatrix> G_multi_;  // Ga, Gb as views
+
     SharedMatrix moFeff_;
     SharedMatrix soFeff_;
     SharedMatrix Dt_;
@@ -46,8 +52,8 @@ class ROHF : public HF {
     SharedMatrix Db_old_;
     SharedMatrix Dt_old_;
     SharedMatrix Ct_;
-    SharedMatrix Ga_;
-    SharedMatrix Gb_;
+    SharedMatrix Ga_;      // View into G_multi_->get(0)
+    SharedMatrix Gb_;      // View into G_multi_->get(1)
     SharedMatrix Ka_;
     SharedMatrix Kb_;
     SharedMatrix moFa_;
@@ -78,6 +84,19 @@ class ROHF : public HF {
     SharedMatrix moFa() const { return moFa_; }
     SharedMatrix moFb() const { return moFb_; }
     SharedMatrix Ct() const {return Ct_; }
+
+    /// ROHF handles 2 states (alpha and beta with different occupations)
+    int n_states() const override { return 2; }
+
+    /// Returns {Cdocc, Csocc} for multi-cycle JK computation
+    /// IMPORTANT: Returns ONLY occupied orbitals (docc and socc blocks)
+    std::vector<SharedMatrix> get_orbital_matrices() const override {
+        // ROHF needs separate docc and socc blocks (same as form_G())
+        Dimension dim_zero(nirrep_, "Zero Dim");
+        SharedMatrix Cdocc = Ca_->get_block({dim_zero, nsopi_}, {dim_zero, nbetapi_});
+        SharedMatrix Csocc = Ca_->get_block({dim_zero, nsopi_}, {nbetapi_, nalphapi_});
+        return {Cdocc, Csocc};
+    }
 
     void save_density_and_energy() override;
 

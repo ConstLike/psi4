@@ -3,9 +3,11 @@ list(APPEND sources
   frac.cc
   hf.cc
   mom.cc
+  multistate_matrix.cc
   rhf.cc
   rohf.cc
   sad.cc
+  scf_engine.cc
   uhf.cc
   )
 psi4_add_module(lib scf_solver sources)
