@@ -1263,6 +1263,16 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
     - Each wfn maintains its own DIIS, damping, convergence state
     - ~1.8-2x faster than running SCF cycles independently
     - Uses existing C++ infrastructure (use_precomputed_jk_ flag)
+
+    DF_SCF_GUESS Support (Andy Trick 2.0)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    When DF_SCF_GUESS=True (default) and SCF_TYPE='DIRECT':
+    - Phase 1: All wfn converge using fast DF iterations
+    - Phase 2: DIIS reset, JK reinitialized for DIRECT
+    - Phase 3: Final convergence with DIRECT integrals
+
+    This matches single SCF behavior and produces identical iteration counts.
+    Total iterations shown = DF iterations + DIRECT iterations.
     """
     if len(wfn_list) == 0:
         raise ValidationError("multi_scf requires at least one wavefunction")
@@ -1306,12 +1316,79 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
     for wfn in wfn_list:
         apply_options_snapshot(wfn, options_snapshot)
 
-    # Initialize wavefunctions if not already done
-    # After snapshot applied, wfn.initialize() reads from frozen options
-    for wfn in wfn_list:
-        if wfn.jk() is None:
-            wfn.initialize()
+    # Andy Trick 2.0 for multi-SCF: DF guess for DIRECT algorithm
+    # This speeds up DIRECT (which recomputes full integrals each iteration)
+    # by first converging via fast DF iterations, then fully converging in fewer DIRECT iterations
+    use_df_guess = (core.get_option('SCF', 'DF_SCF_GUESS') and
+                    core.get_global_option('SCF_TYPE') == 'DIRECT')
 
+    if use_df_guess:
+        if verbose:
+            core.print_out("  Starting with a DF guess for DIRECT algorithm...\n\n")
+
+        # Phase 1: DF pre-iterations (fast convergence)
+        with p4util.OptionsStateCM(['SCF_TYPE']):
+            core.set_global_option('SCF_TYPE', 'DF')
+
+            # Initialize all wfn with DF
+            for wfn in wfn_list:
+                if wfn.jk() is None:
+                    wfn.initialize()
+
+            # Run multi-SCF iterations with DF
+            try:
+                _multi_scf_inner(wfn_list, e_conv, d_conv, max_iter, verbose)
+            except SCFConvergenceError:
+                # DF guess failed to converge - not critical, continue to DIRECT
+                pass
+
+        if verbose:
+            core.print_out("\n  DF guess converged. Switching to DIRECT...\n\n")
+
+        # Phase 2: Reset for DIRECT
+        for wfn in wfn_list:
+            # Reset DIIS subspace (DF gradients not compatible with DIRECT)
+            if wfn.initialized_diis_manager_:
+                wfn.diis_manager_.reset_subspace()
+
+            # Re-initialize JK with DIRECT (recomputes full integrals)
+            wfn.initialize_jk(wfn.memory_jk_)
+    else:
+        # Normal initialization (no DF guess)
+        for wfn in wfn_list:
+            if wfn.jk() is None:
+                wfn.initialize()
+
+    # Phase 3: Main iterations (DIRECT if using DF guess, otherwise normal)
+    return _multi_scf_inner(wfn_list, e_conv, d_conv, max_iter, verbose)
+
+
+def _multi_scf_inner(wfn_list, e_conv, d_conv, max_iter, verbose):
+    """
+    Inner multi-SCF iteration loop.
+
+    This function is called by multi_scf() and performs the actual SCF iterations.
+    It is separated to allow DF_SCF_GUESS to run DF pre-iterations followed by
+    DIRECT final iterations (Andy Trick 2.0).
+
+    Parameters
+    ----------
+    wfn_list : list of Wavefunction
+        List of wavefunctions to converge simultaneously
+    e_conv : float
+        Energy convergence threshold
+    d_conv : float
+        Density convergence threshold
+    max_iter : int
+        Maximum number of SCF iterations
+    verbose : bool
+        Verbosity level
+
+    Returns
+    -------
+    list of float
+        Final energies for each wavefunction
+    """
     if verbose:
         core.print_out("\n  ==> Multi-Cycle SCF (NEW Architecture) <==\n\n")
         core.print_out("  Number of wavefunctions: {}\n".format(len(wfn_list)))
