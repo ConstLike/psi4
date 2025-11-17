@@ -611,7 +611,9 @@ def _scf_iteration(self):
 
     if core.has_option_changed("SCF", "ORBITALS_WRITE"):
         filename = core.get_option("SCF", "ORBITALS_WRITE")
-        self.to_file(filename)
+        # Use wfn_name for unique filename in multi-SCF (empty wfn_name preserves original behavior)
+        unique_filename = self.get_orbitals_filename(filename)
+        self.to_file(unique_filename)
 
     if self._scf_verbose > 3:
         self.Ca().print_out()
@@ -1264,6 +1266,28 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
     """
     if len(wfn_list) == 0:
         raise ValidationError("multi_scf requires at least one wavefunction")
+
+    # Auto-assign unique wavefunction names for file isolation
+    # This enables proper DIIS, stability analysis, and orbital file separation
+    wfn_names_used = set()
+    for i, wfn in enumerate(wfn_list):
+        current_name = wfn.get_wfn_name()
+
+        # Auto-assign if empty (default for single-cycle SCF)
+        if not current_name:
+            wfn_name = f"wfn_{i}"
+            wfn.set_wfn_name(wfn_name)
+        else:
+            wfn_name = current_name
+
+        # Validate no duplicates
+        if wfn_name in wfn_names_used:
+            raise ValidationError(
+                f"Duplicate wavefunction name '{wfn_name}' detected. "
+                f"Each wavefunction in multi_scf must have a unique name for file isolation. "
+                f"Either clear all names (for auto-naming) or ensure all custom names are unique."
+            )
+        wfn_names_used.add(wfn_name)
 
     # Get convergence criteria
     if e_conv is None:

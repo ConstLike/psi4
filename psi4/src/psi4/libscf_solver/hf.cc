@@ -102,6 +102,7 @@ void HF::common_init() {
     module_ = "scf";
     frac_performed_ = false;
     use_precomputed_jk_ = false;  // Multi-cycle JK: default to normal JK computation
+    wfn_name_ = "";  // Empty for single-cycle SCF (backward compatible)
 
     // This quantity is needed fairly soon
     nirrep_ = factory_->nirrep();
@@ -407,6 +408,33 @@ void HF::set_jk(std::shared_ptr<JK> jk) {
     }
 
     jk_ = jk;
+}
+
+void HF::set_wfn_name(const std::string& name) {
+    // Validate: only alphanumeric, underscore, hyphen allowed
+    for (char c : name) {
+        if (!std::isalnum(c) && c != '_' && c != '-') {
+            throw PSIEXCEPTION("Wavefunction name must contain only letters, digits, '_', or '-'. Got: " + name);
+        }
+    }
+    wfn_name_ = name;
+}
+
+std::string HF::get_orbitals_filename(const std::string& base) const {
+    // Backward compatible: if wfn_name_ is empty, return base as-is
+    if (wfn_name_.empty()) {
+        return base;
+    }
+
+    // Find extension (last '.')
+    size_t dot_pos = base.rfind('.');
+    if (dot_pos != std::string::npos) {
+        // Insert wfn_name before extension: "orbs.dat" → "orbs_wfn_0.dat"
+        return base.substr(0, dot_pos) + "_" + wfn_name_ + base.substr(dot_pos);
+    } else {
+        // No extension: append wfn_name
+        return base + "_" + wfn_name_;
+    }
 }
 
 void HF::semicanonicalize() { throw PSIEXCEPTION("This type of wavefunction cannot be semicanonicalized!"); }

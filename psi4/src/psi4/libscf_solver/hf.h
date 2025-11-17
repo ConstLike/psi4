@@ -140,6 +140,12 @@ class HF : public Wavefunction {
     /// Enables backward compatibility (default: false, compute J/K normally)
     bool use_precomputed_jk_;
 
+    /// Wavefunction name for file isolation in multi-SCF calculations
+    /// Used to generate unique filenames for DIIS, stability analysis, orbital writes
+    /// Empty string ("") for single-cycle SCF (backward compatible)
+    /// Set to "wfn_0", "wfn_1", etc. or custom names in multi-SCF
+    std::string wfn_name_;
+
     /// Are we to do MOM?
     bool MOM_enabled_;
     /// Are we to do excited-state MOM?
@@ -305,6 +311,22 @@ class HF : public Wavefunction {
     void set_diis_manager(py::object& manager) { diis_manager_ = manager; }
     bool initialized_diis_manager() const { return initialized_diis_manager_; }
     void set_initialized_diis_manager(bool tf) { initialized_diis_manager_ = tf; }
+
+    /// Get/set wavefunction name for file isolation in multi-SCF
+    const std::string& get_wfn_name() const { return wfn_name_; }
+    void set_wfn_name(const std::string& name);
+
+    /// Generate unique DIIS filename incorporating wfn_name_ for file isolation
+    /// Returns "HF DIIS vector" for single-cycle SCF (backward compatible)
+    /// Returns "wfn_0 DIIS vector", "custom_name DIIS vector" for multi-SCF
+    std::string get_diis_filename() const {
+        return wfn_name_.empty() ? "HF DIIS vector" : wfn_name_ + " DIIS vector";
+    }
+
+    /// Generate unique orbital filename incorporating wfn_name_ for file isolation
+    /// If wfn_name_ is empty: returns base (backward compatible)
+    /// If wfn_name_ is set: inserts before extension (e.g., "orbs.dat" → "orbs_wfn_0.dat")
+    std::string get_orbitals_filename(const std::string& base) const;
 
     /// The JK object (or null if it has been deleted)
     std::shared_ptr<JK> jk() const { return jk_; }

@@ -379,6 +379,10 @@ void export_wavefunction(py::module& m) {
         .def_property("diis_manager_", &scf::HF::diis_manager, &scf::HF::set_diis_manager, "The DIIS object.")
         .def_property("initialized_diis_manager_", &scf::HF::initialized_diis_manager,
                       &scf::HF::set_initialized_diis_manager, "Has the DIIS object been initialized?")
+        .def("get_wfn_name", &scf::HF::get_wfn_name, "Returns the wavefunction name for file isolation in multi-SCF.")
+        .def("set_wfn_name", &scf::HF::set_wfn_name, "name"_a, "Sets the wavefunction name for file isolation in multi-SCF.")
+        .def("get_diis_filename", &scf::HF::get_diis_filename, "Returns the unique DIIS filename incorporating wfn_name_.")
+        .def("get_orbitals_filename", &scf::HF::get_orbitals_filename, "base"_a, "Returns the unique orbital filename incorporating wfn_name_.")
         .def("damping_update", &scf::HF::damping_update, "docstring")
         .def("check_phases", &scf::HF::check_phases, "docstring")
         .def("print_orbitals", &scf::HF::print_orbitals, "docstring")
