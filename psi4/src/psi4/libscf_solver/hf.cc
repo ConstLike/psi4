@@ -253,6 +253,7 @@ void HF::common_init() {
     if (options_["PRINT"].has_changed()) print_ = options_.get_int("PRINT");
 
     initialized_diis_manager_ = false;
+    wfn_name_ = "";  // Empty for single-cycle SCF (backward compatible)
 
     MOM_performed_ = false;  // duplicated py-side (needed before iterate)
 
@@ -1450,5 +1451,30 @@ bool HF::stability_analysis() {
     throw PSIEXCEPTION("Stability analysis hasn't been implemented yet for this wfn type.");
     return false;
 }
+
+void HF::set_wfn_name(const std::string& name) {
+    // Validate: only alphanumeric, underscore, hyphen allowed
+    for (char c : name) {
+        if (!std::isalnum(c) && c != '_' && c != '-') {
+            throw PSIEXCEPTION("Wavefunction name must contain only letters, digits, '_', or '-'. Got: " + name);
+        }
+    }
+    wfn_name_ = name;
+}
+
+std::string HF::get_orbitals_filename(const std::string& base) const {
+    if (wfn_name_.empty()) {
+        return base;  // Backward compatible
+    }
+
+    // Insert wfn_name before file extension
+    size_t dot_pos = base.rfind('.');
+    if (dot_pos != std::string::npos) {
+        return base.substr(0, dot_pos) + "_" + wfn_name_ + base.substr(dot_pos);
+    } else {
+        return base + "_" + wfn_name_;
+    }
+}
+
 }  // namespace scf
 }  // namespace psi

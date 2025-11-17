@@ -548,7 +548,9 @@ def scf_iterate(self, e_conv=None, d_conv=None):
 
         if core.has_option_changed("SCF", "ORBITALS_WRITE"):
             filename = core.get_option("SCF", "ORBITALS_WRITE")
-            self.to_file(filename)
+            # Use wfn_name for unique filename in multi-SCF (empty wfn_name preserves original behavior)
+            unique_filename = self.get_orbitals_filename(filename)
+            self.to_file(unique_filename)
 
         if verbose > 3:
             self.Ca().print_out()
