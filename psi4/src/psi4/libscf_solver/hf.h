@@ -313,7 +313,7 @@ class HF : public Wavefunction {
     void set_initialized_diis_manager(bool tf) { initialized_diis_manager_ = tf; }
 
     /// Get/set wavefunction name for file isolation in multi-SCF
-    const std::string& get_wfn_name() const { return wfn_name_; }
+    const std::string& get_wfn_name() const noexcept { return wfn_name_; }
     void set_wfn_name(const std::string& name);
 
     /// Generate unique DIIS filename incorporating wfn_name_ for file isolation
