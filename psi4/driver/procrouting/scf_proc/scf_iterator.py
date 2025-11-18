@@ -341,8 +341,8 @@ def _scf_initialize_iteration_state(self, e_conv, d_conv):
     self._scf_efp_enabled = hasattr(self.molecule(), 'EFP')
     self._scf_cosx_enabled = "COSX" in core.get_option('SCF', 'SCF_TYPE')  # OK from global
 
-    # CRITICAL: Set DIIS/MOM members that are used by _scf_iteration()
-    # These were originally in scf_iterate() but needed for multi_scf() too
+    # Set DIIS/MOM members used by iteration loop
+    # Required by both scf_iterate() and multi_scf()
     self.diis_enabled_ = self.validate_diis()
     self.MOM_excited_ = _validate_MOM(self)
     self.diis_start_ = self._scf_diis_start
@@ -615,8 +615,7 @@ def _scf_iteration(self):
                     for engine_used in self.diis(self._scf_Dnorm):
                         status.append(engine_used)
             finally:
-                # CRITICAL: Always turn off timer, even if exception occurs
-                # Prevents "Timer already on" errors in retry scenarios
+                # Turn off timer even if exception occurs to prevent timer stack errors
                 core.timer_off("HF: DIIS")
 
             if self._scf_verbose > 4 and diis_performed:
@@ -1260,50 +1259,27 @@ core.HF.validate_diis = _validate_diis
 
 def validate_multi_scf_compatibility(wfn_list):
     """
-    Validate that all wavefunctions can safely share JK computation.
+    Validate that wavefunctions can share a single JK object.
 
-    This function performs FACTUAL checks based on code analysis of shared JK
-    implementation. Only parameters that affect shared components are checked.
+    For shared JK computation, the following must match across all wfn:
+    - Primary basis set (JK built with specific basis dimensions)
+    - Geometry (3-index integrals depend on atomic coordinates)
+    - Auxiliary basis (if SCF_TYPE='DF')
+    - LRC capability (do_wK flag)
+    - LRC omega parameter (if LRC functional)
+    - RSH alpha/beta parameters (if LRC and WCOMBINE=TRUE)
 
-    Principle: Check ONLY what is SHARED, nothing more, nothing less.
-
-    MUST Match (for shared JK):
-    ---------------------------
-    1. Primary basis set - JK built with specific basis
-    2. Geometry (molecule) - 3-index integrals depend on atomic coordinates
-    3. Auxiliary basis - if SCF_TYPE='DF', affects integral approximation
-    4. LRC capability - JK built with or without long-range K support
-    5. LRC omega - if LRC, range-separation parameter used in erf(ωr)/r operator
-    6. RSH alpha/beta - if LRC AND wcombine=TRUE, affect integrals (conditional check)
-
-    CAN Differ (safe):
-    -----------------
-    - Multiplicity / occupation
-    - Reference type (RHF/UHF/ROHF)
-    - Charge
-    - Non-LRC XC functional
-    - Hybrid fraction (do_K overwritten to True)
-    - Convergence settings (per-wfn)
+    Safe to differ: multiplicity, reference type, charge, convergence settings.
 
     Parameters
     ----------
     wfn_list : list of HF
-        List of wavefunctions to validate
+        Wavefunctions to validate for shared JK compatibility
 
     Raises
     ------
     ValidationError
-        If wavefunctions are incompatible for shared JK, with detailed message
-        explaining WHAT doesn't match, WHY it matters, and HOW to fix it.
-
-    See Also
-    --------
-    SHARED_JK_COMPATIBILITY_REQUIREMENTS.md : Detailed code analysis and justification
-
-    Notes
-    -----
-    Based on factual code tracing of _build_jk(), initialize_jk(), and multi_scf()
-    shared JK implementation. Every check has explicit code justification.
+        If wavefunctions have incompatible parameters for shared JK
     """
     if len(wfn_list) < 2:
         return  # Single wfn, no compatibility issues
@@ -1317,7 +1293,7 @@ def validate_multi_scf_compatibility(wfn_list):
     # Check 1.1: Primary Basis Set
     # Code: _build_jk() line 97: wfn.get_basisset("ORBITAL")
     # Why: JK object built with specific basis dimensions, 3-index integrals
-    #      computed for this basis. Different basis → different integrals.
+    #      computed for this basis. Different basis requires different integrals.
     ref_basis = ref_wfn.basisset()
     ref_basis_name = ref_basis.name()
     ref_nbf = ref_basis.nbf()
@@ -1353,7 +1329,7 @@ def validate_multi_scf_compatibility(wfn_list):
     # Check 1.2: Geometry (Molecule)
     # Code: jk.initialize() line 121 - computes 3-index integrals
     # Why: Integrals (Q|μν) = ∫∫ χ_Q(r1) χ_μ(r1) r12^-1 χ_ν(r2) dr1 dr2
-    #      Basis functions χ centered on atoms → integrals depend on geometry
+    #      Basis functions χ centered on atoms, integrals depend on geometry
     ref_mol = ref_wfn.molecule()
 
     for i, wfn in enumerate(wfn_list[1:], 1):
@@ -1394,7 +1370,7 @@ def validate_multi_scf_compatibility(wfn_list):
 
     # Check 1.3: Auxiliary Basis (for DF only)
     # Code: _build_jk() line 98: aux=wfn.get_basisset("DF_BASIS_SCF")
-    # Why: For density fitting, different auxiliary basis → different approximation
+    # Why: For density fitting, different auxiliary basis yields different approximation
     #      (μν|ρσ) ≈ (μν|P) (P|Q)^-1 (Q|ρσ)
     scf_type = core.get_global_option('SCF_TYPE')
     if scf_type == 'DF':
@@ -1417,7 +1393,7 @@ def validate_multi_scf_compatibility(wfn_list):
                     f"Why this matters:\n"
                     f"  For SCF_TYPE='DF', the auxiliary basis is used to approximate\n"
                     f"  4-index integrals: (μν|ρσ) ≈ (μν|P) (P|Q)^-1 (Q|ρσ)\n"
-                    f"  Different auxiliary basis → different approximation → different J/K.\n"
+                    f"  Different auxiliary basis yields different J/K integrals.\n"
                     f"\n"
                     f"Code location: _build_jk() line 98\n"
                     f"  jk = core.JK.build(..., aux=wfn.get_basisset('DF_BASIS_SCF'))\n"
@@ -1472,7 +1448,7 @@ def validate_multi_scf_compatibility(wfn_list):
     # Check 2.1: LRC omega parameter
     # Code: initialize_jk() line 116
     # Why: omega is the range-separation parameter used in erf(ωr)/r operator
-    #      for long-range wK integrals. Different omega → different integrals!
+    #      for long-range wK integrals. Different omega yields different integrals.
     if ref_is_lrc:
         ref_omega = ref_wfn.functional().x_omega()
 
@@ -1495,7 +1471,7 @@ def validate_multi_scf_compatibility(wfn_list):
                     f"Why this matters:\n"
                     f"  For LRC functionals, omega is the range-separation parameter:\n"
                     f"    wK_μν = Σ_ρσ P_ρσ (μρ|erf(ω r)/r|νσ)\n"
-                    f"  Different omega → different erf(ω r) → DIFFERENT wK integrals!\n"
+                    f"  Different omega yields different wK integrals.\n"
                     f"  The shared JK is configured with omega from wfn[0] only.\n"
                     f"  Other wavefunctions skip JK configuration due to idempotency,\n"
                     f"  so they inherit omega from wfn[0].\n"
@@ -1518,9 +1494,9 @@ def validate_multi_scf_compatibility(wfn_list):
     #
     # Physics:
     #   wcombine=FALSE (default): K and wK computed separately, alpha/beta used
-    #                             during Fock assembly → CAN differ
+    #                             during Fock assembly, can differ between wfn
     #   wcombine=TRUE: Combined matrix = alpha*K + beta*wK computed directly
-    #                  → alpha/beta baked into integrals → MUST match
+    #                  with alpha/beta baked into integrals, must match
     #
     # See: INVESTIGATION_VALIDATION_CHECKS.md for C++ code analysis (DFHelper.cc)
 
@@ -1553,7 +1529,7 @@ def validate_multi_scf_compatibility(wfn_list):
                     f"  You have enabled WCOMBINE=TRUE (combined K matrix mode).\n"
                     f"  In this mode, the combined matrix K_combined = alpha*K + beta*wK\n"
                     f"  is computed directly with alpha/beta baked into integrals.\n"
-                    f"  Different alpha → different integrals → WRONG results!\n"
+                    f"  Different alpha yields incorrect results.\n"
                     f"\n"
                     f"Code location: DFHelper.cc compute_sparse_pQq_blocking_p_symm_abw()\n"
                     f"  param_Mp = omega_alpha * buffer + omega_beta * wbuffer\n"
@@ -1582,7 +1558,7 @@ def validate_multi_scf_compatibility(wfn_list):
                     f"  You have enabled WCOMBINE=TRUE (combined K matrix mode).\n"
                     f"  In this mode, the combined matrix K_combined = alpha*K + beta*wK\n"
                     f"  is computed directly with alpha/beta baked into integrals.\n"
-                    f"  Different beta → different integrals → WRONG results!\n"
+                    f"  Different beta yields incorrect results.\n"
                     f"\n"
                     f"Code location: DFHelper.cc compute_sparse_pQq_blocking_p_symm_abw()\n"
                     f"  param_Mp = omega_alpha * buffer + omega_beta * wbuffer\n"
@@ -1593,7 +1569,7 @@ def validate_multi_scf_compatibility(wfn_list):
                     f"  Or disable wcombine mode (set WCOMBINE=FALSE, which is default).\n"
                     f"{'=' * 70}\n"
                 )
-    # else: wcombine=FALSE (default) → alpha/beta used in Fock assembly, not in integrals → OK to differ
+    # else: wcombine=FALSE (default) - alpha/beta used in Fock assembly, not in integrals, OK to differ
 
     # All checks passed!
     # Parameters that CAN differ (safe) are NOT checked:
@@ -1649,10 +1625,29 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
 
     Examples
     --------
-    >>> # Converge singlet and triplet RHF simultaneously
-    >>> rhf_singlet = psi4.core.RHF(wfn_singlet, ...)
-    >>> rhf_triplet = psi4.core.RHF(wfn_triplet, ...)
-    >>> energies = multi_scf([rhf_singlet, rhf_triplet])
+    Converge singlet and triplet states simultaneously::
+
+        import psi4
+        mol = psi4.geometry('''
+        0 1
+        H 0 0 0
+        H 0 0 0.74
+        ''')
+        psi4.set_options({'basis': 'cc-pVDZ'})
+
+        # Create singlet wavefunction
+        mol.set_multiplicity(1)
+        wfn_s = psi4.core.RHF(psi4.core.Wavefunction.build(mol, 'cc-pVDZ'))
+
+        # Create triplet wavefunction
+        mol.set_multiplicity(3)
+        wfn_t = psi4.core.UHF(psi4.core.Wavefunction.build(mol, 'cc-pVDZ'))
+
+        # Converge both simultaneously with shared JK
+        energies = multi_scf([wfn_s, wfn_t])
+
+        print(f"Singlet energy: {energies[0]}")
+        print(f"Triplet energy: {energies[1]}")
 
     Notes
     -----
@@ -1710,12 +1705,12 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
     if max_iter is None:
         max_iter = core.get_option('SCF', 'MAXITER')
 
-    # CRITICAL: Snapshot global options ONCE before creating/initializing any wfn
-    # This prevents non-determinism from global state pollution between wfn creation
+    # Snapshot global options once before creating/initializing any wfn
+    # Prevents non-determinism from global state pollution between wfn creation
     options_snapshot = snapshot_scf_options()
 
-    # CRITICAL: Apply options snapshot to ALL wfn BEFORE any initialization
-    # This ensures wfn.initialize() reads from frozen snapshot, not from global state
+    # Apply options snapshot to all wfn before any initialization
+    # Ensures wfn.initialize() reads from frozen snapshot, not from global state
     for wfn in wfn_list:
         apply_options_snapshot(wfn, options_snapshot)
 
@@ -1758,31 +1753,27 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
             wfn.initialize_jk(wfn.memory_jk_)
     else:
         # Normal initialization (no DF guess)
-        # CRITICAL: Shared JK Pre-Initialization for 10× memory reduction and 10× speedup!
+        # Shared JK pre-initialization reduces memory and computation time.
         #
-        # Problem: Each wfn.initialize() creates ITS OWN JK via _build_jk()
-        #          → N× 3-index integrals computation (5GB × N wavefunctions!)
-        #          → 10× redundant work since multi_scf uses SINGLE shared JK
+        # Problem: Each wfn.initialize() creates its own JK via _build_jk()
+        #          causing N× redundant 3-index integrals computation.
         #
-        # Solution: Create SINGLE shared JK, then share it with ALL wfn
+        # Solution: Create single shared JK, then share it with all wfn.
         #          scf_initialize() is idempotent - reuses JK if already set (line 154-156)
         #
-        # NOTE: 3-index integrals (Q|μν) depend ONLY on basis + geometry,
-        #       NOT on reference type (RHF/UHF/ROHF). JK object is generic
+        # NOTE: 3-index integrals (Q|μν) depend only on basis + geometry,
+        #       not on reference type (RHF/UHF/ROHF). JK object is generic
         #       and works with any number of density matrices.
-        #
-        # Performance: N=10 wfn, 1000 basis → 50GB → 5GB (10× reduction!)
-        #                                     300s → 30s (10× speedup!)
 
         needs_jk_init = any(wfn.jk() is None for wfn in wfn_list)
 
         if needs_jk_init:
-            # Build SINGLE shared JK for all wavefunctions
+            # Build single shared JK for all wavefunctions
             ref_wfn = wfn_list[0]
 
-            # CRITICAL FIX: Use integer arithmetic to avoid float→int type error
-            # Python 3: `/` returns float (250000000.0), but C++ expects int!
-            # Solution: Use `//` (integer division) + explicit int() conversion
+            # Use integer arithmetic to avoid float-to-int type error
+            # Python 3: `/` returns float, but C++ expects int
+            # Use `//` (integer division) + explicit int() conversion
             total_memory_bytes = core.get_memory()
             safety_factor = core.get_global_option("SCF_MEM_SAFETY_FACTOR")
             total_memory = int((total_memory_bytes // 8) * safety_factor)
@@ -1869,8 +1860,6 @@ def _multi_scf_inner(wfn_list, e_conv, d_conv, max_iter, verbose):
 
     # Track convergence status for each wfn
     converged_flags = [False] * len(wfn_list)
-    # DIAGNOSTIC TEST: Grace pattern disabled to test if it causes numerical instability
-    # just_converged_flags = [False] * len(wfn_list)  # Grace iteration tracking
     final_energies = [0.0] * len(wfn_list)
 
     if verbose:
@@ -1884,20 +1873,16 @@ def _multi_scf_inner(wfn_list, e_conv, d_conv, max_iter, verbose):
     # Main multi-cycle SCF iteration loop
     for iteration in range(1, max_iter + 1):
 
-        # Step 1: Collect occupied orbital matrices from ALL wavefunctions
-        # CRITICAL: ALL wfn must participate in JK (including converged ones)
-        # to maintain consistent indexing and prevent discontinuous Fock changes.
-        #
-        # DIAGNOSTIC TEST: Simplified convergence (no grace pattern)
-        # - All wfn participate in JK on every iteration
-        # - Converged wfn continue providing C matrices but don't iterate
-        # - No freezing, no grace period
+        # Step 1: Collect occupied orbital matrices from all wavefunctions
+        # All wfn participate in JK (including converged ones) to maintain
+        # consistent indexing and prevent discontinuous Fock changes.
+        # Converged wfn continue providing C matrices but don't iterate.
         all_C_occ_matrices = []
         wfn_state_counts = []  # Track how many states each wfn has
         active_wfn_indices = []  # Track which wfn need iteration (non-converged)
 
         for i, wfn in enumerate(wfn_list):
-            # DIAGNOSTIC: Always get current C matrices (no freezing)
+            # Get current C matrices for this wfn
             C_matrices = wfn.get_orbital_matrices()
 
             if verbose >= 2:
@@ -1968,20 +1953,18 @@ def _multi_scf_inner(wfn_list, e_conv, d_conv, max_iter, verbose):
                 status_strs.append("CONV")
                 continue
 
-            # DIAGNOSTIC: Removed grace period logic (just_converged_flags)
-
             # Call the refactored _scf_iteration() method
             # This uses precomputed J/K automatically (use_precomputed_jk_ flag)
             should_continue, reason = wfn._scf_iteration()
 
             if not should_continue:
                 if reason == 'converged':
-                    # DIAGNOSTIC: Directly mark as converged (no grace period)
+                    # Mark as converged
                     converged_flags[i] = True
                     final_energies[i] = wfn.get_energies("Total Energy")
                     status_strs.append("CONV")
                     if verbose >= 2:
-                        core.print_out(f"  [DEBUG iter={iteration}] wfn {i} CONVERGED (diagnostic: no grace period)\n")
+                        core.print_out(f"  [DEBUG iter={iteration}] wfn {i} CONVERGED\n")
                 elif reason in ['mom_not_started', 'frac_not_started']:
                     # Special cases - keep iterating
                     all_converged = False
