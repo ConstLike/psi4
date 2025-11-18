@@ -37,6 +37,9 @@
 #include "psi4/libscf_solver/uhf.h"
 #include "psi4/libmints/mintshelper.h"
 #include "psi4/libmints/molecule.h"
+#include "psi4/libmints/vector.h"
+#include "psi4/libfock/v.h"
+#include "psi4/libfunctional/superfunctional.h"
 
 namespace psi{
 namespace scfgrad {
@@ -145,7 +148,8 @@ std::vector<SharedMatrix> multi_scfgrad(
         int nbeta = Cb_occ->colspi()[0];
 
         // Nuclear gradient
-        grads["Nuclear"] = SharedMatrix(ref_mol->nuclear_repulsion_energy_deriv1().clone());
+        std::array<double, 3> dipole_field = {0.0, 0.0, 0.0};  // No external field
+        grads["Nuclear"] = SharedMatrix(ref_mol->nuclear_repulsion_energy_deriv1(dipole_field).clone());
         grads["Nuclear"]->set_name("Nuclear Gradient");
 
         // Core gradient (T + V)
