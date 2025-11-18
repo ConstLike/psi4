@@ -1200,6 +1200,324 @@ def _validate_soscf(wfn=None):
 core.HF.validate_diis = _validate_diis
 
 
+def validate_multi_scf_compatibility(wfn_list):
+    """
+    Validate that all wavefunctions can safely share JK computation.
+
+    This function performs FACTUAL checks based on code analysis of shared JK
+    implementation. Only parameters that affect shared components are checked.
+
+    Principle: Check ONLY what is SHARED, nothing more, nothing less.
+
+    MUST Match (for shared JK):
+    ---------------------------
+    1. Primary basis set - JK built with specific basis
+    2. Geometry (molecule) - 3-index integrals depend on atomic coordinates
+    3. Auxiliary basis - if SCF_TYPE='DF', affects integral approximation
+    4. LRC capability - JK built with or without long-range K support
+    5. LRC omega - if LRC, range-separation parameter (configured once from wfn[0])
+    6. RSH alpha/beta - if LRC, RSH parameters (configured once from wfn[0])
+
+    CAN Differ (safe):
+    -----------------
+    - Multiplicity / occupation
+    - Reference type (RHF/UHF/ROHF)
+    - Charge
+    - Non-LRC XC functional
+    - Hybrid fraction (do_K overwritten to True)
+    - Convergence settings (per-wfn)
+
+    Parameters
+    ----------
+    wfn_list : list of HF
+        List of wavefunctions to validate
+
+    Raises
+    ------
+    ValidationError
+        If wavefunctions are incompatible for shared JK, with detailed message
+        explaining WHAT doesn't match, WHY it matters, and HOW to fix it.
+
+    See Also
+    --------
+    SHARED_JK_COMPATIBILITY_REQUIREMENTS.md : Detailed code analysis and justification
+
+    Notes
+    -----
+    Based on factual code tracing of _build_jk(), initialize_jk(), and multi_scf()
+    shared JK implementation. Every check has explicit code justification.
+    """
+    if len(wfn_list) < 2:
+        return  # Single wfn, no compatibility issues
+
+    ref_wfn = wfn_list[0]
+
+    # ========================================================================
+    # Category 1: JK Structure (baked into JK.build(), cannot change)
+    # ========================================================================
+
+    # Check 1.1: Primary Basis Set
+    # Code: _build_jk() line 97: wfn.get_basisset("ORBITAL")
+    # Why: JK object built with specific basis dimensions, 3-index integrals
+    #      computed for this basis. Different basis → different integrals.
+    ref_basis = ref_wfn.basisset()
+    ref_basis_name = ref_basis.name()
+    ref_nbf = ref_basis.nbf()
+
+    for i, wfn in enumerate(wfn_list[1:], 1):
+        wfn_basis = wfn.basisset()
+        wfn_basis_name = wfn_basis.name()
+        wfn_nbf = wfn_basis.nbf()
+
+        if wfn_basis_name != ref_basis_name or wfn_nbf != ref_nbf:
+            raise ValidationError(
+                f"\n"
+                f"Shared JK Compatibility Error: Primary basis set mismatch\n"
+                f"{'=' * 70}\n"
+                f"Wavefunction {i} has different primary basis set:\n"
+                f"  Reference (wfn 0): {ref_basis_name} ({ref_nbf} basis functions)\n"
+                f"  Wavefunction {i}:  {wfn_basis_name} ({wfn_nbf} basis functions)\n"
+                f"\n"
+                f"Why this matters:\n"
+                f"  All wavefunctions share a single JK object built with specific\n"
+                f"  basis set dimensions. The 3-index integrals (Q|μν) are computed\n"
+                f"  for this basis. Different basis sets require different integrals.\n"
+                f"\n"
+                f"Code location: _build_jk() line 97\n"
+                f"  jk = core.JK.build(wfn.get_basisset('ORBITAL'), ...)\n"
+                f"\n"
+                f"Solution:\n"
+                f"  Use the same primary basis set for all wavefunctions in multi_scf().\n"
+                f"  Example: set basis cc-pVDZ for all molecules before creating wfn.\n"
+                f"{'=' * 70}\n"
+            )
+
+    # Check 1.2: Geometry (Molecule)
+    # Code: jk.initialize() line 121 - computes 3-index integrals
+    # Why: Integrals (Q|μν) = ∫∫ χ_Q(r1) χ_μ(r1) r12^-1 χ_ν(r2) dr1 dr2
+    #      Basis functions χ centered on atoms → integrals depend on geometry
+    ref_mol = ref_wfn.molecule()
+
+    for i, wfn in enumerate(wfn_list[1:], 1):
+        wfn_mol = wfn.molecule()
+
+        # Check if same molecule object (identity check is fastest)
+        if wfn_mol is not ref_mol:
+            # Different objects - check if geometries are identical
+            # This can happen if molecules were cloned
+            ref_geom = ref_mol.geometry().np.flatten()
+            wfn_geom = wfn_mol.geometry().np.flatten()
+
+            if ref_geom.shape != wfn_geom.shape or \
+               not core.np.allclose(ref_geom, wfn_geom, atol=1e-10):
+                raise ValidationError(
+                    f"\n"
+                    f"Shared JK Compatibility Error: Geometry mismatch\n"
+                    f"{'=' * 70}\n"
+                    f"Wavefunction {i} has different molecular geometry:\n"
+                    f"  Reference and wfn {i} have different atomic coordinates.\n"
+                    f"\n"
+                    f"Why this matters:\n"
+                    f"  The 3-index integrals (Q|μν) depend on atomic positions because\n"
+                    f"  basis functions are centered on atoms. Different geometries\n"
+                    f"  require completely different integrals.\n"
+                    f"\n"
+                    f"Code location: jk.initialize() called in initialize_jk() line 121\n"
+                    f"  Computes integrals for current molecular geometry.\n"
+                    f"\n"
+                    f"Solution:\n"
+                    f"  Use the same molecule object for all wavefunctions.\n"
+                    f"  If you need different multiplicities/charges, use:\n"
+                    f"    mol.set_multiplicity(...)  # Changes occupation\n"
+                    f"    mol.set_molecular_charge(...)  # Changes charge\n"
+                    f"  but keep the SAME molecule object (same geometry).\n"
+                    f"{'=' * 70}\n"
+                )
+
+    # Check 1.3: Auxiliary Basis (for DF only)
+    # Code: _build_jk() line 98: aux=wfn.get_basisset("DF_BASIS_SCF")
+    # Why: For density fitting, different auxiliary basis → different approximation
+    #      (μν|ρσ) ≈ (μν|P) (P|Q)^-1 (Q|ρσ)
+    scf_type = core.get_global_option('SCF_TYPE')
+    if scf_type == 'DF':
+        ref_aux = ref_wfn.get_basisset("DF_BASIS_SCF")
+        ref_aux_name = ref_aux.name()
+
+        for i, wfn in enumerate(wfn_list[1:], 1):
+            wfn_aux = wfn.get_basisset("DF_BASIS_SCF")
+            wfn_aux_name = wfn_aux.name()
+
+            if wfn_aux_name != ref_aux_name:
+                raise ValidationError(
+                    f"\n"
+                    f"Shared JK Compatibility Error: DF auxiliary basis mismatch\n"
+                    f"{'=' * 70}\n"
+                    f"Wavefunction {i} has different DF auxiliary basis:\n"
+                    f"  Reference (wfn 0): {ref_aux_name}\n"
+                    f"  Wavefunction {i}:  {wfn_aux_name}\n"
+                    f"\n"
+                    f"Why this matters:\n"
+                    f"  For SCF_TYPE='DF', the auxiliary basis is used to approximate\n"
+                    f"  4-index integrals: (μν|ρσ) ≈ (μν|P) (P|Q)^-1 (Q|ρσ)\n"
+                    f"  Different auxiliary basis → different approximation → different J/K.\n"
+                    f"\n"
+                    f"Code location: _build_jk() line 98\n"
+                    f"  jk = core.JK.build(..., aux=wfn.get_basisset('DF_BASIS_SCF'))\n"
+                    f"\n"
+                    f"Solution:\n"
+                    f"  Use the same DF auxiliary basis for all wavefunctions.\n"
+                    f"  Example: set df_basis_scf cc-pVDZ-RI for all molecules.\n"
+                    f"{'=' * 70}\n"
+                )
+
+    # Check 1.4: LRC Capability
+    # Code: _build_jk() line 99: do_wK=wfn.functional().is_x_lrc()
+    # Why: JK built with or without long-range K capability. If built without,
+    #      cannot compute wK later!
+    ref_is_lrc = ref_wfn.functional().is_x_lrc()
+
+    for i, wfn in enumerate(wfn_list[1:], 1):
+        wfn_is_lrc = wfn.functional().is_x_lrc()
+
+        if wfn_is_lrc != ref_is_lrc:
+            ref_func_name = ref_wfn.functional().name()
+            wfn_func_name = wfn.functional().name()
+
+            raise ValidationError(
+                f"\n"
+                f"Shared JK Compatibility Error: LRC capability mismatch\n"
+                f"{'=' * 70}\n"
+                f"Wavefunction {i} has incompatible functional:\n"
+                f"  Reference (wfn 0): {ref_func_name} (is_x_lrc={ref_is_lrc})\n"
+                f"  Wavefunction {i}:  {wfn_func_name} (is_x_lrc={wfn_is_lrc})\n"
+                f"\n"
+                f"Why this matters:\n"
+                f"  The shared JK object is built with or without long-range K (wK)\n"
+                f"  capability. If built without wK support (non-LRC functional), it\n"
+                f"  cannot compute wK for LRC functionals later!\n"
+                f"\n"
+                f"Code location: _build_jk() line 99\n"
+                f"  jk = core.JK.build(..., do_wK=wfn.functional().is_x_lrc())\n"
+                f"\n"
+                f"Solution:\n"
+                f"  All wavefunctions must be either:\n"
+                f"    - All LRC functionals (ωB97X, ωB97X-D, LC-ωPBE, etc.), OR\n"
+                f"    - All non-LRC (HF, B3LYP, PBE0, etc.)\n"
+                f"  Mixing LRC and non-LRC is not supported for shared JK.\n"
+                f"{'=' * 70}\n"
+            )
+
+    # ========================================================================
+    # Category 2: JK Configuration (set in initialize_jk(), not updated later)
+    # ========================================================================
+
+    # Checks 2.1-2.3: LRC Parameters (omega, alpha, beta)
+    # Code: initialize_jk() lines 116-119
+    # Why: These are set during ref_wfn.initialize_jk() and NOT reconfigured
+    #      for other wfn (they skip initialize_jk due to idempotency).
+    #      If different, wfn[1:] use WRONG parameters!
+    if ref_is_lrc:
+        ref_omega = ref_wfn.functional().x_omega()
+        ref_alpha = ref_wfn.functional().x_alpha()
+        ref_beta = ref_wfn.functional().x_beta()
+
+        for i, wfn in enumerate(wfn_list[1:], 1):
+            wfn_omega = wfn.functional().x_omega()
+            wfn_alpha = wfn.functional().x_alpha()
+            wfn_beta = wfn.functional().x_beta()
+
+            # Check omega
+            if abs(wfn_omega - ref_omega) > 1e-10:
+                ref_func_name = ref_wfn.functional().name()
+                wfn_func_name = wfn.functional().name()
+
+                raise ValidationError(
+                    f"\n"
+                    f"Shared JK Compatibility Error: LRC omega parameter mismatch\n"
+                    f"{'=' * 70}\n"
+                    f"Wavefunction {i} has different omega parameter:\n"
+                    f"  Reference (wfn 0): {ref_func_name}, omega = {ref_omega}\n"
+                    f"  Wavefunction {i}:  {wfn_func_name}, omega = {wfn_omega}\n"
+                    f"\n"
+                    f"Why this matters:\n"
+                    f"  For LRC functionals, omega is the range-separation parameter:\n"
+                    f"    1/r = erf(ω r)/r + erfc(ω r)/r\n"
+                    f"  The shared JK is configured with omega from wfn[0] only.\n"
+                    f"  Other wavefunctions skip JK configuration due to idempotency,\n"
+                    f"  so they inherit omega from wfn[0]. Different omega would give\n"
+                    f"  wrong long-range/short-range splitting!\n"
+                    f"\n"
+                    f"Code location: initialize_jk() line 116\n"
+                    f"  jk.set_omega(functional.x_omega())\n"
+                    f"  Only called for wfn[0], skipped for wfn[1:] (scf_initialize\n"
+                    f"  idempotency check at lines 146-148).\n"
+                    f"\n"
+                    f"Solution:\n"
+                    f"  All wavefunctions must use LRC functionals with the SAME omega.\n"
+                    f"  Different LRC functionals (ωB97X vs ωB97X-D) typically have\n"
+                    f"  different omega values, so they cannot be mixed.\n"
+                    f"{'=' * 70}\n"
+                )
+
+            # Check alpha
+            if abs(wfn_alpha - ref_alpha) > 1e-10:
+                ref_func_name = ref_wfn.functional().name()
+                wfn_func_name = wfn.functional().name()
+
+                raise ValidationError(
+                    f"\n"
+                    f"Shared JK Compatibility Error: RSH alpha parameter mismatch\n"
+                    f"{'=' * 70}\n"
+                    f"Wavefunction {i} has different alpha parameter:\n"
+                    f"  Reference (wfn 0): {ref_func_name}, alpha = {ref_alpha}\n"
+                    f"  Wavefunction {i}:  {wfn_func_name}, alpha = {wfn_alpha}\n"
+                    f"\n"
+                    f"Why this matters:\n"
+                    f"  For range-separated hybrid (RSH) functionals, alpha controls\n"
+                    f"  the short-range HF exchange fraction. The shared JK is configured\n"
+                    f"  with alpha from wfn[0] only (same reason as omega above).\n"
+                    f"\n"
+                    f"Code location: initialize_jk() line 118\n"
+                    f"  jk.set_omega_alpha(functional.x_alpha())\n"
+                    f"\n"
+                    f"Solution:\n"
+                    f"  All wavefunctions must use functionals with the SAME alpha.\n"
+                    f"{'=' * 70}\n"
+                )
+
+            # Check beta
+            if abs(wfn_beta - ref_beta) > 1e-10:
+                ref_func_name = ref_wfn.functional().name()
+                wfn_func_name = wfn.functional().name()
+
+                raise ValidationError(
+                    f"\n"
+                    f"Shared JK Compatibility Error: RSH beta parameter mismatch\n"
+                    f"{'=' * 70}\n"
+                    f"Wavefunction {i} has different beta parameter:\n"
+                    f"  Reference (wfn 0): {ref_func_name}, beta = {ref_beta}\n"
+                    f"  Wavefunction {i}:  {wfn_func_name}, beta = {wfn_beta}\n"
+                    f"\n"
+                    f"Why this matters:\n"
+                    f"  For RSH functionals, beta controls the long-range HF exchange\n"
+                    f"  fraction. The shared JK is configured with beta from wfn[0] only.\n"
+                    f"\n"
+                    f"Code location: initialize_jk() line 119\n"
+                    f"  jk.set_omega_beta(functional.x_beta())\n"
+                    f"\n"
+                    f"Solution:\n"
+                    f"  All wavefunctions must use functionals with the SAME beta.\n"
+                    f"{'=' * 70}\n"
+                )
+
+    # All checks passed!
+    # Parameters that CAN differ (safe) are NOT checked:
+    # - Multiplicity, Reference type, Charge, Non-LRC XC, Hybrid fraction,
+    #   Convergence settings - these don't affect shared JK
+    # Parameters already protected:
+    # - SCF_TYPE (options snapshot), do_J/do_K (overwritten in _multi_scf_inner)
+
+
 def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
     """
     Run multiple SCF calculations with shared JK computation.
@@ -1271,6 +1589,11 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
     """
     if len(wfn_list) == 0:
         raise ValidationError("multi_scf requires at least one wavefunction")
+
+    # Validate wavefunction compatibility for shared JK
+    # Checks: basis set, geometry, LRC parameters, etc.
+    # Only checks what affects SHARED components (no half-measures!)
+    validate_multi_scf_compatibility(wfn_list)
 
     # Auto-assign unique wavefunction names for file isolation
     # This enables proper DIIS, stability analysis, and orbital file separation
