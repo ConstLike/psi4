@@ -1124,20 +1124,23 @@ void DFJKGrad::build_Amn_x_terms() {
         }
     }
 
-    // => Temporary Gradients <= //
+    // => Temporary Gradients [thread][wfn] <= //
 
-    std::vector<SharedMatrix> Jtemps;
-    std::vector<SharedMatrix> Ktemps;
-    std::vector<SharedMatrix> wKtemps;
+    std::vector<std::vector<SharedMatrix>> Jtemps(df_ints_num_threads_);
+    std::vector<std::vector<SharedMatrix>> Ktemps(df_ints_num_threads_);
+    std::vector<std::vector<SharedMatrix>> wKtemps(df_ints_num_threads_);
+
     for (int t = 0; t < df_ints_num_threads_; t++) {
-        if (do_J_) {
-            Jtemps.push_back(std::make_shared<Matrix>("Jtemp", natom, 3));
-        }
-        if (do_K_) {
-            Ktemps.push_back(std::make_shared<Matrix>("Ktemp", natom, 3));
-        }
-        if (do_wK_) {
-            wKtemps.push_back(std::make_shared<Matrix>("wKtemp", natom, 3));
+        for (int w = 0; w < nwfn; w++) {
+            if (do_J_) {
+                Jtemps[t].push_back(std::make_shared<Matrix>("Jtemp", natom, 3));
+            }
+            if (do_K_) {
+                Ktemps[t].push_back(std::make_shared<Matrix>("Ktemp", natom, 3));
+            }
+            if (do_wK_) {
+                wKtemps[t].push_back(std::make_shared<Matrix>("wKtemp", natom, 3));
+            }
         }
     }
 
@@ -1154,33 +1157,115 @@ void DFJKGrad::build_Amn_x_terms() {
         int pstop = (Pstop == auxiliary_->nshell() ? naux : auxiliary_->shell(Pstop).function_index());
         int np = pstop - pstart;
 
-        // => J_mn^A <= //
+        // => Phase 1: Per-wfn preparation (read densities & perform transforms) <= //
 
-        if (do_K_ || do_wK_) Kmn->zero();
-        if (do_wK_) wKmn->zero();
-        for (const auto& trans : transforms) {
-            // > Unpack transform < //
-            size_t unit = std::get<0>(trans);
-            std::string buffer = std::get<1>(trans);
-            double** Cp = std::get<2>(trans);
-            size_t nmo = std::get<3>(trans);
-            psio_address* address = std::get<4>(trans);
-            double** retp = std::get<5>(trans);
+        for (int w = 0; w < nwfn; w++) {
+            int na = Ca_list_[w]->colspi()[0];
+            int nb = Cb_list_[w]->colspi()[0];
+            bool restricted = (Ca_list_[w] == Cb_list_[w]);
+            double factor = (restricted ? 2.0 : 1.0);
 
-            size_t nmo2 = nmo * nmo;
+            double** Cap = Ca_list_[w]->pointer();
+            double** Cbp = Cb_list_[w]->pointer();
 
-            // > Stripe < //
-            psio_->read(unit, buffer.c_str(), (char*)Aijp[0], sizeof(double) * np * nmo2, *address, address);
+            auto [unit_a_w, unit_b_w, unit_c_w] = wfn_units_[w];
 
-            // > (A|ij) C_mi -> (A|mj) < //
-#pragma omp parallel for
-            for (int P = 0; P < np; P++) {
-                C_DGEMM('N', 'N', nso, nmo, nmo, 1.0, Cp[0], nmo, &Aijp[0][P * nmo2], nmo, 0.0, Amip[P], na);
+            // Read J density (block 0 only)
+            if (do_J_ && block == 0) {
+                double* dp = d_list[w]->pointer();
+                psio_->read_entry(unit_c_w, "c", (char*)dp, sizeof(double) * naux);
             }
 
-            // > (A|mj) C_nj -> (A|mn) < //
-            C_DGEMM('N', 'T', np * (size_t)nso, nso, nmo, factor, Amip[0], na, Cp[0], nmo, 1.0, retp[0], nso);
-        }
+            // K/wK transforms: (A|ij) → (A|mn), (A|w|ij) → (A|w|mn)
+            if (do_K_ || do_wK_) {
+                Kmn_list[w]->zero();
+
+                static std::map<std::tuple<int, size_t, std::string>, psio_address> psio_addrs_k;
+                auto get_addr_k = [&](size_t unit, const std::string& buf) -> psio_address* {
+                    auto key = std::make_tuple(w, unit, buf);
+                    if (block == 0) psio_addrs_k[key] = PSIO_ZERO;
+                    return &psio_addrs_k[key];
+                };
+
+                double** Kmnp = Kmn_list[w]->pointer();
+
+                // Alpha K transform
+                psio_->read(unit_a_w, "(A|ij)", (char*)Aijp[0],
+                            sizeof(double) * np * na * na,
+                            *get_addr_k(unit_a_w, "(A|ij)"), get_addr_k(unit_a_w, "(A|ij)"));
+
+#pragma omp parallel for
+                for (int P = 0; P < np; P++) {
+                    C_DGEMM('N', 'N', nso, na, na, 1.0, Cap[0], na,
+                            &Aijp[0][P * na * na], na, 0.0, Amip[P], na_max);
+                }
+
+                C_DGEMM('N', 'T', np * (size_t)nso, nso, na, factor,
+                        Amip[0], na_max, Cap[0], na, 1.0, Kmnp[0], nso);
+
+                // Beta K transform (if unrestricted)
+                if (!restricted && nb > 0) {
+                    psio_->read(unit_b_w, "(A|ij)", (char*)Aijp[0],
+                                sizeof(double) * np * nb * nb,
+                                *get_addr_k(unit_b_w, "(A|ij)"), get_addr_k(unit_b_w, "(A|ij)"));
+
+#pragma omp parallel for
+                    for (int P = 0; P < np; P++) {
+                        C_DGEMM('N', 'N', nso, nb, nb, 1.0, Cbp[0], nb,
+                                &Aijp[0][P * nb * nb], nb, 0.0, Amip[P], na_max);
+                    }
+
+                    C_DGEMM('N', 'T', np * (size_t)nso, nso, nb, 1.0,
+                            Amip[0], na_max, Cbp[0], nb, 1.0, Kmnp[0], nso);
+                }
+            }
+
+            // wK transforms (LR integrals)
+            if (do_wK_) {
+                wKmn_list[w]->zero();
+
+                static std::map<std::tuple<int, size_t, std::string>, psio_address> psio_addrs_wk;
+                auto get_addr_wk = [&](size_t unit, const std::string& buf) -> psio_address* {
+                    auto key = std::make_tuple(w, unit, buf);
+                    if (block == 0) psio_addrs_wk[key] = PSIO_ZERO;
+                    return &psio_addrs_wk[key];
+                };
+
+                double** wKmnp = wKmn_list[w]->pointer();
+
+                // Alpha wK transform
+                psio_->read(unit_a_w, "(A|w|ij)", (char*)Aijp[0],
+                            sizeof(double) * np * na * na,
+                            *get_addr_wk(unit_a_w, "(A|w|ij)"), get_addr_wk(unit_a_w, "(A|w|ij)"));
+
+#pragma omp parallel for
+                for (int P = 0; P < np; P++) {
+                    C_DGEMM('N', 'N', nso, na, na, 1.0, Cap[0], na,
+                            &Aijp[0][P * na * na], na, 0.0, Amip[P], na_max);
+                }
+
+                C_DGEMM('N', 'T', np * (size_t)nso, nso, na, factor,
+                        Amip[0], na_max, Cap[0], na, 1.0, wKmnp[0], nso);
+
+                // Beta wK transform
+                if (!restricted && nb > 0) {
+                    psio_->read(unit_b_w, "(A|w|ij)", (char*)Aijp[0],
+                                sizeof(double) * np * nb * nb,
+                                *get_addr_wk(unit_b_w, "(A|w|ij)"), get_addr_wk(unit_b_w, "(A|w|ij)"));
+
+#pragma omp parallel for
+                    for (int P = 0; P < np; P++) {
+                        C_DGEMM('N', 'N', nso, nb, nb, 1.0, Cbp[0], nb,
+                                &Aijp[0][P * nb * nb], nb, 0.0, Amip[P], na_max);
+                    }
+
+                    C_DGEMM('N', 'T', np * (size_t)nso, nso, nb, 1.0,
+                            Amip[0], na_max, Cbp[0], nb, 1.0, wKmnp[0], nso);
+                }
+            }
+        }  // End per-wfn preparation loop
+
+        // => Phase 2: Generate (A|pq)^x derivative integrals ONCE (WFN-INDEPENDENT) <= //
 
         // > Integrals < //
         int nthread_df = df_ints_num_threads_;
@@ -1228,79 +1313,99 @@ void DFJKGrad::build_Amn_x_terms() {
 
             double perm = (M == N ? 1.0 : 2.0);
 
-            double** grad_Jp;
-            double** grad_Kp;
-            double** grad_wKp;
+            // => Phase 3: Contract integrals with ALL wavefunctions <= //
 
-            if (do_J_) {
-                grad_Jp = Jtemps[thread]->pointer();
-            }
-            if (do_K_) {
-                grad_Kp = Ktemps[thread]->pointer();
-            }
-            if (do_wK_) {
-                grad_wKp = wKtemps[thread]->pointer();
-            }
+            for (int w = 0; w < nwfn; w++) {
+                double** grad_Jp = nullptr;
+                double** grad_Kp = nullptr;
+                double** grad_wKp = nullptr;
 
-            for (int p = 0; p < nP; p++) {
-                for (int m = 0; m < nM; m++) {
-                    for (int n = 0; n < nN; n++) {
-                        //  J^x = (A|pq)^x d_A Dt_pq
-                        if (do_J_) {
-                            double Ival = 1.0 * perm * dp[p + oP + pstart] * Dtp[m + oM][n + oN];
-                            grad_Jp[aP][0] += Ival * (*Px);
-                            grad_Jp[aP][1] += Ival * (*Py);
-                            grad_Jp[aP][2] += Ival * (*Pz);
-                            grad_Jp[aM][0] += Ival * (*Mx);
-                            grad_Jp[aM][1] += Ival * (*My);
-                            grad_Jp[aM][2] += Ival * (*Mz);
-                            grad_Jp[aN][0] += Ival * (*Nx);
-                            grad_Jp[aN][1] += Ival * (*Ny);
-                            grad_Jp[aN][2] += Ival * (*Nz);
+                if (do_J_) {
+                    grad_Jp = Jtemps[thread][w]->pointer();
+                }
+                if (do_K_) {
+                    grad_Kp = Ktemps[thread][w]->pointer();
+                }
+                if (do_wK_) {
+                    grad_wKp = wKtemps[thread][w]->pointer();
+                }
+
+                double* dp = do_J_ ? d_list[w]->pointer() : nullptr;
+                double** Dtp = Dt_list_[w]->pointer();
+                double** Kmnp = (do_K_ || do_wK_) ? Kmn_list[w]->pointer() : nullptr;
+                double** wKmnp = do_wK_ ? wKmn_list[w]->pointer() : nullptr;
+
+                const double* Px_w = Px;
+                const double* Py_w = Py;
+                const double* Pz_w = Pz;
+                const double* Mx_w = Mx;
+                const double* My_w = My;
+                const double* Mz_w = Mz;
+                const double* Nx_w = Nx;
+                const double* Ny_w = Ny;
+                const double* Nz_w = Nz;
+
+                for (int p = 0; p < nP; p++) {
+                    for (int m = 0; m < nM; m++) {
+                        for (int n = 0; n < nN; n++) {
+                            //  J^x = (A|pq)^x d_A Dt_pq
+                            if (do_J_) {
+                                double Ival = 1.0 * perm * dp[p + oP + pstart] * Dtp[m + oM][n + oN];
+                                grad_Jp[aP][0] += Ival * (*Px_w);
+                                grad_Jp[aP][1] += Ival * (*Py_w);
+                                grad_Jp[aP][2] += Ival * (*Pz_w);
+                                grad_Jp[aM][0] += Ival * (*Mx_w);
+                                grad_Jp[aM][1] += Ival * (*My_w);
+                                grad_Jp[aM][2] += Ival * (*Mz_w);
+                                grad_Jp[aN][0] += Ival * (*Nx_w);
+                                grad_Jp[aN][1] += Ival * (*Ny_w);
+                                grad_Jp[aN][2] += Ival * (*Nz_w);
+                            }
+
+                            //  K^x = (A|pq)^x (A|pq)
+                            if (do_K_) {
+                                double Kval = 1.0 * perm * Kmnp[p + oP][(m + oM) * nso + (n + oN)];
+                                grad_Kp[aP][0] += Kval * (*Px_w);
+                                grad_Kp[aP][1] += Kval * (*Py_w);
+                                grad_Kp[aP][2] += Kval * (*Pz_w);
+                                grad_Kp[aM][0] += Kval * (*Mx_w);
+                                grad_Kp[aM][1] += Kval * (*My_w);
+                                grad_Kp[aM][2] += Kval * (*Mz_w);
+                                grad_Kp[aN][0] += Kval * (*Nx_w);
+                                grad_Kp[aN][1] += Kval * (*Ny_w);
+                                grad_Kp[aN][2] += Kval * (*Nz_w);
+                            }
+
+                            // wK^x = 0.5 * (A|pq)^x (A|w|pq)
+                            if (do_wK_) {
+                                double wKval = 0.5 * perm * wKmnp[p + oP][(m + oM) * nso + (n + oN)];
+                                grad_wKp[aP][0] += wKval * (*Px_w);
+                                grad_wKp[aP][1] += wKval * (*Py_w);
+                                grad_wKp[aP][2] += wKval * (*Pz_w);
+                                grad_wKp[aM][0] += wKval * (*Mx_w);
+                                grad_wKp[aM][1] += wKval * (*My_w);
+                                grad_wKp[aM][2] += wKval * (*Mz_w);
+                                grad_wKp[aN][0] += wKval * (*Nx_w);
+                                grad_wKp[aN][1] += wKval * (*Ny_w);
+                                grad_wKp[aN][2] += wKval * (*Nz_w);
+                            }
+
+                            Px_w++;
+                            Py_w++;
+                            Pz_w++;
+                            Mx_w++;
+                            My_w++;
+                            Mz_w++;
+                            Nx_w++;
+                            Ny_w++;
+                            Nz_w++;
                         }
-
-                        //  K^x = (A|pq)^x (A|pq)
-                        if (do_K_) {
-                            double Kval = 1.0 * perm * Kmnp[p + oP][(m + oM) * nso + (n + oN)];
-                            grad_Kp[aP][0] += Kval * (*Px);
-                            grad_Kp[aP][1] += Kval * (*Py);
-                            grad_Kp[aP][2] += Kval * (*Pz);
-                            grad_Kp[aM][0] += Kval * (*Mx);
-                            grad_Kp[aM][1] += Kval * (*My);
-                            grad_Kp[aM][2] += Kval * (*Mz);
-                            grad_Kp[aN][0] += Kval * (*Nx);
-                            grad_Kp[aN][1] += Kval * (*Ny);
-                            grad_Kp[aN][2] += Kval * (*Nz);
-                        }
-
-                        // wK^x = 0.5 * (A|pq)^x (A|w|pq)
-                        if (do_wK_) {
-                            double wKval = 0.5 * perm * wKmnp[p + oP][(m + oM) * nso + (n + oN)];
-                            grad_wKp[aP][0] += wKval * (*Px);
-                            grad_wKp[aP][1] += wKval * (*Py);
-                            grad_wKp[aP][2] += wKval * (*Pz);
-                            grad_wKp[aM][0] += wKval * (*Mx);
-                            grad_wKp[aM][1] += wKval * (*My);
-                            grad_wKp[aM][2] += wKval * (*Mz);
-                            grad_wKp[aN][0] += wKval * (*Nx);
-                            grad_wKp[aN][1] += wKval * (*Ny);
-                            grad_wKp[aN][2] += wKval * (*Nz);
-                        }
-
-                        Px++;
-                        Py++;
-                        Pz++;
-                        Mx++;
-                        My++;
-                        Mz++;
-                        Nx++;
-                        Ny++;
-                        Nz++;
                     }
                 }
-            }
+            }  // End per-wfn contraction loop
 
             //  wK^x = 0.5 * (A|w|pq)^x (A|pq)
+            //  Second symmetric contribution: LR derivative integrals × regular densities
             if (do_wK_) {
                 omega_eri[thread]->compute_shell_deriv1(P, 0, M, N);
                 const double* buffer = omega_eri[thread]->buffer();
@@ -1316,60 +1421,68 @@ void DFJKGrad::build_Amn_x_terms() {
                 const double* Ny = buffers[7];
                 const double* Nz = buffers[8];
 
-                for (int p = 0; p < nP; p++) {
-                    for (int m = 0; m < nM; m++) {
-                        for (int n = 0; n < nN; n++) {
-                            double wKval = 0.5 * perm * Kmnp[p + oP][(m + oM) * nso + (n + oN)];
-                            grad_wKp[aP][0] += wKval * (*Px);
-                            grad_wKp[aP][1] += wKval * (*Py);
-                            grad_wKp[aP][2] += wKval * (*Pz);
-                            grad_wKp[aM][0] += wKval * (*Mx);
-                            grad_wKp[aM][1] += wKval * (*My);
-                            grad_wKp[aM][2] += wKval * (*Mz);
-                            grad_wKp[aN][0] += wKval * (*Nx);
-                            grad_wKp[aN][1] += wKval * (*Ny);
-                            grad_wKp[aN][2] += wKval * (*Nz);
-                            Px++;
-                            Py++;
-                            Pz++;
-                            Mx++;
-                            My++;
-                            Mz++;
-                            Nx++;
-                            Ny++;
-                            Nz++;
+                // Loop over wavefunctions (reuse LR integrals with different Kmn)
+                for (int w = 0; w < nwfn; w++) {
+                    double** grad_wKp = wKtemps[thread][w]->pointer();
+                    double** Kmnp = Kmn_list[w]->pointer();
+
+                    const double* Px_w = Px;
+                    const double* Py_w = Py;
+                    const double* Pz_w = Pz;
+                    const double* Mx_w = Mx;
+                    const double* My_w = My;
+                    const double* Mz_w = Mz;
+                    const double* Nx_w = Nx;
+                    const double* Ny_w = Ny;
+                    const double* Nz_w = Nz;
+
+                    for (int p = 0; p < nP; p++) {
+                        for (int m = 0; m < nM; m++) {
+                            for (int n = 0; n < nN; n++) {
+                                double wKval = 0.5 * perm * Kmnp[p + oP][(m + oM) * nso + (n + oN)];
+                                grad_wKp[aP][0] += wKval * (*Px_w);
+                                grad_wKp[aP][1] += wKval * (*Py_w);
+                                grad_wKp[aP][2] += wKval * (*Pz_w);
+                                grad_wKp[aM][0] += wKval * (*Mx_w);
+                                grad_wKp[aM][1] += wKval * (*My_w);
+                                grad_wKp[aM][2] += wKval * (*Mz_w);
+                                grad_wKp[aN][0] += wKval * (*Nx_w);
+                                grad_wKp[aN][1] += wKval * (*Ny_w);
+                                grad_wKp[aN][2] += wKval * (*Nz_w);
+                                Px_w++;
+                                Py_w++;
+                                Pz_w++;
+                                Mx_w++;
+                                My_w++;
+                                Mz_w++;
+                                Nx_w++;
+                                Ny_w++;
+                                Nz_w++;
+                            }
                         }
                     }
-                }
+                }  // End per-wfn LR contraction loop
             }
         }
     }
 
     // => Temporary Gradient Reduction <= //
 
-    // gradients_["Coulomb"]->zero();
-    // gradients_["Exchange"]->zero();
-    // gradients_["Exchange,LR"]->zero();
+    // => Phase 4: Accumulate thread gradients for ALL wavefunctions <= //
 
-    if (do_J_) {
+    for (int w = 0; w < nwfn; w++) {
         for (int t = 0; t < df_ints_num_threads_; t++) {
-            gradients_["Coulomb"]->add(Jtemps[t]);
+            if (do_J_) {
+                gradients_list_[w]["Coulomb"]->add(Jtemps[t][w]);
+            }
+            if (do_K_) {
+                gradients_list_[w]["Exchange"]->add(Ktemps[t][w]);
+            }
+            if (do_wK_) {
+                gradients_list_[w]["Exchange,LR"]->add(wKtemps[t][w]);
+            }
         }
     }
-    if (do_K_) {
-        for (int t = 0; t < df_ints_num_threads_; t++) {
-            gradients_["Exchange"]->add(Ktemps[t]);
-        }
-    }
-    if (do_wK_) {
-        for (int t = 0; t < df_ints_num_threads_; t++) {
-            gradients_["Exchange,LR"]->add(wKtemps[t]);
-        }
-    }
-
-    // gradients_["Coulomb"]->print();
-    // gradients_["Exchange"]->print();
-    // gradients_["Exchange,LR"]->print();
 }
 
 void DFJKGrad::compute_hessian() {
