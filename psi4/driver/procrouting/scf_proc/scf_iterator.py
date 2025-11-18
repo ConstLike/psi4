@@ -1343,7 +1343,7 @@ def validate_multi_scf_compatibility(wfn_list):
             wfn_geom = wfn_mol.geometry().np.flatten()
 
             if ref_geom.shape != wfn_geom.shape or \
-               not core.np.allclose(ref_geom, wfn_geom, atol=1e-10):
+               not np.allclose(ref_geom, wfn_geom, atol=1e-10):
                 raise ValidationError(
                     f"\n"
                     f"Shared JK Compatibility Error: Geometry mismatch\n"
