@@ -952,73 +952,58 @@ void DFJKGrad::build_AB_x_terms()
     auto naux = auxiliary_->nbf();
     int nwfn = Dt_list_.size();
 
-    // => Accumulate densities from all wavefunctions <= //
-    // (A|B)^x is WFN-INDEPENDENT, so we sum densities then compute gradient once
+    // CRITICAL FIX: Compute (A|B)^x gradient contribution PER-WAVEFUNCTION
+    // Although (A|B)^x derivative integrals are the same for all wfn,
+    // the densities (d_A, V_AB, W_AB) are DIFFERENT for each wfn.
+    // Previous code accumulated densities then computed gradient once - WRONG!
+    // This caused massive gradient errors (off by 10^4 - 10^5 ×).
 
-    std::map<std::string, SharedMatrix> densities;
+    for (int w = 0; w < nwfn; w++) {
+        auto [unit_a_w, unit_b_w, unit_c_w] = wfn_units_[w];
 
-    if (do_J_) {
-        auto D_total = std::make_shared<Matrix>("D_total", naux, naux);
-        D_total->zero();
-        auto Dp_total = D_total->pointer();
+        std::map<std::string, SharedMatrix> densities_w;
 
-        for (int w = 0; w < nwfn; w++) {
-            auto [unit_a_w, unit_b_w, unit_c_w] = wfn_units_[w];
+        // J gradient: density d * d^T for THIS wfn only
+        if (do_J_) {
+            auto D_w = std::make_shared<Matrix>("D_w", naux, naux);
+            D_w->zero();
+            auto Dp_w = D_w->pointer();
 
             auto d = std::make_shared<Vector>("d", naux);
             auto dp = d->pointer();
             psio_->read_entry(unit_c_w, "c", (char*) dp, sizeof(double) * naux);
 
-            // Accumulate: D_total += d * d^T
-            C_DGER(naux, naux, 1.0, dp, 1, dp, 1, Dp_total[0], naux);
+            // D_w = d * d^T (outer product)
+            C_DGER(naux, naux, 1.0, dp, 1, dp, 1, Dp_w[0], naux);
+
+            densities_w["Coulomb"] = D_w;
         }
-        densities["Coulomb"] = D_total;
-    }
 
-    if (do_K_) {
-        auto V_total = std::make_shared<Matrix>("V_total", naux, naux);
-        V_total->zero();
-        auto Vp_total = V_total->pointer();
+        // K gradient: V_AB for THIS wfn only
+        if (do_K_) {
+            auto V_w = std::make_shared<Matrix>("V_w", naux, naux);
+            auto Vp_w = V_w->pointer();
+            psio_->read_entry(unit_c_w, "V", (char*) Vp_w[0], sizeof(double) * naux * naux);
 
-        for (int w = 0; w < nwfn; w++) {
-            auto [unit_a_w, unit_b_w, unit_c_w] = wfn_units_[w];
-
-            auto V = std::make_shared<Matrix>("V", naux, naux);
-            auto Vp = V->pointer();
-            psio_->read_entry(unit_c_w, "V", (char*) Vp[0], sizeof(double) * naux * naux);
-
-            // Accumulate: V_total += V
-            V_total->add(V);
+            densities_w["Exchange"] = V_w;
         }
-        densities["Exchange"] = V_total;
-    }
 
-    if (do_wK_) {
-        auto W_total = std::make_shared<Matrix>("W_total", naux, naux);
-        W_total->zero();
+        // wK gradient: W_AB for THIS wfn only
+        if (do_wK_) {
+            auto W_w = std::make_shared<Matrix>("W_w", naux, naux);
+            auto Wp_w = W_w->pointer();
+            psio_->read_entry(unit_c_w, "W", (char*) Wp_w[0], sizeof(double) * naux * naux);
 
-        for (int w = 0; w < nwfn; w++) {
-            auto [unit_a_w, unit_b_w, unit_c_w] = wfn_units_[w];
-
-            auto W = std::make_shared<Matrix>("W", naux, naux);
-            auto Wp = W->pointer();
-            psio_->read_entry(unit_c_w, "W", (char*) Wp[0], sizeof(double) * naux * naux);
-
-            // Accumulate: W_total += W
-            W_total->add(W);
+            densities_w["Exchange,LR"] = W_w;
         }
-        densities["Exchange,LR"] = W_total;
-    }
 
-    // => Compute (A|B)^x gradient contributions (WFN-INDEPENDENT) <= //
-    auto results = mints_->metric_grad(densities, "DF_BASIS_SCF");
+        // Compute (A|B)^x gradient for THIS wfn's densities
+        auto results_w = mints_->metric_grad(densities_w, "DF_BASIS_SCF");
 
-    // => Store in gradients_list_ for all wavefunctions <= //
-    // Since (A|B)^x is WFN-INDEPENDENT, contribution is same for all wfn
-    // But we've already accumulated, so we add result to gradients_list_[0]
-    // (build_Amn_x_terms will add the WFN-DEPENDENT parts per-wfn)
-    for (const auto& kv: results) {
-        gradients_list_[0][kv.first] = kv.second;
+        // Add to THIS wfn's gradients
+        for (const auto& kv : results_w) {
+            gradients_list_[w][kv.first]->add(kv.second);
+        }
     }
 }
 void DFJKGrad::build_Amn_x_terms() {
