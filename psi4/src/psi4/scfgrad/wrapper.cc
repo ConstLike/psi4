@@ -38,6 +38,7 @@
 #include "psi4/libmints/mintshelper.h"
 #include "psi4/libmints/molecule.h"
 #include "psi4/libmints/vector.h"
+#include "psi4/libmints/basisset.h"
 #include "psi4/libfock/v.h"
 #include "psi4/libfunctional/superfunctional.h"
 
@@ -108,12 +109,36 @@ std::vector<SharedMatrix> multi_scfgrad(
     outfile->Printf("         ------------------------------------------------------------\n\n");
 
     // ========================================
-    // Step 1: Compute individual gradient terms for each wfn
+    // Step 1: Prepare MintsHelper with proper basis sets
+    // ========================================
+
+    // Get MintsHelper from first wavefunction and ensure DF_BASIS_SCF is set
+    auto mintshelper = wfns[0]->mintshelper();
+
+    // Check if we need DF basis (only for DF-type SCF)
+    std::string scf_type = options.get_str("SCF_TYPE");
+    bool df_needed = (scf_type.find("DF") != std::string::npos);
+
+    if (df_needed) {
+        // Check if DF_BASIS_SCF is already set
+        if (!wfns[0]->basisset_exists("DF_BASIS_SCF")) {
+            // Build and set DF_BASIS_SCF (following scf_helper pattern)
+            auto aux_basis = BasisSet::build(
+                ref_mol,
+                "DF_BASIS_SCF",
+                options.get_str("DF_BASIS_SCF"),
+                "JKFIT",
+                options.get_str("BASIS"),
+                ref_basis->has_puream()
+            );
+            mintshelper->set_basisset("DF_BASIS_SCF", aux_basis);
+        }
+    }
+
+    // ========================================
+    // Step 2: Compute individual gradient terms for each wfn
     // ========================================
     std::vector<std::map<std::string, SharedMatrix>> individual_grads(nwfn);
-
-    // Use MintsHelper from first wavefunction (already has DF_BASIS_SCF configured)
-    auto mintshelper = wfns[0]->mintshelper();
 
     for (int i = 0; i < nwfn; i++) {
         auto& wfn = wfns[i];
@@ -186,7 +211,7 @@ std::vector<SharedMatrix> multi_scfgrad(
     }
 
     // ========================================
-    // Step 2: Batched JK gradient computation
+    // Step 3: Batched JK gradient computation
     // ========================================
     timer_on("Grad: JK (Batched)");
 
@@ -267,7 +292,7 @@ std::vector<SharedMatrix> multi_scfgrad(
 #endif
 
     // ========================================
-    // Step 3: Assemble total gradients
+    // Step 4: Assemble total gradients
     // ========================================
     std::vector<SharedMatrix> total_gradients;
 
