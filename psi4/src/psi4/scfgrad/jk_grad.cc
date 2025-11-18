@@ -148,9 +148,19 @@ void DFJKGrad::common_init() {
     df_ints_num_threads_ = Process::environment.get_n_threads();
 #endif
     condition_ = 1.0E-12;
+
+    // Single-wfn legacy units (for backwards compatibility)
     unit_a_ = 105;
     unit_b_ = 106;
     unit_c_ = 107;
+
+    // Shared metric inverse unit (unit 108)
+    unit_metric_inv_ = 108;
+
+    // Multi-wfn units will be initialized in compute_gradient() based on nwfn
+    // Layout: unit_base + wfn_idx * 3 + {0=alpha, 1=beta, 2=c}
+    // E.g., wfn 0: 109, 110, 111; wfn 1: 112, 113, 114; etc.
+
     psio_ = PSIO::shared_object();
 }
 void DFJKGrad::print_header() const {
@@ -181,25 +191,22 @@ void DFJKGrad::compute_gradient() {
     }
 
     int nwfn = Dt_list_.size();
-    if (nwfn != 1) {
-        throw PSIEXCEPTION("DFJKGrad: Multi-wfn not yet supported (only single-wfn for now). "
-                           "Use DirectJKGrad for multi-wfn gradients.");
-    }
-
-    // => Set up gradients <= //
     int natom = primary_->molecule()->natom();
-    gradients_list_.clear();
-    gradients_list_.resize(nwfn);  // Size 1 for single-wfn
 
-    if (do_J_) {
-        gradients_list_[0]["Coulomb"] = std::make_shared<Matrix>("Coulomb Gradient", natom, 3);
-    }
-    if (do_K_) {
-        gradients_list_[0]["Exchange"] = std::make_shared<Matrix>("Exchange Gradient", natom, 3);
-    }
-    if (do_wK_) {
-        // throw PSIEXCEPTION("Exchange,LR gradients are not currently available with DF.");
-        gradients_list_[0]["Exchange,LR"] = std::make_shared<Matrix>("Exchange,LR Gradient", natom, 3);
+    // => Set up gradients for ALL wavefunctions <= //
+    gradients_list_.clear();
+    gradients_list_.resize(nwfn);
+
+    for (int w = 0; w < nwfn; w++) {
+        if (do_J_) {
+            gradients_list_[w]["Coulomb"] = std::make_shared<Matrix>("Coulomb Gradient", natom, 3);
+        }
+        if (do_K_) {
+            gradients_list_[w]["Exchange"] = std::make_shared<Matrix>("Exchange Gradient", natom, 3);
+        }
+        if (do_wK_) {
+            gradients_list_[w]["Exchange,LR"] = std::make_shared<Matrix>("Exchange,LR Gradient", natom, 3);
+        }
     }
 
 #ifdef USING_BrianQC
@@ -210,10 +217,29 @@ void DFJKGrad::compute_gradient() {
     }
 #endif
 
-    // => Open temp files <= //
-    psio_->open(unit_a_, PSIO_OPEN_NEW);
-    psio_->open(unit_b_, PSIO_OPEN_NEW);
-    psio_->open(unit_c_, PSIO_OPEN_NEW);
+    // => Set up PSIO units for multi-wfn <= //
+    // Layout: unit_base + wfn_idx * 3 + {0=alpha, 1=beta, 2=c}
+    // Single-wfn uses legacy units (105, 106, 107)
+    // Multi-wfn uses units starting from 109
+    size_t unit_base = (nwfn == 1) ? 105 : 109;
+
+    wfn_units_.clear();
+    wfn_units_.reserve(nwfn);
+
+    for (int w = 0; w < nwfn; w++) {
+        size_t ua = unit_base + w * 3 + 0;  // Alpha
+        size_t ub = unit_base + w * 3 + 1;  // Beta
+        size_t uc = unit_base + w * 3 + 2;  // c/W/V
+        wfn_units_.push_back(std::make_tuple(ua, ub, uc));
+    }
+
+    // => Open temp files for all wavefunctions <= //
+    for (int w = 0; w < nwfn; w++) {
+        auto [ua, ub, uc] = wfn_units_[w];
+        psio_->open(ua, PSIO_OPEN_NEW);
+        psio_->open(ub, PSIO_OPEN_NEW);
+        psio_->open(uc, PSIO_OPEN_NEW);
+    }
 
     // => Gradient Construction: Get in there and kill 'em all! <= //
 
@@ -297,20 +323,28 @@ void DFJKGrad::compute_gradient() {
     //     gradients_["Exchange,LR"]->print();
     // }
 
-    // => Close temp files <= //
-    psio_->close(unit_a_, 0);
-    psio_->close(unit_b_, 0);
-    psio_->close(unit_c_, 0);
+    // => Close temp files for all wavefunctions <= //
+    for (int w = 0; w < nwfn; w++) {
+        auto [ua, ub, uc] = wfn_units_[w];
+        psio_->close(ua, 0);
+        psio_->close(ub, 0);
+        psio_->close(uc, 0);
+    }
 }
 void DFJKGrad::build_Amn_terms() {
     // => Sizing <= //
 
     int nso = primary_->nbf();
     int naux = auxiliary_->nbf();
-    int na = Ca_list_[0]->colspi()[0];  // Phase B: DFJKGrad single-wfn only
-    int nb = Cb_list_[0]->colspi()[0];
+    int nwfn = Dt_list_.size();
 
-    bool restricted = (Ca_list_[0] == Cb_list_[0]);
+    // Get max occupied dimensions across all wavefunctions for memory allocation
+    int na_max = 0;
+    int nb_max = 0;
+    for (int w = 0; w < nwfn; w++) {
+        na_max = std::max(na_max, static_cast<int>(Ca_list_[w]->colspi()[0]));
+        nb_max = std::max(nb_max, static_cast<int>(Cb_list_[w]->colspi()[0]));
+    }
 
     // => Integrals <= //
 
@@ -331,8 +365,8 @@ void DFJKGrad::build_Amn_terms() {
     size_t row_cost = 0L;
     row_cost += nso * (size_t)nso;
     if (do_K_ || do_wK_) {
-        row_cost += nso * (size_t)na;
-        row_cost += na * (size_t)na;
+        row_cost += nso * (size_t)na_max;
+        row_cost += na_max * (size_t)na_max;
     }
     size_t rows = memory_ / row_cost;
     rows = (rows > naux ? naux : rows);
@@ -355,14 +389,7 @@ void DFJKGrad::build_Amn_terms() {
     Pstarts.push_back(auxiliary_->nshell());
 
     // => Temporary Buffers <= //
-
-    SharedVector c;
-    double* cp;
-
-    if (do_J_) {
-        c = std::make_shared<Vector>("c", naux);
-        cp = c->pointer();
-    }
+    // Allocate using max dimensions across all wavefunctions
 
     SharedMatrix Amn;
     SharedMatrix Ami;
@@ -372,23 +399,15 @@ void DFJKGrad::build_Amn_terms() {
     double** Amip;
     double** Aijp;
 
-    if (true) {
-        Amn = std::make_shared<Matrix>("Amn", max_rows, nso * (size_t)nso);
-        Amnp = Amn->pointer();
-    }
+    Amn = std::make_shared<Matrix>("Amn", max_rows, nso * (size_t)nso);
+    Amnp = Amn->pointer();
+
     if (do_K_ || do_wK_) {
-        Ami = std::make_shared<Matrix>("Ami", max_rows, nso * (size_t)na);
-        Aij = std::make_shared<Matrix>("Aij", max_rows, na * (size_t)na);
+        Ami = std::make_shared<Matrix>("Ami", max_rows, nso * (size_t)na_max);
+        Aij = std::make_shared<Matrix>("Aij", max_rows, na_max * (size_t)na_max);
         Amip = Ami->pointer();
         Aijp = Aij->pointer();
     }
-
-    double** Dtp = Dt_list_[0]->pointer();  // Phase B: DFJKGrad single-wfn only
-    double** Cap = Ca_list_[0]->pointer();
-    double** Cbp = Cb_list_[0]->pointer();
-
-    psio_address next_Aija = PSIO_ZERO;
-    psio_address next_Aijb = PSIO_ZERO;
 
     // => Master Loop <= //
 
@@ -442,46 +461,82 @@ void DFJKGrad::build_Amn_terms() {
             }
         }
 
-        // > (A|mn) D_mn -> c_A < //
-        if (do_J_) {
-            C_DGEMV('N', np, nso * (size_t)nso, 1.0, Amnp[0], nso * (size_t)nso, Dtp[0], 1, 0.0, &cp[pstart], 1);
-        }
+        // => Multi-wfn contractions: Reuse (A|mn) for all wavefunctions <= //
+        for (int w = 0; w < nwfn; w++) {
+            // Get per-wfn dimensions and data
+            int na = Ca_list_[w]->colspi()[0];
+            int nb = Cb_list_[w]->colspi()[0];
+            bool restricted = (Ca_list_[w] == Cb_list_[w]);
 
-        // > Alpha < //
-        if (do_K_ || do_wK_) {
-            // > (A|mn) C_ni -> (A|mi) < //
-            C_DGEMM('N', 'N', np * (size_t)nso, na, nso, 1.0, Amnp[0], nso, Cap[0], na, 0.0, Amip[0], na);
+            double** Dtp = Dt_list_[w]->pointer();
+            double** Cap = Ca_list_[w]->pointer();
+            double** Cbp = Cb_list_[w]->pointer();
 
-            // > (A|mi) C_mj -> (A|ij) < //
-#pragma omp parallel for
-            for (int p = 0; p < np; p++) {
-                C_DGEMM('T', 'N', na, na, nso, 1.0, Amip[p], na, Cap[0], na, 0.0, &Aijp[0][p * (size_t)na * na], na);
+            // Get per-wfn PSIO units
+            auto [unit_a_w, unit_b_w, unit_c_w] = wfn_units_[w];
+
+            // Get or initialize per-wfn PSIO addresses (stored in static map)
+            static std::map<std::tuple<int, size_t>, psio_address> psio_addrs;
+            auto key_a = std::make_tuple(w, unit_a_w);
+            auto key_b = std::make_tuple(w, unit_b_w);
+
+            if (block == 0) {
+                psio_addrs[key_a] = PSIO_ZERO;
+                psio_addrs[key_b] = PSIO_ZERO;
             }
 
-            // > Stripe < //
-            psio_->write(unit_a_, "(A|ij)", (char*)Aijp[0], sizeof(double) * np * na * na, next_Aija, &next_Aija);
-        }
+            // > (A|mn) D_mn -> c_A < //
+            if (do_J_) {
+                // Allocate c vector for this wfn (will accumulate across blocks)
+                static std::map<std::tuple<int, int>, SharedVector> c_vectors;
+                auto c_key = std::make_tuple(block, w);
 
-        // > Beta < //
-        if (!restricted && (do_K_ || do_wK_)) {
-            // skip if there are no beta electrons
-            if (nb > 0){
+                if (block == 0) {
+                    c_vectors[c_key] = std::make_shared<Vector>("c", naux);
+                    c_vectors[c_key]->zero();
+                }
+
+                double* cp = c_vectors[c_key]->pointer();
+                C_DGEMV('N', np, nso * (size_t)nso, 1.0, Amnp[0], nso * (size_t)nso, Dtp[0], 1, 0.0, &cp[pstart], 1);
+
+                // Write c vector at end of all blocks
+                if (block == Pstarts.size() - 2) {
+                    psio_->write_entry(unit_c_w, "c", (char*)cp, sizeof(double) * naux);
+                }
+            }
+
+            // > Alpha < //
+            if (do_K_ || do_wK_) {
                 // > (A|mn) C_ni -> (A|mi) < //
-                    C_DGEMM('N', 'N', np * (size_t)nso, nb, nso, 1.0, Amnp[0], nso, Cbp[0], nb, 0.0, Amip[0], na);
+                C_DGEMM('N', 'N', np * (size_t)nso, na, nso, 1.0, Amnp[0], nso, Cap[0], na, 0.0, Amip[0], na);
 
                 // > (A|mi) C_mj -> (A|ij) < //
 #pragma omp parallel for
                 for (int p = 0; p < np; p++) {
-                    C_DGEMM('T', 'N', nb, nb, nso, 1.0, Amip[p], na, Cbp[0], nb, 0.0, &Aijp[0][p * (size_t)nb * nb], nb);
+                    C_DGEMM('T', 'N', na, na, nso, 1.0, Amip[p], na, Cap[0], na, 0.0, &Aijp[0][p * (size_t)na * na], na);
                 }
-            }
-            // > Stripe < //
-            psio_->write(unit_b_, "(A|ij)", (char*)Aijp[0], sizeof(double) * np * nb * nb, next_Aijb, &next_Aijb);
-        }
-    }
 
-    if (do_J_) {
-        psio_->write_entry(unit_c_, "c", (char*)cp, sizeof(double) * naux);
+                // > Stripe < //
+                psio_->write(unit_a_w, "(A|ij)", (char*)Aijp[0], sizeof(double) * np * na * na, psio_addrs[key_a], &psio_addrs[key_a]);
+            }
+
+            // > Beta < //
+            if (!restricted && (do_K_ || do_wK_)) {
+                // skip if there are no beta electrons
+                if (nb > 0) {
+                    // > (A|mn) C_ni -> (A|mi) < //
+                    C_DGEMM('N', 'N', np * (size_t)nso, nb, nso, 1.0, Amnp[0], nso, Cbp[0], nb, 0.0, Amip[0], nb);
+
+                    // > (A|mi) C_mj -> (A|ij) < //
+#pragma omp parallel for
+                    for (int p = 0; p < np; p++) {
+                        C_DGEMM('T', 'N', nb, nb, nso, 1.0, Amip[p], nb, Cbp[0], nb, 0.0, &Aijp[0][p * (size_t)nb * nb], nb);
+                    }
+                }
+                // > Stripe < //
+                psio_->write(unit_b_w, "(A|ij)", (char*)Aijp[0], sizeof(double) * np * nb * nb, psio_addrs[key_b], &psio_addrs[key_b]);
+            }
+        }  // End multi-wfn loop
     }
 }
 void DFJKGrad::build_Amn_lr_terms() {
@@ -491,10 +546,15 @@ void DFJKGrad::build_Amn_lr_terms() {
 
     int nso = primary_->nbf();
     int naux = auxiliary_->nbf();
-    int na = Ca_list_[0]->colspi()[0];  // Phase B: DFJKGrad single-wfn only
-    int nb = Cb_list_[0]->colspi()[0];
+    int nwfn = Dt_list_.size();
 
-    bool restricted = (Ca_list_[0] == Cb_list_[0]);
+    // Get max occupied dimensions across all wavefunctions
+    int na_max = 0;
+    int nb_max = 0;
+    for (int w = 0; w < nwfn; w++) {
+        na_max = std::max(na_max, static_cast<int>(Ca_list_[w]->colspi()[0]));
+        nb_max = std::max(nb_max, static_cast<int>(Cb_list_[w]->colspi()[0]));
+    }
 
     // => Integrals <= //
 
@@ -513,8 +573,8 @@ void DFJKGrad::build_Amn_lr_terms() {
     int maxP = auxiliary_->max_function_per_shell();
     size_t row_cost = 0L;
     row_cost += nso * (size_t)nso;
-    row_cost += nso * (size_t)na;
-    row_cost += na * (size_t)na;
+    row_cost += nso * (size_t)na_max;
+    row_cost += na_max * (size_t)na_max;
     size_t rows = memory_ / row_cost;
     rows = (rows > naux ? naux : rows);
     rows = (rows < maxP ? maxP : rows);
@@ -546,18 +606,12 @@ void DFJKGrad::build_Amn_lr_terms() {
     double** Aijp;
 
     Amn = std::make_shared<Matrix>("Amn", max_rows, nso * (size_t)nso);
-    Ami = std::make_shared<Matrix>("Ami", max_rows, nso * (size_t)na);
-    Aij = std::make_shared<Matrix>("Aij", max_rows, na * (size_t)na);
+    Ami = std::make_shared<Matrix>("Ami", max_rows, nso * (size_t)na_max);
+    Aij = std::make_shared<Matrix>("Aij", max_rows, na_max * (size_t)na_max);
 
     Amnp = Amn->pointer();
     Amip = Ami->pointer();
     Aijp = Aij->pointer();
-
-    double** Cap = Ca_list_[0]->pointer();  // Phase B: DFJKGrad single-wfn only
-    double** Cbp = Cb_list_[0]->pointer();
-
-    psio_address next_Aija = PSIO_ZERO;
-    psio_address next_Aijb = PSIO_ZERO;
 
     // => Master Loop <= //
 
@@ -611,75 +665,106 @@ void DFJKGrad::build_Amn_lr_terms() {
             }
         }
 
-        // > Alpha < //
-        if (true) {
-            // > (A|mn) C_ni -> (A|mi) < //
+        // => Multi-wfn LR contractions: Reuse (A|w|mn) for all wavefunctions <= //
+        for (int w = 0; w < nwfn; w++) {
+            // Get per-wfn dimensions and data
+            int na = Ca_list_[w]->colspi()[0];
+            int nb = Cb_list_[w]->colspi()[0];
+            bool restricted = (Ca_list_[w] == Cb_list_[w]);
+
+            double** Cap = Ca_list_[w]->pointer();
+            double** Cbp = Cb_list_[w]->pointer();
+
+            // Get per-wfn PSIO units
+            auto [unit_a_w, unit_b_w, unit_c_w] = wfn_units_[w];
+
+            // Get or initialize per-wfn PSIO addresses (stored in static map)
+            static std::map<std::tuple<int, size_t, bool>, psio_address> psio_addrs_lr;
+            auto key_a = std::make_tuple(w, unit_a_w, true);  // true = LR
+            auto key_b = std::make_tuple(w, unit_b_w, true);
+
+            if (block == 0) {
+                psio_addrs_lr[key_a] = PSIO_ZERO;
+                psio_addrs_lr[key_b] = PSIO_ZERO;
+            }
+
+            // > Alpha < //
+            // > (A|w|mn) C_ni -> (A|w|mi) < //
             C_DGEMM('N', 'N', np * (size_t)nso, na, nso, 1.0, Amnp[0], nso, Cap[0], na, 0.0, Amip[0], na);
 
-            // > (A|mi) C_mj -> (A|ij) < //
+            // > (A|w|mi) C_mj -> (A|w|ij) < //
 #pragma omp parallel for
             for (int p = 0; p < np; p++) {
                 C_DGEMM('T', 'N', na, na, nso, 1.0, Amip[p], na, Cap[0], na, 0.0, &Aijp[0][p * (size_t)na * na], na);
             }
 
             // > Stripe < //
-            psio_->write(unit_a_, "(A|w|ij)", (char*)Aijp[0], sizeof(double) * np * na * na, next_Aija, &next_Aija);
-        }
+            psio_->write(unit_a_w, "(A|w|ij)", (char*)Aijp[0], sizeof(double) * np * na * na, psio_addrs_lr[key_a], &psio_addrs_lr[key_a]);
 
-        // > Beta < //
-        if (!restricted) {
-            // > (A|mn) C_ni -> (A|mi) < //
-            C_DGEMM('N', 'N', np * (size_t)nso, nb, nso, 1.0, Amnp[0], nso, Cbp[0], nb, 0.0, Amip[0], na);
+            // > Beta < //
+            if (!restricted) {
+                // > (A|w|mn) C_ni -> (A|w|mi) < //
+                C_DGEMM('N', 'N', np * (size_t)nso, nb, nso, 1.0, Amnp[0], nso, Cbp[0], nb, 0.0, Amip[0], nb);
 
-            // > (A|mi) C_mj -> (A|ij) < //
+                // > (A|w|mi) C_mj -> (A|w|ij) < //
 #pragma omp parallel for
-            for (int p = 0; p < np; p++) {
-                C_DGEMM('T', 'N', nb, nb, nso, 1.0, Amip[p], na, Cbp[0], nb, 0.0, &Aijp[0][p * (size_t)nb * nb], nb);
-            }
+                for (int p = 0; p < np; p++) {
+                    C_DGEMM('T', 'N', nb, nb, nso, 1.0, Amip[p], nb, Cbp[0], nb, 0.0, &Aijp[0][p * (size_t)nb * nb], nb);
+                }
 
-            // > Stripe < //
-            psio_->write(unit_b_, "(A|w|ij)", (char*)Aijp[0], sizeof(double) * np * nb * nb, next_Aijb, &next_Aijb);
-        }
+                // > Stripe < //
+                psio_->write(unit_b_w, "(A|w|ij)", (char*)Aijp[0], sizeof(double) * np * nb * nb, psio_addrs_lr[key_b], &psio_addrs_lr[key_b]);
+            }
+        }  // End multi-wfn loop
     }
 }
 void DFJKGrad::build_AB_inv_terms() {
     // => Sizing <= //
 
     int naux = auxiliary_->nbf();
-    int na = Ca_list_[0]->colspi()[0];  // Phase B: DFJKGrad single-wfn only
-    int nb = Cb_list_[0]->colspi()[0];
+    int nwfn = Dt_list_.size();
 
-    bool restricted = (Ca_list_[0] == Cb_list_[0]);
+    // Get max occupied dimensions for memory allocation
+    int na_max = 0;
+    int nb_max = 0;
+    for (int w = 0; w < nwfn; w++) {
+        na_max = std::max(na_max, static_cast<int>(Ca_list_[w]->colspi()[0]));
+        nb_max = std::max(nb_max, static_cast<int>(Cb_list_[w]->colspi()[0]));
+    }
 
-    // => Fitting Metric Full Inverse <= //
+    // => Fitting Metric Full Inverse (WFN-INDEPENDENT - compute once) <= //
 
     auto metric = std::make_shared<FittingMetric>(auxiliary_, true);
     metric->form_full_eig_inverse(condition_);
     SharedMatrix J = metric->get_metric();
     double** Jp = J->pointer();
 
-    // => d_A = (A|B)^{-1} c_B <= //
+    // => Per-wfn J transforms: d_A = (A|B)^{-1} c_B <= //
     if (do_J_) {
         auto c = std::make_shared<Vector>("c", naux);
         auto d = std::make_shared<Vector>("d", naux);
         double* cp = c->pointer();
         double* dp = d->pointer();
 
-        psio_->read_entry(unit_c_, "c", (char*)cp, sizeof(double) * naux);
+        for (int w = 0; w < nwfn; w++) {
+            auto [unit_a_w, unit_b_w, unit_c_w] = wfn_units_[w];
 
-        C_DGEMV('N', naux, naux, 1.0, Jp[0], naux, cp, 1, 0.0, dp, 1);
-
-        psio_->write_entry(unit_c_, "c", (char*)dp, sizeof(double) * naux);
+            psio_->read_entry(unit_c_w, "c", (char*)cp, sizeof(double) * naux);
+            C_DGEMV('N', naux, naux, 1.0, Jp[0], naux, cp, 1, 0.0, dp, 1);
+            psio_->write_entry(unit_c_w, "c", (char*)dp, sizeof(double) * naux);
+        }
     }
 
     if (!(do_K_ || do_wK_)) return;
+
+    // => Per-wfn K/wK transforms: (A|B)(B|ij) -> (A|ij) <= //
 
     int max_cols;
     size_t effective_memory = memory_ - 1L * naux * naux;
     size_t col_cost = 2L * naux;
     size_t cols = effective_memory / col_cost;
-    cols = (cols > na * (size_t)na ? na * (size_t)na : cols);
-    cols = (cols < na ? na : cols);
+    cols = (cols > na_max * (size_t)na_max ? na_max * (size_t)na_max : cols);
+    cols = (cols < na_max ? na_max : cols);
     max_cols = (int)cols;
 
     auto Aij = std::make_shared<Matrix>("Aij", naux, max_cols);
@@ -692,39 +777,47 @@ void DFJKGrad::build_AB_inv_terms() {
     buffers.push_back("(A|ij)");
     if (do_wK_) buffers.push_back("(A|w|ij)");
 
-    // Units and sizing for alpha/beta
-    std::vector<std::pair<size_t, size_t>> us_vec;
-    us_vec.push_back(std::make_pair(unit_a_, na));
-    if (!restricted) us_vec.push_back(std::make_pair(unit_b_, nb));
+    // Loop over wavefunctions
+    for (int w = 0; w < nwfn; w++) {
+        int na = Ca_list_[w]->colspi()[0];
+        int nb = Cb_list_[w]->colspi()[0];
+        bool restricted = (Ca_list_[w] == Cb_list_[w]);
 
-    // Transform all three index buffers (A|B)(B|ij) -> (A|ij)
-    for (const auto& buff_name : buffers) {
-        for (const auto& us : us_vec) {
-            size_t unit_name = us.first;
-            size_t nmo_size = us.second;
-            size_t nmo_size2 = nmo_size * nmo_size;
-            // printf("%s | %zu %zu\n", buff_name.c_str(), unit_name, nmo_size);
+        auto [unit_a_w, unit_b_w, unit_c_w] = wfn_units_[w];
 
-            psio_address next_Aija = PSIO_ZERO;
+        // Units and sizing for alpha/beta
+        std::vector<std::pair<size_t, size_t>> us_vec;
+        us_vec.push_back(std::make_pair(unit_a_w, na));
+        if (!restricted) us_vec.push_back(std::make_pair(unit_b_w, nb));
 
-            for (long int ij = 0L; ij < nmo_size2; ij += max_cols) {
-                int ncols = (ij + max_cols >= nmo_size2 ? nmo_size2 - ij : max_cols);
+        // Transform all three index buffers (A|B)(B|ij) -> (A|ij)
+        for (const auto& buff_name : buffers) {
+            for (const auto& us : us_vec) {
+                size_t unit_name = us.first;
+                size_t nmo_size = us.second;
+                size_t nmo_size2 = nmo_size * nmo_size;
 
-                // > Read < //
-                for (int Q = 0; Q < naux; Q++) {
-                    next_Aija = psio_get_address(PSIO_ZERO, sizeof(double) * (Q * (size_t)nmo_size2 + ij));
-                    psio_->read(unit_name, buff_name.c_str(), (char*)Aijp[Q], sizeof(double) * ncols, next_Aija,
-                                &next_Aija);
-                }
+                psio_address next_Aija = PSIO_ZERO;
 
-                // > GEMM <//
-                C_DGEMM('N', 'N', naux, ncols, naux, 1.0, Jp[0], naux, Aijp[0], max_cols, 0.0, Bijp[0], max_cols);
+                for (long int ij = 0L; ij < nmo_size2; ij += max_cols) {
+                    int ncols = (ij + max_cols >= nmo_size2 ? nmo_size2 - ij : max_cols);
 
-                // > Stripe < //
-                for (int Q = 0; Q < naux; Q++) {
-                    next_Aija = psio_get_address(PSIO_ZERO, sizeof(double) * (Q * (size_t)nmo_size2 + ij));
-                    psio_->write(unit_name, buff_name.c_str(), (char*)Bijp[Q], sizeof(double) * ncols, next_Aija,
-                                 &next_Aija);
+                    // > Read < //
+                    for (int Q = 0; Q < naux; Q++) {
+                        next_Aija = psio_get_address(PSIO_ZERO, sizeof(double) * (Q * (size_t)nmo_size2 + ij));
+                        psio_->read(unit_name, buff_name.c_str(), (char*)Aijp[Q], sizeof(double) * ncols, next_Aija,
+                                    &next_Aija);
+                    }
+
+                    // > GEMM <//
+                    C_DGEMM('N', 'N', naux, ncols, naux, 1.0, Jp[0], naux, Aijp[0], max_cols, 0.0, Bijp[0], max_cols);
+
+                    // > Stripe < //
+                    for (int Q = 0; Q < naux; Q++) {
+                        next_Aija = psio_get_address(PSIO_ZERO, sizeof(double) * (Q * (size_t)nmo_size2 + ij));
+                        psio_->write(unit_name, buff_name.c_str(), (char*)Bijp[Q], sizeof(double) * ncols, next_Aija,
+                                     &next_Aija);
+                    }
                 }
             }
         }
@@ -736,19 +829,21 @@ void DFJKGrad::build_UV_terms() {
     // => Sizing <= //
 
     int naux = auxiliary_->nbf();
-    int na = Ca_list_[0]->colspi()[0];  // Phase B: DFJKGrad single-wfn only
-    int nb = Cb_list_[0]->colspi()[0];
+    int nwfn = Dt_list_.size();
 
-    bool restricted = (Ca_list_[0] == Cb_list_[0]);
-
-    auto V = std::make_shared<Matrix>("W", naux, naux);
-    double** Vp = V->pointer();
+    // Get max occupied dimensions for memory allocation
+    int na_max = 0;
+    int nb_max = 0;
+    for (int w = 0; w < nwfn; w++) {
+        na_max = std::max(na_max, static_cast<int>(Ca_list_[w]->colspi()[0]));
+        nb_max = std::max(nb_max, static_cast<int>(Cb_list_[w]->colspi()[0]));
+    }
 
     // => Memory Constraints <= //
 
     int max_rows;
     size_t effective_memory = memory_ - 1L * naux * naux;
-    size_t row_cost = 2L * na * (size_t)na;
+    size_t row_cost = 2L * na_max * (size_t)na_max;
     size_t rows = memory_ / row_cost;
     rows = (rows > naux ? naux : rows);
     rows = (rows < 1L ? 1L : rows);
@@ -756,124 +851,174 @@ void DFJKGrad::build_UV_terms() {
 
     // => Temporary Buffers <= //
 
-    auto Aij = std::make_shared<Matrix>("Aij", max_rows, na * (size_t)na);
-    auto Bij = std::make_shared<Matrix>("Bij", max_rows, na * (size_t)na);
+    auto V = std::make_shared<Matrix>("W", naux, naux);
+    auto Aij = std::make_shared<Matrix>("Aij", max_rows, na_max * (size_t)na_max);
+    auto Bij = std::make_shared<Matrix>("Bij", max_rows, na_max * (size_t)na_max);
+    double** Vp = V->pointer();
     double** Aijp = Aij->pointer();
     double** Bijp = Bij->pointer();
 
-    // => V < = //
+    // => Loop over wavefunctions <= //
+    for (int w = 0; w < nwfn; w++) {
+        int na = Ca_list_[w]->colspi()[0];
+        int nb = Cb_list_[w]->colspi()[0];
+        bool restricted = (Ca_list_[w] == Cb_list_[w]);
 
-    // > Alpha < //
-    if (true) {
+        auto [unit_a_w, unit_b_w, unit_c_w] = wfn_units_[w];
+
+        // => V (K exchange) < = //
+        V->zero();
+
+        // > Alpha < //
         psio_address next_Aij = PSIO_ZERO;
         for (int P = 0; P < naux; P += max_rows) {
             psio_address next_Bij = PSIO_ZERO;
             int nP = (P + max_rows >= naux ? naux - P : max_rows);
-            psio_->read(unit_a_, "(A|ij)", (char*)Aijp[0], sizeof(double) * nP * na * na, next_Aij, &next_Aij);
+            psio_->read(unit_a_w, "(A|ij)", (char*)Aijp[0], sizeof(double) * nP * na * na, next_Aij, &next_Aij);
             for (int Q = 0; Q < naux; Q += max_rows) {
                 int nQ = (Q + max_rows >= naux ? naux - Q : max_rows);
-                psio_->read(unit_a_, "(A|ij)", (char*)Bijp[0], sizeof(double) * nQ * na * na, next_Bij, &next_Bij);
+                psio_->read(unit_a_w, "(A|ij)", (char*)Bijp[0], sizeof(double) * nQ * na * na, next_Bij, &next_Bij);
 
                 C_DGEMM('N', 'T', nP, nQ, na * (size_t)na, 1.0, Aijp[0], na * (size_t)na, Bijp[0], na * (size_t)na, 0.0,
                         &Vp[P][Q], naux);
             }
         }
-    }
-    // > Beta < //
-    if (!restricted) {
-        psio_address next_Aij = PSIO_ZERO;
-        for (int P = 0; P < naux; P += max_rows) {
-            psio_address next_Bij = PSIO_ZERO;
-            int nP = (P + max_rows >= naux ? naux - P : max_rows);
-            psio_->read(unit_b_, "(A|ij)", (char*)Aijp[0], sizeof(double) * nP * nb * nb, next_Aij, &next_Aij);
-            for (int Q = 0; Q < naux; Q += max_rows) {
-                int nQ = (Q + max_rows >= naux ? naux - Q : max_rows);
-                psio_->read(unit_b_, "(A|ij)", (char*)Bijp[0], sizeof(double) * nQ * nb * nb, next_Bij, &next_Bij);
 
-                C_DGEMM('N', 'T', nP, nQ, nb * (size_t)nb, 1.0, Aijp[0], nb * (size_t)nb, Bijp[0], nb * (size_t)nb, 1.0,
-                        &Vp[P][Q], naux);
+        // > Beta < //
+        if (!restricted) {
+            psio_address next_Aij_b = PSIO_ZERO;
+            for (int P = 0; P < naux; P += max_rows) {
+                psio_address next_Bij_b = PSIO_ZERO;
+                int nP = (P + max_rows >= naux ? naux - P : max_rows);
+                psio_->read(unit_b_w, "(A|ij)", (char*)Aijp[0], sizeof(double) * nP * nb * nb, next_Aij_b, &next_Aij_b);
+                for (int Q = 0; Q < naux; Q += max_rows) {
+                    int nQ = (Q + max_rows >= naux ? naux - Q : max_rows);
+                    psio_->read(unit_b_w, "(A|ij)", (char*)Bijp[0], sizeof(double) * nQ * nb * nb, next_Bij_b, &next_Bij_b);
+
+                    C_DGEMM('N', 'T', nP, nQ, nb * (size_t)nb, 1.0, Aijp[0], nb * (size_t)nb, Bijp[0], nb * (size_t)nb, 1.0,
+                            &Vp[P][Q], naux);
+                }
             }
+        } else {
+            V->scale(2.0);
         }
-    } else {
-        V->scale(2.0);
-    }
-    psio_->write_entry(unit_c_, "V", (char*)Vp[0], sizeof(double) * naux * naux);
+        psio_->write_entry(unit_c_w, "V", (char*)Vp[0], sizeof(double) * naux * naux);
 
-    if (!do_wK_) return;
+        if (!do_wK_) continue;
 
-    // => W < = //
-    V->zero();
+        // => W (wK exchange) < = //
+        V->zero();
 
-    // > Alpha < //
-    if (true) {
-        psio_address next_Aij = PSIO_ZERO;
+        // > Alpha < //
+        psio_address next_Aij_w = PSIO_ZERO;
         for (int P = 0; P < naux; P += max_rows) {
-            psio_address next_Bij = PSIO_ZERO;
+            psio_address next_Bij_w = PSIO_ZERO;
             int nP = (P + max_rows >= naux ? naux - P : max_rows);
-            psio_->read(unit_a_, "(A|ij)", (char*)Aijp[0], sizeof(double) * nP * na * na, next_Aij, &next_Aij);
+            psio_->read(unit_a_w, "(A|ij)", (char*)Aijp[0], sizeof(double) * nP * na * na, next_Aij_w, &next_Aij_w);
             for (int Q = 0; Q < naux; Q += max_rows) {
                 int nQ = (Q + max_rows >= naux ? naux - Q : max_rows);
-                psio_->read(unit_a_, "(A|w|ij)", (char*)Bijp[0], sizeof(double) * nQ * na * na, next_Bij, &next_Bij);
+                psio_->read(unit_a_w, "(A|w|ij)", (char*)Bijp[0], sizeof(double) * nQ * na * na, next_Bij_w, &next_Bij_w);
 
                 C_DGEMM('N', 'T', nP, nQ, na * (size_t)na, 1.0, Aijp[0], na * (size_t)na, Bijp[0], na * (size_t)na, 0.0,
                         &Vp[P][Q], naux);
             }
         }
-    }
-    // > Beta < //
-    if (!restricted) {
-        psio_address next_Aij = PSIO_ZERO;
-        for (int P = 0; P < naux; P += max_rows) {
-            psio_address next_Bij = PSIO_ZERO;
-            int nP = (P + max_rows >= naux ? naux - P : max_rows);
-            psio_->read(unit_b_, "(A|ij)", (char*)Aijp[0], sizeof(double) * nP * nb * nb, next_Aij, &next_Aij);
-            for (int Q = 0; Q < naux; Q += max_rows) {
-                int nQ = (Q + max_rows >= naux ? naux - Q : max_rows);
-                psio_->read(unit_b_, "(A|w|ij)", (char*)Bijp[0], sizeof(double) * nQ * nb * nb, next_Bij, &next_Bij);
 
-                C_DGEMM('N', 'T', nP, nQ, nb * (size_t)nb, 1.0, Aijp[0], nb * (size_t)nb, Bijp[0], nb * (size_t)nb, 1.0,
-                        &Vp[P][Q], naux);
+        // > Beta < //
+        if (!restricted) {
+            psio_address next_Aij_wb = PSIO_ZERO;
+            for (int P = 0; P < naux; P += max_rows) {
+                psio_address next_Bij_wb = PSIO_ZERO;
+                int nP = (P + max_rows >= naux ? naux - P : max_rows);
+                psio_->read(unit_b_w, "(A|ij)", (char*)Aijp[0], sizeof(double) * nP * nb * nb, next_Aij_wb, &next_Aij_wb);
+                for (int Q = 0; Q < naux; Q += max_rows) {
+                    int nQ = (Q + max_rows >= naux ? naux - Q : max_rows);
+                    psio_->read(unit_b_w, "(A|w|ij)", (char*)Bijp[0], sizeof(double) * nQ * nb * nb, next_Bij_wb, &next_Bij_wb);
+
+                    C_DGEMM('N', 'T', nP, nQ, nb * (size_t)nb, 1.0, Aijp[0], nb * (size_t)nb, Bijp[0], nb * (size_t)nb, 1.0,
+                            &Vp[P][Q], naux);
+                }
             }
+        } else {
+            V->scale(2.0);
         }
-    } else {
-        V->scale(2.0);
-    }
-    V->hermitivitize();
-    psio_->write_entry(unit_c_, "W", (char*)Vp[0], sizeof(double) * naux * naux);
+        V->hermitivitize();
+        psio_->write_entry(unit_c_w, "W", (char*)Vp[0], sizeof(double) * naux * naux);
+    }  // End multi-wfn loop
 }
 
 void DFJKGrad::build_AB_x_terms()
 {
     auto naux = auxiliary_->nbf();
+    int nwfn = Dt_list_.size();
+
+    // => Accumulate densities from all wavefunctions <= //
+    // (A|B)^x is WFN-INDEPENDENT, so we sum densities then compute gradient once
 
     std::map<std::string, SharedMatrix> densities;
 
     if (do_J_) {
-        auto d = std::make_shared<Vector>("d", naux);
-        auto dp = d->pointer();
-        psio_->read_entry(unit_c_, "c", (char*) dp, sizeof(double) * naux);
-        auto D = std::make_shared<Matrix>("D", naux, naux);
-        auto Dp = D->pointer();
-        C_DGER(naux, naux, 1, dp, 1, dp, 1, Dp[0], naux);
-        densities["Coulomb"] = D;
-    }
-    if (do_K_) {
-        auto V = std::make_shared<Matrix>("V", naux, naux);
-        auto Vp = V->pointer();
-        psio_->read_entry(unit_c_, "V", (char*) Vp[0], sizeof(double) * naux * naux);
-        densities["Exchange"] = V;
-    }
-    if (do_wK_) {
-        auto W = std::make_shared<Matrix>("W", naux, naux);
-        auto Wp = W->pointer();
-        psio_->read_entry(unit_c_, "W", (char*) Wp[0], sizeof(double) * naux * naux);
-        densities["Exchange,LR"] = W;
+        auto D_total = std::make_shared<Matrix>("D_total", naux, naux);
+        D_total->zero();
+        auto Dp_total = D_total->pointer();
+
+        for (int w = 0; w < nwfn; w++) {
+            auto [unit_a_w, unit_b_w, unit_c_w] = wfn_units_[w];
+
+            auto d = std::make_shared<Vector>("d", naux);
+            auto dp = d->pointer();
+            psio_->read_entry(unit_c_w, "c", (char*) dp, sizeof(double) * naux);
+
+            // Accumulate: D_total += d * d^T
+            C_DGER(naux, naux, 1.0, dp, 1, dp, 1, Dp_total[0], naux);
+        }
+        densities["Coulomb"] = D_total;
     }
 
+    if (do_K_) {
+        auto V_total = std::make_shared<Matrix>("V_total", naux, naux);
+        V_total->zero();
+        auto Vp_total = V_total->pointer();
+
+        for (int w = 0; w < nwfn; w++) {
+            auto [unit_a_w, unit_b_w, unit_c_w] = wfn_units_[w];
+
+            auto V = std::make_shared<Matrix>("V", naux, naux);
+            auto Vp = V->pointer();
+            psio_->read_entry(unit_c_w, "V", (char*) Vp[0], sizeof(double) * naux * naux);
+
+            // Accumulate: V_total += V
+            V_total->add(V);
+        }
+        densities["Exchange"] = V_total;
+    }
+
+    if (do_wK_) {
+        auto W_total = std::make_shared<Matrix>("W_total", naux, naux);
+        W_total->zero();
+
+        for (int w = 0; w < nwfn; w++) {
+            auto [unit_a_w, unit_b_w, unit_c_w] = wfn_units_[w];
+
+            auto W = std::make_shared<Matrix>("W", naux, naux);
+            auto Wp = W->pointer();
+            psio_->read_entry(unit_c_w, "W", (char*) Wp[0], sizeof(double) * naux * naux);
+
+            // Accumulate: W_total += W
+            W_total->add(W);
+        }
+        densities["Exchange,LR"] = W_total;
+    }
+
+    // => Compute (A|B)^x gradient contributions (WFN-INDEPENDENT) <= //
     auto results = mints_->metric_grad(densities, "DF_BASIS_SCF");
 
+    // => Store in gradients_list_ for all wavefunctions <= //
+    // Since (A|B)^x is WFN-INDEPENDENT, contribution is same for all wfn
+    // But we've already accumulated, so we add result to gradients_list_[0]
+    // (build_Amn_x_terms will add the WFN-DEPENDENT parts per-wfn)
     for (const auto& kv: results) {
-        gradients_[kv.first] = kv.second;
+        gradients_list_[0][kv.first] = kv.second;
     }
 }
 void DFJKGrad::build_Amn_x_terms() {

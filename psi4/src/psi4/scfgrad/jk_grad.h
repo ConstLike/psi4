@@ -266,12 +266,21 @@ protected:
     void build_AB_x_terms();
     void build_Amn_x_terms();
 
-    /// File number for Alpha (Q|mn) tensor
+    /// File number for Alpha (Q|mn) tensor (single-wfn legacy)
     size_t unit_a_;
-    /// File number for Beta (Q|mn) tensor
+    /// File number for Beta (Q|mn) tensor (single-wfn legacy)
     size_t unit_b_;
-    /// File number for J tensors
+    /// File number for J tensors (single-wfn legacy)
     size_t unit_c_;
+
+    /// Multi-wfn PSIO units: [wfn_idx] -> {unit_a, unit_b, unit_c}
+    /// unit_a: Alpha (Q|ij) for this wfn
+    /// unit_b: Beta (Q|ij) for this wfn
+    /// unit_c: c, W, V vectors/matrices for this wfn
+    std::vector<std::tuple<size_t, size_t, size_t>> wfn_units_;
+
+    /// Shared metric inverse unit (same for all wfn)
+    size_t unit_metric_inv_;
 
 public:
     DFJKGrad(int deriv, std::shared_ptr<MintsHelper> mints);
