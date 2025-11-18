@@ -1027,10 +1027,15 @@ void DFJKGrad::build_Amn_x_terms() {
     int natom = primary_->molecule()->natom();
     int nso = primary_->nbf();
     int naux = auxiliary_->nbf();
-    int na = Ca_list_[0]->colspi()[0];  // Phase B: DFJKGrad single-wfn only
-    int nb = Cb_list_[0]->colspi()[0];
+    int nwfn = Dt_list_.size();
 
-    bool restricted = (Ca_list_[0] == Cb_list_[0]);
+    // Get max occupied dimensions across all wavefunctions
+    int na_max = 0;
+    int nb_max = 0;
+    for (int w = 0; w < nwfn; w++) {
+        na_max = std::max(na_max, static_cast<int>(Ca_list_[w]->colspi()[0]));
+        nb_max = std::max(nb_max, static_cast<int>(Cb_list_[w]->colspi()[0]));
+    }
 
     // => Integrals <= //
 
@@ -1061,8 +1066,8 @@ void DFJKGrad::build_Amn_x_terms() {
         if (do_wK_) {
             row_cost += nso * (size_t)nso;
         }
-        row_cost += nso * (size_t)na;
-        row_cost += na * (size_t)na;
+        row_cost += nso * (size_t)na_max;
+        row_cost += na_max * (size_t)na_max;
         size_t rows = memory_ / row_cost;
         rows = (rows > naux ? naux : rows);
         rows = (rows < maxP ? maxP : rows);
@@ -1087,47 +1092,37 @@ void DFJKGrad::build_Amn_x_terms() {
     Pstarts.push_back(auxiliary_->nshell());
 
     // => Temporary Buffers <= //
+    // Allocate using max dimensions (will be used for all wavefunctions)
 
-    SharedVector d;
-    double* dp;
-
-    if (do_J_) {
-        d = std::make_shared<Vector>("d", naux);
-        dp = d->pointer();
-        psio_->read_entry(unit_c_, "c", (char*)dp, sizeof(double) * naux);
-    }
-
-    SharedMatrix Kmn;
-    SharedMatrix wKmn;
     SharedMatrix Ami;
     SharedMatrix Aij;
-
-    double** Kmnp;
-    double** wKmnp;
     double** Amip;
     double** Aijp;
 
     if (do_K_ || do_wK_) {
-        Kmn = std::make_shared<Matrix>("Kmn", max_rows, nso * (size_t)nso);
-        Ami = std::make_shared<Matrix>("Ami", max_rows, nso * (size_t)na);
-        Aij = std::make_shared<Matrix>("Aij", max_rows, na * (size_t)na);
-        Kmnp = Kmn->pointer();
+        Ami = std::make_shared<Matrix>("Ami", max_rows, nso * (size_t)na_max);
+        Aij = std::make_shared<Matrix>("Aij", max_rows, na_max * (size_t)na_max);
         Amip = Ami->pointer();
         Aijp = Aij->pointer();
     }
-    if (do_wK_) {
-        wKmn = std::make_shared<Matrix>("wKmn", max_rows, nso * (size_t)nso);
-        wKmnp = wKmn->pointer();
+
+    // => Per-wfn data structures <= //
+    // J densities (d vectors), K/wK densities (Kmn, wKmn matrices)
+    std::vector<SharedVector> d_list(nwfn);
+    std::vector<SharedMatrix> Kmn_list(nwfn);
+    std::vector<SharedMatrix> wKmn_list(nwfn);
+
+    for (int w = 0; w < nwfn; w++) {
+        if (do_J_) {
+            d_list[w] = std::make_shared<Vector>("d", naux);
+        }
+        if (do_K_ || do_wK_) {
+            Kmn_list[w] = std::make_shared<Matrix>("Kmn", max_rows, nso * (size_t)nso);
+        }
+        if (do_wK_) {
+            wKmn_list[w] = std::make_shared<Matrix>("wKmn", max_rows, nso * (size_t)nso);
+        }
     }
-
-    double** Dtp = Dt_list_[0]->pointer();  // Phase B: DFJKGrad single-wfn only
-    double** Cap = Ca_list_[0]->pointer();
-    double** Cbp = Cb_list_[0]->pointer();
-
-    psio_address next_Aija = PSIO_ZERO;
-    psio_address next_Aijb = PSIO_ZERO;
-    psio_address next_Awija = PSIO_ZERO;
-    psio_address next_Awijb = PSIO_ZERO;
 
     // => Temporary Gradients <= //
 
@@ -1146,30 +1141,7 @@ void DFJKGrad::build_Amn_x_terms() {
         }
     }
 
-    // => R/U doubling factor <= //
-
-    double factor = (restricted ? 2.0 : 1.0);
-
-    // => Figure out required transforms <= //
-
-    // unit, disk buffer name, nmo_size, psio_address, output_buffer
-    std::vector<std::tuple<size_t, std::string, double**, size_t, psio_address*, double**>> transforms;
-    if (do_K_ || do_wK_) {
-        transforms.push_back(std::make_tuple(unit_a_, "(A|ij)", Cap, na, &next_Aija, Kmnp));
-        // skip if there are no beta electrons
-        if (!restricted && nb > 0) {
-            transforms.push_back(std::make_tuple(unit_b_, "(A|ij)", Cbp, nb, &next_Aijb, Kmnp));
-        }
-    }
-    if (do_wK_) {
-        transforms.push_back(std::make_tuple(unit_a_, "(A|w|ij)", Cap, na, &next_Awija, wKmnp));
-        // skip if there are no beta electrons        
-        if (!restricted && nb > 0) {
-            transforms.push_back(std::make_tuple(unit_b_, "(A|w|ij)", Cbp, nb, &next_Awijb, wKmnp));
-        }
-    }
-
-    // => Master Loop <= //
+    // => Master Loop over auxiliary basis blocks <= //
 
     for (int block = 0; block < Pstarts.size() - 1; block++) {
         // > Sizing < //
