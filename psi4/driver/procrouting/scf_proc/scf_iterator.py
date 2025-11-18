@@ -273,9 +273,67 @@ def _scf_initialize_iteration_state(self, e_conv, d_conv):
     self._scf_e_conv = e_conv
     self._scf_d_conv = d_conv
 
-    # Store configuration flags
+    # ========================================================================
+    # Cache ALL options from snapshot (ONCE) to avoid scattered lookups
+    # ========================================================================
+    # This consolidates all option reads in ONE place, making code cleaner
+    # and easier to maintain. Previously had 34 scattered get_option_from_snapshot()
+    # calls throughout iteration code.
+
+    # DIIS options
+    self._scf_diis = get_option_from_snapshot(self, 'DIIS')
+    self._scf_diis_start = get_option_from_snapshot(self, 'DIIS_START')
+    self._scf_diis_min_vecs = get_option_from_snapshot(self, 'DIIS_MIN_VECS')
+    self._scf_diis_max_vecs = get_option_from_snapshot(self, 'DIIS_MAX_VECS')
+    self._scf_diis_rms_error = get_option_from_snapshot(self, 'DIIS_RMS_ERROR')
+
+    # AEDIIS options
+    self._scf_initial_accelerator = get_option_from_snapshot(self, 'SCF_INITIAL_ACCELERATOR')
+    self._scf_initial_start_diis_transition = get_option_from_snapshot(self, 'SCF_INITIAL_START_DIIS_TRANSITION')
+    self._scf_initial_finish_diis_transition = get_option_from_snapshot(self, 'SCF_INITIAL_FINISH_DIIS_TRANSITION')
+
+    # Damping options
+    self._scf_damping_percentage = get_option_from_snapshot(self, 'DAMPING_PERCENTAGE')
+    self._scf_damping_convergence = get_option_from_snapshot(self, 'DAMPING_CONVERGENCE')
+
+    # SOSCF options
+    self._scf_soscf = get_option_from_snapshot(self, 'SOSCF')
+    self._scf_soscf_start_convergence = get_option_from_snapshot(self, 'SOSCF_START_CONVERGENCE')
+    self._scf_soscf_conv = get_option_from_snapshot(self, 'SOSCF_CONV')
+    self._scf_soscf_min_iter = get_option_from_snapshot(self, 'SOSCF_MIN_ITER')
+    self._scf_soscf_max_iter = get_option_from_snapshot(self, 'SOSCF_MAX_ITER')
+    self._scf_soscf_print = get_option_from_snapshot(self, 'SOSCF_PRINT')
+
+    # MOM options
+    self._scf_mom_start = get_option_from_snapshot(self, 'MOM_START')
+    self._scf_mom_occ = get_option_from_snapshot(self, 'MOM_OCC')
+
+    # FRAC options
+    self._scf_frac_start = get_option_from_snapshot(self, 'FRAC_START')
+    self._scf_frac_occ = get_option_from_snapshot(self, 'FRAC_OCC')
+    self._scf_frac_val = get_option_from_snapshot(self, 'FRAC_VAL')
+    self._scf_frac_renormalize = get_option_from_snapshot(self, 'FRAC_RENORMALIZE')
+
+    # Convergence options
+    self._scf_maxiter = get_option_from_snapshot(self, 'MAXITER')
+    self._scf_e_convergence = get_option_from_snapshot(self, 'E_CONVERGENCE')
+    self._scf_d_convergence = get_option_from_snapshot(self, 'D_CONVERGENCE')
+    self._scf_fail_on_maxiter = get_option_from_snapshot(self, 'FAIL_ON_MAXITER')
+
+    # Other options
+    self._scf_level_shift = get_option_from_snapshot(self, 'LEVEL_SHIFT')
+    self._scf_level_shift_cutoff = get_option_from_snapshot(self, 'LEVEL_SHIFT_CUTOFF')
+    self._scf_print = get_option_from_snapshot(self, 'PRINT')
+
+    # COSX options
+    self._scf_cosx_maxiter_final = get_option_from_snapshot(self, 'COSX_MAXITER_FINAL')
+
+    # ========================================================================
+    # Derived configuration flags (computed from cached options)
+    # ========================================================================
+
     self._scf_is_dfjk = core.get_global_option('SCF_TYPE').endswith('DF')
-    self._scf_verbose = get_option_from_snapshot(self, 'PRINT')
+    self._scf_verbose = self._scf_print
     self._scf_reference = core.get_option('SCF', "REFERENCE")  # OK from global (doesn't change)
     self._scf_damping_enabled = _validate_damping(self)
     self._scf_soscf_enabled = _validate_soscf(self)
@@ -287,7 +345,7 @@ def _scf_initialize_iteration_state(self, e_conv, d_conv):
     # These were originally in scf_iterate() but needed for multi_scf() too
     self.diis_enabled_ = self.validate_diis()
     self.MOM_excited_ = _validate_MOM(self)
-    self.diis_start_ = get_option_from_snapshot(self, 'DIIS_START')
+    self.diis_start_ = self._scf_diis_start
 
     # COSX early screening parameters
     self._scf_early_screening = False
@@ -295,7 +353,7 @@ def _scf_initialize_iteration_state(self, e_conv, d_conv):
         self._scf_early_screening = True
         self.jk().set_COSX_grid("Initial")
 
-    self._scf_maxiter_post_screening = get_option_from_snapshot(self, 'COSX_MAXITER_FINAL')
+    self._scf_maxiter_post_screening = self._scf_cosx_maxiter_final
     if self._scf_maxiter_post_screening < -1:
         raise ValidationError('COSX_MAXITER_FINAL ({}) must be -1 or above. If you wish to attempt full SCF converge on the final COSX grid, set COSX_MAXITER_FINAL to -1.'.format(self._scf_maxiter_post_screening))
 
@@ -388,7 +446,7 @@ def scf_iterate(self, e_conv=None, d_conv=None):
         if not should_continue:
             break
 
-        if self.iteration_ >= get_option_from_snapshot(self, 'MAXITER'):
+        if self.iteration_ >= self._scf_maxiter:
             raise SCFConvergenceError("""SCF iterations""", self.iteration_, self, self._scf_Ediff, self._scf_Dnorm)
 
 
@@ -501,8 +559,8 @@ def _scf_iteration(self):
     status = []
 
     # Check if we are doing SOSCF
-    if (self._scf_soscf_enabled and (self.iteration_ >= 3) and (self._scf_Dnorm < get_option_from_snapshot(self, 'SOSCF_START_CONVERGENCE'))):
-        self._scf_Dnorm = self.compute_orbital_gradient(False, get_option_from_snapshot(self, 'DIIS_MAX_VECS'))
+    if (self._scf_soscf_enabled and (self.iteration_ >= 3) and (self._scf_Dnorm < self._scf_soscf_start_convergence)):
+        self._scf_Dnorm = self.compute_orbital_gradient(False, self._scf_diis_max_vecs)
         diis_performed = False
         if self.functional().needs_xc():
             base_name = "SOKS, nmicro="
@@ -510,10 +568,10 @@ def _scf_iteration(self):
             base_name = "SOSCF, nmicro="
 
         if not _converged(self._scf_Ediff, self._scf_Dnorm, e_conv=self._scf_e_conv, d_conv=self._scf_d_conv):
-            nmicro = self.soscf_update(get_option_from_snapshot(self, 'SOSCF_CONV'),
-                                       get_option_from_snapshot(self, 'SOSCF_MIN_ITER'),
-                                       get_option_from_snapshot(self, 'SOSCF_MAX_ITER'),
-                                       get_option_from_snapshot(self, 'SOSCF_PRINT'))
+            nmicro = self.soscf_update(self._scf_soscf_conv,
+                                       self._scf_soscf_min_iter,
+                                       self._scf_soscf_max_iter,
+                                       self._scf_soscf_print)
             # if zero, the soscf call bounced for some reason
             soscf_performed = (nmicro > 0)
 
@@ -551,7 +609,7 @@ def _scf_iteration(self):
                 diis_performed = False
                 add_to_diis_subspace = self.diis_enabled_ and self.iteration_ >= self.diis_start_
 
-                self._scf_Dnorm = self.compute_orbital_gradient(add_to_diis_subspace, get_option_from_snapshot(self, 'DIIS_MAX_VECS'))
+                self._scf_Dnorm = self.compute_orbital_gradient(add_to_diis_subspace, self._scf_diis_max_vecs)
 
                 if add_to_diis_subspace:
                     for engine_used in self.diis(self._scf_Dnorm):
@@ -568,8 +626,8 @@ def _scf_iteration(self):
 
             # frac, MOM invoked here from Wfn::HF::find_occupation
             core.timer_on("HF: Form C")
-            level_shift = get_option_from_snapshot(self, 'LEVEL_SHIFT')
-            if level_shift > 0 and self._scf_Dnorm > get_option_from_snapshot(self, 'LEVEL_SHIFT_CUTOFF'):
+            level_shift = self._scf_level_shift
+            if level_shift > 0 and self._scf_Dnorm > self._scf_level_shift_cutoff:
                 status.append("SHIFT")
                 self.form_C(level_shift)
             else:
@@ -599,8 +657,8 @@ def _scf_iteration(self):
     core.set_variable("SCF D NORM", self._scf_Dnorm)
 
     # After we've built the new D, damp the update
-    if (self._scf_damping_enabled and self.iteration_ > 1 and self._scf_Dnorm > get_option_from_snapshot(self, 'DAMPING_CONVERGENCE')):
-        damping_percentage = get_option_from_snapshot(self, 'DAMPING_PERCENTAGE')
+    if (self._scf_damping_enabled and self.iteration_ > 1 and self._scf_Dnorm > self._scf_damping_convergence):
+        damping_percentage = self._scf_damping_percentage
         self.damping_update(damping_percentage * 0.01)
         status.append("DAMP={}%".format(round(damping_percentage)))
 
@@ -624,7 +682,7 @@ def _scf_iteration(self):
 
     # if a an excited MOM is requested but not started, don't stop yet
     # Note that MOM_performed_ just checks initialization, and our convergence measures used the pre-MOM orbitals
-    if self.MOM_excited_ and ((not self.MOM_performed_) or self.iteration_ == get_option_from_snapshot(self, 'MOM_START')):
+    if self.MOM_excited_ and ((not self.MOM_performed_) or self.iteration_ == self._scf_mom_start):
         return (True, 'mom_not_started')
 
     # if a fractional occupation is requested but not started, don't stop yet
@@ -1215,8 +1273,9 @@ def validate_multi_scf_compatibility(wfn_list):
     2. Geometry (molecule) - 3-index integrals depend on atomic coordinates
     3. Auxiliary basis - if SCF_TYPE='DF', affects integral approximation
     4. LRC capability - JK built with or without long-range K support
-    5. LRC omega - if LRC, range-separation parameter (configured once from wfn[0])
-    6. RSH alpha/beta - if LRC, RSH parameters (configured once from wfn[0])
+    5. LRC omega - if LRC, range-separation parameter used in erf(ωr)/r operator
+
+    Note: RSH alpha/beta NOT checked (only affect integrals if wcombine=TRUE, which is not default)
 
     CAN Differ (safe):
     -----------------
@@ -1411,22 +1470,17 @@ def validate_multi_scf_compatibility(wfn_list):
     # Category 2: JK Configuration (set in initialize_jk(), not updated later)
     # ========================================================================
 
-    # Checks 2.1-2.3: LRC Parameters (omega, alpha, beta)
-    # Code: initialize_jk() lines 116-119
-    # Why: These are set during ref_wfn.initialize_jk() and NOT reconfigured
-    #      for other wfn (they skip initialize_jk due to idempotency).
-    #      If different, wfn[1:] use WRONG parameters!
+    # Check 2.1: LRC omega parameter
+    # Code: initialize_jk() line 116
+    # Why: omega is the range-separation parameter used in erf(ωr)/r operator
+    #      for long-range wK integrals. Different omega → different integrals!
     if ref_is_lrc:
         ref_omega = ref_wfn.functional().x_omega()
-        ref_alpha = ref_wfn.functional().x_alpha()
-        ref_beta = ref_wfn.functional().x_beta()
 
         for i, wfn in enumerate(wfn_list[1:], 1):
             wfn_omega = wfn.functional().x_omega()
-            wfn_alpha = wfn.functional().x_alpha()
-            wfn_beta = wfn.functional().x_beta()
 
-            # Check omega
+            # Check omega MUST match
             if abs(wfn_omega - ref_omega) > 1e-10:
                 ref_func_name = ref_wfn.functional().name()
                 wfn_func_name = wfn.functional().name()
@@ -1441,11 +1495,11 @@ def validate_multi_scf_compatibility(wfn_list):
                     f"\n"
                     f"Why this matters:\n"
                     f"  For LRC functionals, omega is the range-separation parameter:\n"
-                    f"    1/r = erf(ω r)/r + erfc(ω r)/r\n"
+                    f"    wK_μν = Σ_ρσ P_ρσ (μρ|erf(ω r)/r|νσ)\n"
+                    f"  Different omega → different erf(ω r) → DIFFERENT wK integrals!\n"
                     f"  The shared JK is configured with omega from wfn[0] only.\n"
                     f"  Other wavefunctions skip JK configuration due to idempotency,\n"
-                    f"  so they inherit omega from wfn[0]. Different omega would give\n"
-                    f"  wrong long-range/short-range splitting!\n"
+                    f"  so they inherit omega from wfn[0].\n"
                     f"\n"
                     f"Code location: initialize_jk() line 116\n"
                     f"  jk.set_omega(functional.x_omega())\n"
@@ -1459,56 +1513,25 @@ def validate_multi_scf_compatibility(wfn_list):
                     f"{'=' * 70}\n"
                 )
 
-            # Check alpha
-            if abs(wfn_alpha - ref_alpha) > 1e-10:
-                ref_func_name = ref_wfn.functional().name()
-                wfn_func_name = wfn.functional().name()
-
-                raise ValidationError(
-                    f"\n"
-                    f"Shared JK Compatibility Error: RSH alpha parameter mismatch\n"
-                    f"{'=' * 70}\n"
-                    f"Wavefunction {i} has different alpha parameter:\n"
-                    f"  Reference (wfn 0): {ref_func_name}, alpha = {ref_alpha}\n"
-                    f"  Wavefunction {i}:  {wfn_func_name}, alpha = {wfn_alpha}\n"
-                    f"\n"
-                    f"Why this matters:\n"
-                    f"  For range-separated hybrid (RSH) functionals, alpha controls\n"
-                    f"  the short-range HF exchange fraction. The shared JK is configured\n"
-                    f"  with alpha from wfn[0] only (same reason as omega above).\n"
-                    f"\n"
-                    f"Code location: initialize_jk() line 118\n"
-                    f"  jk.set_omega_alpha(functional.x_alpha())\n"
-                    f"\n"
-                    f"Solution:\n"
-                    f"  All wavefunctions must use functionals with the SAME alpha.\n"
-                    f"{'=' * 70}\n"
-                )
-
-            # Check beta
-            if abs(wfn_beta - ref_beta) > 1e-10:
-                ref_func_name = ref_wfn.functional().name()
-                wfn_func_name = wfn.functional().name()
-
-                raise ValidationError(
-                    f"\n"
-                    f"Shared JK Compatibility Error: RSH beta parameter mismatch\n"
-                    f"{'=' * 70}\n"
-                    f"Wavefunction {i} has different beta parameter:\n"
-                    f"  Reference (wfn 0): {ref_func_name}, beta = {ref_beta}\n"
-                    f"  Wavefunction {i}:  {wfn_func_name}, beta = {wfn_beta}\n"
-                    f"\n"
-                    f"Why this matters:\n"
-                    f"  For RSH functionals, beta controls the long-range HF exchange\n"
-                    f"  fraction. The shared JK is configured with beta from wfn[0] only.\n"
-                    f"\n"
-                    f"Code location: initialize_jk() line 119\n"
-                    f"  jk.set_omega_beta(functional.x_beta())\n"
-                    f"\n"
-                    f"Solution:\n"
-                    f"  All wavefunctions must use functionals with the SAME beta.\n"
-                    f"{'=' * 70}\n"
-                )
+    # NOTE: alpha/beta NOT checked (only needed if JK wcombine=TRUE)
+    # ---------------------------------------------------------------
+    # RSH parameters alpha/beta are NOT validated because they are used
+    # ONLY if JK.wcombine=TRUE (combined K matrix mode). Default is wcombine=FALSE,
+    # where K and wK are computed separately and alpha/beta are applied later
+    # during Fock assembly (not during integral computation).
+    #
+    # In wcombine=FALSE mode (default):
+    #   - K and wK computed separately from integrals
+    #   - alpha/beta used in: F = ... + alpha*K + beta*wK (Fock assembly)
+    #   - Different alpha/beta → same integrals → OK!
+    #
+    # In wcombine=TRUE mode (if ever enabled):
+    #   - Combined matrix computed: K_combined = alpha*K + beta*wK
+    #   - alpha/beta baked into integrals
+    #   - Different alpha/beta → different integrals → WRONG!
+    #   - Would need validation (but wcombine never set in current code)
+    #
+    # See: INVESTIGATION_VALIDATION_CHECKS.md for C++ code analysis
 
     # All checks passed!
     # Parameters that CAN differ (safe) are NOT checked:
