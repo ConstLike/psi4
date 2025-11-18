@@ -1957,10 +1957,13 @@ def _multi_scf_inner(wfn_list, e_conv, d_conv, max_iter, verbose):
         # Distribute to ALL wfn (maintains consistent indexing)
         for i, wfn in enumerate(wfn_list):
             n_states = wfn_state_counts[i]
-            J_list = [J_all[jk_index + j] for j in range(n_states)]
-            K_list = [K_all[jk_index + j] for j in range(n_states)]
-            wK_list = [wK_all[jk_index + j] for j in range(n_states)] if wK_all else []
-            wfn.set_jk_matrices(J_list, K_list, wK_list)
+            slice_range = slice(jk_index, jk_index + n_states)
+
+            wfn.set_jk_matrices(
+                J_all[slice_range],
+                K_all[slice_range],
+                wK_all[slice_range] if wK_all else []
+            )
             jk_index += n_states
 
         # Step 4: Each wavefunction completes its SCF iteration
