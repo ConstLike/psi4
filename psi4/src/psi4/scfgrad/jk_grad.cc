@@ -1108,37 +1108,51 @@ void DFJKGrad::build_Amn_x_terms() {
 
     // => Per-wfn data structures <= //
     // J densities (d vectors), K/wK densities (Kmn, wKmn matrices)
+    // HPC optimization: Check do_J/K/wK ONCE outside loop
     std::vector<SharedVector> d_list(nwfn);
     std::vector<SharedMatrix> Kmn_list(nwfn);
     std::vector<SharedMatrix> wKmn_list(nwfn);
 
-    for (int w = 0; w < nwfn; w++) {
-        if (do_J_) {
+    if (do_J_) {
+        for (int w = 0; w < nwfn; w++) {
             d_list[w] = std::make_shared<Vector>("d", naux);
         }
-        if (do_K_ || do_wK_) {
+    }
+    if (do_K_ || do_wK_) {
+        for (int w = 0; w < nwfn; w++) {
             Kmn_list[w] = std::make_shared<Matrix>("Kmn", max_rows, nso * (size_t)nso);
         }
-        if (do_wK_) {
+    }
+    if (do_wK_) {
+        for (int w = 0; w < nwfn; w++) {
             wKmn_list[w] = std::make_shared<Matrix>("wKmn", max_rows, nso * (size_t)nso);
         }
     }
 
     // => Temporary Gradients [thread][wfn] <= //
+    // HPC optimization: Check do_J/K/wK ONCE outside double loop
 
     std::vector<std::vector<SharedMatrix>> Jtemps(df_ints_num_threads_);
     std::vector<std::vector<SharedMatrix>> Ktemps(df_ints_num_threads_);
     std::vector<std::vector<SharedMatrix>> wKtemps(df_ints_num_threads_);
 
-    for (int t = 0; t < df_ints_num_threads_; t++) {
-        for (int w = 0; w < nwfn; w++) {
-            if (do_J_) {
+    if (do_J_) {
+        for (int t = 0; t < df_ints_num_threads_; t++) {
+            for (int w = 0; w < nwfn; w++) {
                 Jtemps[t].push_back(std::make_shared<Matrix>("Jtemp", natom, 3));
             }
-            if (do_K_) {
+        }
+    }
+    if (do_K_) {
+        for (int t = 0; t < df_ints_num_threads_; t++) {
+            for (int w = 0; w < nwfn; w++) {
                 Ktemps[t].push_back(std::make_shared<Matrix>("Ktemp", natom, 3));
             }
-            if (do_wK_) {
+        }
+    }
+    if (do_wK_) {
+        for (int t = 0; t < df_ints_num_threads_; t++) {
+            for (int w = 0; w < nwfn; w++) {
                 wKtemps[t].push_back(std::make_shared<Matrix>("wKtemp", natom, 3));
             }
         }
@@ -1314,42 +1328,29 @@ void DFJKGrad::build_Amn_x_terms() {
             double perm = (M == N ? 1.0 : 2.0);
 
             // => Phase 3: Contract integrals with ALL wavefunctions <= //
+            // HPC OPTIMIZATION: Check do_J/K/wK ONCE per shell pair (not N×nP×nM×nN times!)
+            // Reduces ~15 million checks to ~3 thousand for typical calculation
 
-            for (int w = 0; w < nwfn; w++) {
-                double** grad_Jp = nullptr;
-                double** grad_Kp = nullptr;
-                double** grad_wKp = nullptr;
+            // J gradient: (A|pq)^x d_A Dt_pq
+            if (do_J_) {
+                for (int w = 0; w < nwfn; w++) {
+                    double** grad_Jp = Jtemps[thread][w]->pointer();
+                    double* dp = d_list[w]->pointer();
+                    double** Dtp = Dt_list_[w]->pointer();
 
-                if (do_J_) {
-                    grad_Jp = Jtemps[thread][w]->pointer();
-                }
-                if (do_K_) {
-                    grad_Kp = Ktemps[thread][w]->pointer();
-                }
-                if (do_wK_) {
-                    grad_wKp = wKtemps[thread][w]->pointer();
-                }
+                    const double* Px_w = Px;
+                    const double* Py_w = Py;
+                    const double* Pz_w = Pz;
+                    const double* Mx_w = Mx;
+                    const double* My_w = My;
+                    const double* Mz_w = Mz;
+                    const double* Nx_w = Nx;
+                    const double* Ny_w = Ny;
+                    const double* Nz_w = Nz;
 
-                double* dp = do_J_ ? d_list[w]->pointer() : nullptr;
-                double** Dtp = Dt_list_[w]->pointer();
-                double** Kmnp = (do_K_ || do_wK_) ? Kmn_list[w]->pointer() : nullptr;
-                double** wKmnp = do_wK_ ? wKmn_list[w]->pointer() : nullptr;
-
-                const double* Px_w = Px;
-                const double* Py_w = Py;
-                const double* Pz_w = Pz;
-                const double* Mx_w = Mx;
-                const double* My_w = My;
-                const double* Mz_w = Mz;
-                const double* Nx_w = Nx;
-                const double* Ny_w = Ny;
-                const double* Nz_w = Nz;
-
-                for (int p = 0; p < nP; p++) {
-                    for (int m = 0; m < nM; m++) {
-                        for (int n = 0; n < nN; n++) {
-                            //  J^x = (A|pq)^x d_A Dt_pq
-                            if (do_J_) {
+                    for (int p = 0; p < nP; p++) {
+                        for (int m = 0; m < nM; m++) {
+                            for (int n = 0; n < nN; n++) {
                                 double Ival = 1.0 * perm * dp[p + oP + pstart] * Dtp[m + oM][n + oN];
                                 grad_Jp[aP][0] += Ival * (*Px_w);
                                 grad_Jp[aP][1] += Ival * (*Py_w);
@@ -1360,10 +1361,35 @@ void DFJKGrad::build_Amn_x_terms() {
                                 grad_Jp[aN][0] += Ival * (*Nx_w);
                                 grad_Jp[aN][1] += Ival * (*Ny_w);
                                 grad_Jp[aN][2] += Ival * (*Nz_w);
-                            }
 
-                            //  K^x = (A|pq)^x (A|pq)
-                            if (do_K_) {
+                                Px_w++; Py_w++; Pz_w++;
+                                Mx_w++; My_w++; Mz_w++;
+                                Nx_w++; Ny_w++; Nz_w++;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // K gradient: (A|pq)^x (A|pq)
+            if (do_K_) {
+                for (int w = 0; w < nwfn; w++) {
+                    double** grad_Kp = Ktemps[thread][w]->pointer();
+                    double** Kmnp = Kmn_list[w]->pointer();
+
+                    const double* Px_w = Px;
+                    const double* Py_w = Py;
+                    const double* Pz_w = Pz;
+                    const double* Mx_w = Mx;
+                    const double* My_w = My;
+                    const double* Mz_w = Mz;
+                    const double* Nx_w = Nx;
+                    const double* Ny_w = Ny;
+                    const double* Nz_w = Nz;
+
+                    for (int p = 0; p < nP; p++) {
+                        for (int m = 0; m < nM; m++) {
+                            for (int n = 0; n < nN; n++) {
                                 double Kval = 1.0 * perm * Kmnp[p + oP][(m + oM) * nso + (n + oN)];
                                 grad_Kp[aP][0] += Kval * (*Px_w);
                                 grad_Kp[aP][1] += Kval * (*Py_w);
@@ -1374,10 +1400,35 @@ void DFJKGrad::build_Amn_x_terms() {
                                 grad_Kp[aN][0] += Kval * (*Nx_w);
                                 grad_Kp[aN][1] += Kval * (*Ny_w);
                                 grad_Kp[aN][2] += Kval * (*Nz_w);
-                            }
 
-                            // wK^x = 0.5 * (A|pq)^x (A|w|pq)
-                            if (do_wK_) {
+                                Px_w++; Py_w++; Pz_w++;
+                                Mx_w++; My_w++; Mz_w++;
+                                Nx_w++; Ny_w++; Nz_w++;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // wK gradient: 0.5 * (A|pq)^x (A|w|pq)
+            if (do_wK_) {
+                for (int w = 0; w < nwfn; w++) {
+                    double** grad_wKp = wKtemps[thread][w]->pointer();
+                    double** wKmnp = wKmn_list[w]->pointer();
+
+                    const double* Px_w = Px;
+                    const double* Py_w = Py;
+                    const double* Pz_w = Pz;
+                    const double* Mx_w = Mx;
+                    const double* My_w = My;
+                    const double* Mz_w = Mz;
+                    const double* Nx_w = Nx;
+                    const double* Ny_w = Ny;
+                    const double* Nz_w = Nz;
+
+                    for (int p = 0; p < nP; p++) {
+                        for (int m = 0; m < nM; m++) {
+                            for (int n = 0; n < nN; n++) {
                                 double wKval = 0.5 * perm * wKmnp[p + oP][(m + oM) * nso + (n + oN)];
                                 grad_wKp[aP][0] += wKval * (*Px_w);
                                 grad_wKp[aP][1] += wKval * (*Py_w);
@@ -1388,21 +1439,15 @@ void DFJKGrad::build_Amn_x_terms() {
                                 grad_wKp[aN][0] += wKval * (*Nx_w);
                                 grad_wKp[aN][1] += wKval * (*Ny_w);
                                 grad_wKp[aN][2] += wKval * (*Nz_w);
-                            }
 
-                            Px_w++;
-                            Py_w++;
-                            Pz_w++;
-                            Mx_w++;
-                            My_w++;
-                            Mz_w++;
-                            Nx_w++;
-                            Ny_w++;
-                            Nz_w++;
+                                Px_w++; Py_w++; Pz_w++;
+                                Mx_w++; My_w++; Mz_w++;
+                                Nx_w++; Ny_w++; Nz_w++;
+                            }
                         }
                     }
                 }
-            }  // End per-wfn contraction loop
+            }
 
             //  wK^x = 0.5 * (A|w|pq)^x (A|pq)
             //  Second symmetric contribution: LR derivative integrals × regular densities
@@ -1469,16 +1514,25 @@ void DFJKGrad::build_Amn_x_terms() {
     // => Temporary Gradient Reduction <= //
 
     // => Phase 4: Accumulate thread gradients for ALL wavefunctions <= //
+    // HPC optimization: Check do_J/K/wK ONCE outside loops (not N×threads times)
 
-    for (int w = 0; w < nwfn; w++) {
-        for (int t = 0; t < df_ints_num_threads_; t++) {
-            if (do_J_) {
+    if (do_J_) {
+        for (int w = 0; w < nwfn; w++) {
+            for (int t = 0; t < df_ints_num_threads_; t++) {
                 gradients_list_[w]["Coulomb"]->add(Jtemps[t][w]);
             }
-            if (do_K_) {
+        }
+    }
+    if (do_K_) {
+        for (int w = 0; w < nwfn; w++) {
+            for (int t = 0; t < df_ints_num_threads_; t++) {
                 gradients_list_[w]["Exchange"]->add(Ktemps[t][w]);
             }
-            if (do_wK_) {
+        }
+    }
+    if (do_wK_) {
+        for (int w = 0; w < nwfn; w++) {
+            for (int t = 0; t < df_ints_num_threads_; t++) {
                 gradients_list_[w]["Exchange,LR"]->add(wKtemps[t][w]);
             }
         }
