@@ -199,6 +199,10 @@ procedures = {
         'oremp2'        : proc.select_olccd_gradient,
         'ccd'           : proc.select_ccd_gradient,
     },
+    'multi_gradient' : {
+        'hf'            : proc.run_multi_scf_gradient,
+        'scf'           : proc.run_multi_scf_gradient,
+    },
     'hessian' : {
         'hf'            : proc.run_scf_hessian,
         'scf'           : proc.run_scf_hessian,
@@ -289,6 +293,10 @@ for key in functionals:
     # Gradients
     if not (ssuper.is_c_hybrid() or ssuper.is_c_lrc() or ssuper.needs_vv10()):
         procedures['gradient'][key] = proc.select_scf_gradient
+
+    # Multi-Gradients (batched)
+    if not (ssuper.is_c_hybrid() or ssuper.is_c_lrc() or ssuper.needs_vv10()):
+        procedures['multi_gradient'][key] = proc.run_multi_scf_gradient
 
     # Hessians
     if not ssuper.is_gga(): # N.B. this eliminates both GGA and m-GGA, as the latter contains GGA terms
