@@ -1862,6 +1862,12 @@ def _multi_scf_inner(wfn_list, e_conv, d_conv, max_iter, verbose):
     converged_flags = [False] * len(wfn_list)
     final_energies = [0.0] * len(wfn_list)
 
+    # Pre-compute wavefunction state counts (invariant: RHF=1, UHF/ROHF=2)
+    # This eliminates redundant n_states() calls and enables pre-allocation
+    # n_states() is a const method - value doesn't change between iterations
+    wfn_state_counts = [wfn.n_states() for wfn in wfn_list]
+    total_states = sum(wfn_state_counts)
+
     if verbose:
         header = "  " + "Iter".rjust(4)
         for i in range(len(wfn_list)):
@@ -1877,20 +1883,36 @@ def _multi_scf_inner(wfn_list, e_conv, d_conv, max_iter, verbose):
         # All wfn participate in JK (including converged ones) to maintain
         # consistent indexing and prevent discontinuous Fock changes.
         # Converged wfn continue providing C matrices but don't iterate.
-        all_C_occ_matrices = []
-        wfn_state_counts = []  # Track how many states each wfn has
-        active_wfn_indices = []  # Track which wfn need iteration (non-converged)
 
+        # Pre-allocate list with exact size (eliminates reallocation overhead)
+        # wfn_state_counts pre-computed above (const: RHF=1, UHF/ROHF=2)
+        all_C_occ_matrices = [None] * total_states
+        active_wfn_indices = []  # Size unknown (converged count varies)
+
+        # Fill pre-allocated list via direct indexing (cache-friendly, no reallocation)
+        matrix_idx = 0
         for i, wfn in enumerate(wfn_list):
             # Get current C matrices for this wfn
             C_matrices = wfn.get_orbital_matrices()
+            n_states = len(C_matrices)
 
             if verbose >= 2:
                 status = "CONVERGED" if converged_flags[i] else "ACTIVE"
-                core.print_out(f"  [DEBUG iter={iteration}] wfn {i}: {status}, collected {len(C_matrices)} C matrices\n")
+                core.print_out(f"  [DEBUG iter={iteration}] wfn {i}: {status}, collected {n_states} C matrices\n")
 
-            all_C_occ_matrices.extend(C_matrices)
-            wfn_state_counts.append(len(C_matrices))
+            # Sanity check: ensure n_states() matches get_orbital_matrices() length
+            # This is an invariant - if violated, indicates a bug in C++ code
+            if n_states != wfn_state_counts[i]:
+                raise ValidationError(
+                    f"Inconsistent state count for wavefunction {i} ({wfn.__class__.__name__}):\n"
+                    f"  n_states() returned {wfn_state_counts[i]}\n"
+                    f"  get_orbital_matrices() returned {n_states} matrices\n"
+                    f"This indicates a bug in the C++ implementation."
+                )
+
+            # Direct indexing assignment (faster than extend, better cache locality)
+            all_C_occ_matrices[matrix_idx:matrix_idx + n_states] = C_matrices
+            matrix_idx += n_states
 
             # Track which wfn still need iteration (not converged)
             if not converged_flags[i]:
