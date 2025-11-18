@@ -1274,8 +1274,7 @@ def validate_multi_scf_compatibility(wfn_list):
     3. Auxiliary basis - if SCF_TYPE='DF', affects integral approximation
     4. LRC capability - JK built with or without long-range K support
     5. LRC omega - if LRC, range-separation parameter used in erf(ωr)/r operator
-
-    Note: RSH alpha/beta NOT checked (only affect integrals if wcombine=TRUE, which is not default)
+    6. RSH alpha/beta - if LRC AND wcombine=TRUE, affect integrals (conditional check)
 
     CAN Differ (safe):
     -----------------
@@ -1513,25 +1512,88 @@ def validate_multi_scf_compatibility(wfn_list):
                     f"{'=' * 70}\n"
                 )
 
-    # NOTE: alpha/beta NOT checked (only needed if JK wcombine=TRUE)
-    # ---------------------------------------------------------------
-    # RSH parameters alpha/beta are NOT validated because they are used
-    # ONLY if JK.wcombine=TRUE (combined K matrix mode). Default is wcombine=FALSE,
-    # where K and wK are computed separately and alpha/beta are applied later
-    # during Fock assembly (not during integral computation).
+    # Checks 2.2-2.3: LRC alpha/beta parameters (CONDITIONAL on wcombine)
+    # Code: initialize_jk() lines 118-119
+    # Why: alpha/beta affect integrals ONLY if wcombine=TRUE (combined K mode)
     #
-    # In wcombine=FALSE mode (default):
-    #   - K and wK computed separately from integrals
-    #   - alpha/beta used in: F = ... + alpha*K + beta*wK (Fock assembly)
-    #   - Different alpha/beta → same integrals → OK!
+    # Physics:
+    #   wcombine=FALSE (default): K and wK computed separately, alpha/beta used
+    #                             during Fock assembly → CAN differ
+    #   wcombine=TRUE: Combined matrix = alpha*K + beta*wK computed directly
+    #                  → alpha/beta baked into integrals → MUST match
     #
-    # In wcombine=TRUE mode (if ever enabled):
-    #   - Combined matrix computed: K_combined = alpha*K + beta*wK
-    #   - alpha/beta baked into integrals
-    #   - Different alpha/beta → different integrals → WRONG!
-    #   - Would need validation (but wcombine never set in current code)
-    #
-    # See: INVESTIGATION_VALIDATION_CHECKS.md for C++ code analysis
+    # See: INVESTIGATION_VALIDATION_CHECKS.md for C++ code analysis (DFHelper.cc)
+
+    # Check if wcombine mode is enabled (global option)
+    wcombine_enabled = core.get_option('SCF', 'WCOMBINE') if core.has_option_changed('SCF', 'WCOMBINE') else False
+
+    if ref_is_lrc and wcombine_enabled:
+        # wcombine mode: alpha/beta affect integrals, MUST validate
+        ref_alpha = ref_wfn.functional().x_alpha()
+        ref_beta = ref_wfn.functional().x_beta()
+
+        for i, wfn in enumerate(wfn_list[1:], 1):
+            wfn_alpha = wfn.functional().x_alpha()
+            wfn_beta = wfn.functional().x_beta()
+
+            # Check alpha
+            if abs(wfn_alpha - ref_alpha) > 1e-10:
+                ref_func_name = ref_wfn.functional().name()
+                wfn_func_name = wfn.functional().name()
+
+                raise ValidationError(
+                    f"\n"
+                    f"Shared JK Compatibility Error: RSH alpha parameter mismatch (wcombine=TRUE)\n"
+                    f"{'=' * 70}\n"
+                    f"Wavefunction {i} has different alpha parameter:\n"
+                    f"  Reference (wfn 0): {ref_func_name}, alpha = {ref_alpha}\n"
+                    f"  Wavefunction {i}:  {wfn_func_name}, alpha = {wfn_alpha}\n"
+                    f"\n"
+                    f"Why this matters:\n"
+                    f"  You have enabled WCOMBINE=TRUE (combined K matrix mode).\n"
+                    f"  In this mode, the combined matrix K_combined = alpha*K + beta*wK\n"
+                    f"  is computed directly with alpha/beta baked into integrals.\n"
+                    f"  Different alpha → different integrals → WRONG results!\n"
+                    f"\n"
+                    f"Code location: DFHelper.cc compute_sparse_pQq_blocking_p_symm_abw()\n"
+                    f"  param_Mp = omega_alpha * buffer + omega_beta * wbuffer\n"
+                    f"  (only called if wcombine=TRUE)\n"
+                    f"\n"
+                    f"Solution:\n"
+                    f"  All wavefunctions must use functionals with the SAME alpha.\n"
+                    f"  Or disable wcombine mode (set WCOMBINE=FALSE, which is default).\n"
+                    f"{'=' * 70}\n"
+                )
+
+            # Check beta
+            if abs(wfn_beta - ref_beta) > 1e-10:
+                ref_func_name = ref_wfn.functional().name()
+                wfn_func_name = wfn.functional().name()
+
+                raise ValidationError(
+                    f"\n"
+                    f"Shared JK Compatibility Error: RSH beta parameter mismatch (wcombine=TRUE)\n"
+                    f"{'=' * 70}\n"
+                    f"Wavefunction {i} has different beta parameter:\n"
+                    f"  Reference (wfn 0): {ref_func_name}, beta = {ref_beta}\n"
+                    f"  Wavefunction {i}:  {wfn_func_name}, beta = {wfn_beta}\n"
+                    f"\n"
+                    f"Why this matters:\n"
+                    f"  You have enabled WCOMBINE=TRUE (combined K matrix mode).\n"
+                    f"  In this mode, the combined matrix K_combined = alpha*K + beta*wK\n"
+                    f"  is computed directly with alpha/beta baked into integrals.\n"
+                    f"  Different beta → different integrals → WRONG results!\n"
+                    f"\n"
+                    f"Code location: DFHelper.cc compute_sparse_pQq_blocking_p_symm_abw()\n"
+                    f"  param_Mp = omega_alpha * buffer + omega_beta * wbuffer\n"
+                    f"  (only called if wcombine=TRUE)\n"
+                    f"\n"
+                    f"Solution:\n"
+                    f"  All wavefunctions must use functionals with the SAME beta.\n"
+                    f"  Or disable wcombine mode (set WCOMBINE=FALSE, which is default).\n"
+                    f"{'=' * 70}\n"
+                )
+    # else: wcombine=FALSE (default) → alpha/beta used in Fock assembly, not in integrals → OK to differ
 
     # All checks passed!
     # Parameters that CAN differ (safe) are NOT checked:
