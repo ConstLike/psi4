@@ -114,19 +114,15 @@ std::vector<SharedMatrix> multi_scfgrad(
     // Get MintsHelper from first wavefunction
     auto mintshelper = wfns[0]->mintshelper();
 
-    // CRITICAL: Ensure DF_BASIS_SCF is set if DF integrals are needed
-    // Wavefunctions created via scf_helper have DF_BASIS_SCF set by scf_wavefunction_factory.
-    // But wavefunctions created directly (e.g., RHF(Wavefunction.build())) do NOT.
-    // We must handle both cases to support multi_scf → multi_gradient workflow.
-
+    // DF_BASIS_SCF validation: only needed for single-wfn + DF
+    // Multi-wfn uses DirectJKGrad (no DF basis needed), so only check for nwfn==1
     std::string scf_type = options.get_str("SCF_TYPE");
     bool df_needed = (scf_type.find("DF") != std::string::npos);
 
-    if (df_needed && !wfns[0]->basisset_exists("DF_BASIS_SCF")) {
-        // DF_BASIS_SCF not set - wavefunction created via direct path
-        // Build it following scf_wavefunction_factory pattern (proc.py:1462-1465)
+    if (nwfn == 1 && df_needed && !wfns[0]->basisset_exists("DF_BASIS_SCF")) {
+        // Single-wfn with scf_type='DF' requires DF_BASIS_SCF
         throw PSIEXCEPTION(
-            "multi_scfgrad: DF_BASIS_SCF not set on wavefunctions.\n"
+            "multi_scfgrad: DF_BASIS_SCF not set on wavefunction.\n"
             "When using scf_type='DF', wavefunctions must be created via psi4.energy('scf') "
             "or have DF_BASIS_SCF explicitly set.\n"
             "Direct creation via RHF(Wavefunction.build()) requires calling wfn.initialize() first."
