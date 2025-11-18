@@ -111,17 +111,18 @@ std::vector<SharedMatrix> multi_scfgrad(
     // Step 1: Prepare MintsHelper with proper basis sets
     // ========================================
 
-    // Get MintsHelper from first wavefunction and ensure DF_BASIS_SCF is set
+    // Get MintsHelper from first wavefunction
     auto mintshelper = wfns[0]->mintshelper();
 
     // For DF calculations, ensure MintsHelper has DF_BASIS_SCF configured
-    // Get it from the wavefunction where it was set during SCF convergence
+    // CRITICAL: wfn->basisset_exists() delegates to mintshelper_->basisset_exists(),
+    // so the previous check `if (!mintshelper->basisset_exists())` was NOP (always false).
+    // Instead, UNCONDITIONALLY set DF_BASIS_SCF if wavefunction has it.
+    // This handles edge cases and is safe (if already set, just overwrites with same value).
     if (wfns[0]->basisset_exists("DF_BASIS_SCF")) {
         auto df_basis = wfns[0]->get_basisset("DF_BASIS_SCF");
-        // Ensure MintsHelper has it (may not if MintsHelper was created fresh)
-        if (!mintshelper->basisset_exists("DF_BASIS_SCF")) {
-            mintshelper->set_basisset("DF_BASIS_SCF", df_basis);
-        }
+        // Set unconditionally - safe because it's the same shared_ptr
+        mintshelper->set_basisset("DF_BASIS_SCF", df_basis);
     }
 
     // ========================================
