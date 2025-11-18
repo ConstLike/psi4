@@ -1682,6 +1682,10 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
         # Solution: Create SINGLE shared JK, then share it with ALL wfn
         #          scf_initialize() is idempotent - reuses JK if already set (line 154-156)
         #
+        # NOTE: 3-index integrals (Q|μν) depend ONLY on basis + geometry,
+        #       NOT on reference type (RHF/UHF/ROHF). JK object is generic
+        #       and works with any number of density matrices.
+        #
         # Performance: N=10 wfn, 1000 basis → 50GB → 5GB (10× reduction!)
         #                                     300s → 30s (10× speedup!)
 
@@ -1690,7 +1694,13 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
         if needs_jk_init:
             # Build SINGLE shared JK for all wavefunctions
             ref_wfn = wfn_list[0]
-            total_memory = (core.get_memory() / 8) * core.get_global_option("SCF_MEM_SAFETY_FACTOR")
+
+            # CRITICAL FIX: Use integer arithmetic to avoid float→int type error
+            # Python 3: `/` returns float (250000000.0), but C++ expects int!
+            # Solution: Use `//` (integer division) + explicit int() conversion
+            total_memory_bytes = core.get_memory()
+            safety_factor = core.get_global_option("SCF_MEM_SAFETY_FACTOR")
+            total_memory = int((total_memory_bytes // 8) * safety_factor)
 
             # Create JK for reference wfn
             shared_jk = _build_jk(ref_wfn, total_memory)
