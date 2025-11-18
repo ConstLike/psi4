@@ -112,7 +112,8 @@ std::vector<SharedMatrix> multi_scfgrad(
     // ========================================
     std::vector<std::map<std::string, SharedMatrix>> individual_grads(nwfn);
 
-    auto mintshelper = std::make_shared<MintsHelper>(ref_basis, options);
+    // Use MintsHelper from first wavefunction (already has DF_BASIS_SCF configured)
+    auto mintshelper = wfns[0]->mintshelper();
 
     for (int i = 0; i < nwfn; i++) {
         auto& wfn = wfns[i];
