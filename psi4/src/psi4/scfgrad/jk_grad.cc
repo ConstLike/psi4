@@ -2238,15 +2238,23 @@ void DirectJKGrad::print_header() const {
 void DirectJKGrad::compute_gradient() {
     if (!do_J_ && !do_K_ && !do_wK_) return;
 
-    if (!(Ca_ && Cb_ && Da_ && Db_ && Dt_))
-        throw PSIEXCEPTION("Occupation/Density not set");
-    
+    // Phase B: Validate lists (DirectJKGrad supports single-wfn for now, multi-wfn via compute1)
+    if (Ca_list_.empty() || Cb_list_.empty() || Da_list_.empty() || Db_list_.empty() || Dt_list_.empty()) {
+        throw PSIEXCEPTION("DirectJKGrad: Occupation/Density lists not set. Call set_Da() etc first.");
+    }
+
+    int nwfn = Dt_list_.size();
+    if (nwfn != 1) {
+        throw PSIEXCEPTION("DirectJKGrad::compute_gradient(): Only single-wfn supported via this path. "
+                           "Multi-wfn batching happens inside compute1().");
+    }
+
 #ifdef USING_BrianQC
     if (brianEnable) {
         brianBool computeCoulomb = (do_J_ ? BRIAN_TRUE : BRIAN_FALSE);
         brianBool computeExchange = ((do_K_ || do_wK_) ? BRIAN_TRUE : BRIAN_FALSE);
         bool betaFlag = (brianRestrictionType != BRIAN_RESTRICTION_TYPE_RHF);
-        
+
         std::shared_ptr<Matrix> Jgrad, Kgrada, Kgradb;
         if (computeCoulomb) {
             Jgrad = std::make_shared<Matrix>("Coulomb Gradient", primary_->molecule()->natom(), 3);
@@ -2257,17 +2265,17 @@ void DirectJKGrad::compute_gradient() {
                 Kgradb = std::make_shared<Matrix>("Exchange Gradient beta", primary_->molecule()->natom(), 3);
             }
         }
-        
+
         brianOPTBuildGradientRepulsionDeriv(&brianCookie,
             &computeCoulomb,
             &computeExchange,
-            Da_->get_pointer(),
-            (betaFlag ? Db_->get_pointer() : nullptr),
+            Da_list_[0]->get_pointer(),  // Phase B: Use list[0] for single-wfn
+            (betaFlag ? Db_list_[0]->get_pointer() : nullptr),
             (computeCoulomb ? Jgrad->get_pointer() : nullptr),
             (computeExchange ? Kgrada->get_pointer() : nullptr),
             ((computeExchange && betaFlag) ? Kgradb->get_pointer() : nullptr)
         );
-        
+
         if (computeExchange) {
             if (betaFlag) {
                 Kgrada->add(Kgradb);
@@ -2275,38 +2283,42 @@ void DirectJKGrad::compute_gradient() {
                 Kgrada->scale(2.0);
             }
         }
-        
-        gradients_.clear();
-        
+
+        // Phase B: Store in gradients_list_
+        gradients_list_.clear();
+        gradients_list_.resize(1);  // Single-wfn
+
         if (do_J_) {
-            gradients_["Coulomb"] = Jgrad;
+            gradients_list_[0]["Coulomb"] = Jgrad;
         }
-        
+
         if (do_K_) {
-            gradients_["Exchange"] = Kgrada;
-            
+            gradients_list_[0]["Exchange"] = Kgrada;
+
             if (do_wK_) {
-                gradients_["Exchange,LR"] = std::make_shared<Matrix>("Exchange,LR Gradient", primary_->molecule()->natom(), 3);
+                gradients_list_[0]["Exchange,LR"] = std::make_shared<Matrix>("Exchange,LR Gradient", primary_->molecule()->natom(), 3);
             }
         } else if (do_wK_) {
-            gradients_["Exchange,LR"] = Kgrada;
+            gradients_list_[0]["Exchange,LR"] = Kgrada;
         }
-        
+
         return;
     }
 #endif
 
     // => Set up gradients <= //
     int natom = primary_->molecule()->natom();
-    gradients_.clear();
+    gradients_list_.clear();
+    gradients_list_.resize(nwfn);  // Size 1 for single-wfn
+
     if (do_J_) {
-        gradients_["Coulomb"] = std::make_shared<Matrix>("Coulomb Gradient", natom, 3);
+        gradients_list_[0]["Coulomb"] = std::make_shared<Matrix>("Coulomb Gradient", natom, 3);
     }
     if (do_K_) {
-        gradients_["Exchange"] = std::make_shared<Matrix>("Exchange Gradient", natom, 3);
+        gradients_list_[0]["Exchange"] = std::make_shared<Matrix>("Exchange Gradient", natom, 3);
     }
     if (do_wK_) {
-        gradients_["Exchange,LR"] = std::make_shared<Matrix>("Exchange,LR Gradient", natom, 3);
+        gradients_list_[0]["Exchange,LR"] = std::make_shared<Matrix>("Exchange,LR Gradient", natom, 3);
     }
 
     auto factory = std::make_shared<IntegralFactory>(primary_, primary_, primary_, primary_);
@@ -2318,12 +2330,12 @@ void DirectJKGrad::compute_gradient() {
         }
         std::map<std::string, std::shared_ptr<Matrix>> vals = compute1(ints);
         if (do_J_) {
-            gradients_["Coulomb"]->copy(vals["J"]);
-            // gradients_["Coulomb"]->print();
+            gradients_list_[0]["Coulomb"]->copy(vals["J"]);  // Phase B: Use gradients_list_
+            // gradients_list_[0]["Coulomb"]->print();
         }
         if (do_K_) {
-            gradients_["Exchange"]->copy(vals["K"]);
-            // gradients_["Exchange"]->print();
+            gradients_list_[0]["Exchange"]->copy(vals["K"]);  // Phase B: Use gradients_list_
+            // gradients_list_[0]["Exchange"]->print();
         }
     }
     if (do_wK_) {
@@ -2332,18 +2344,12 @@ void DirectJKGrad::compute_gradient() {
             ints.push_back(std::shared_ptr<TwoBodyAOInt>(factory->erf_eri(omega_, 1)));
         }
         std::map<std::string, std::shared_ptr<Matrix>> vals = compute1(ints);
-        gradients_["Exchange,LR"]->copy(vals["K"]);
-        // gradients_["Exchange,LR"]->print();
+        gradients_list_[0]["Exchange,LR"]->copy(vals["K"]);  // Phase B: Use gradients_list_
+        // gradients_list_[0]["Exchange,LR"]->print();
     }
 }
 std::map<std::string, std::shared_ptr<Matrix>> DirectJKGrad::compute1(
     std::vector<std::shared_ptr<TwoBodyAOInt>>& ints) {
-    // === PHASE B: WORK IN PROGRESS === //
-    // TODO: Finish wfn loop implementation (contraction + thread reduction)
-    // Infrastructure ready (jk_grad.h + thread-local storage), but contraction needs wrapping
-    throw PSIEXCEPTION("DirectJKGrad::compute1(): Phase B implementation in progress. "
-                       "Multi-wfn batching not yet complete. Use DFJKGrad for now.");
-
     int nthreads = ints.size();
     int natom = primary_->molecule()->natom();
 
@@ -2391,10 +2397,6 @@ std::map<std::string, std::shared_ptr<Matrix>> DirectJKGrad::compute1(
 #else
         const int rank = 0;
 #endif
-        // Phase B TODO: Jp/Kp will be obtained per-wfn inside wfn loop
-        // TEMPORARY COMMENT to allow compilation - will be fixed in next step
-        // double** Jp = Jgrad_all[rank][wfn_idx]->pointer();  // TODO: Move inside wfn loop
-        // double** Kp = Kgrad_all[rank][wfn_idx]->pointer();  // TODO: Move inside wfn loop
         // loop over all the blocks of |R>=S)
         size_t start = ints[rank]->first_RS_shell_block(blockPQ_idx);
         for (int blockRS_idx = start; blockRS_idx < blocksRS.size(); ++blockRS_idx) {
@@ -2402,7 +2404,7 @@ std::map<std::string, std::shared_ptr<Matrix>> DirectJKGrad::compute1(
 
             if (!ints[rank]->shell_block_significant(blockPQ_idx, blockRS_idx)) continue;
 
-            // compute the integrals and continue if none were computed
+            // Compute derivative integrals ONCE (reused for all wfn!)
             ints[rank]->compute_shell_blocks_deriv1(blockPQ_idx, blockRS_idx);
             const auto& buffers = ints[rank]->buffers();
 
@@ -2418,6 +2420,18 @@ std::map<std::string, std::shared_ptr<Matrix>> DirectJKGrad::compute1(
             const double* pDx = buffers[9];
             const double* pDy = buffers[10];
             const double* pDz = buffers[11];
+
+            // === Phase B: Loop over ALL wavefunctions === //
+            // Derivative integrals (pAx, pAy, ...) computed once above, now contract with each wfn
+            for (int wfn_idx = 0; wfn_idx < nwfn; wfn_idx++) {
+                // Get densities for THIS wavefunction
+                double** Dtp = Dt_list_[wfn_idx]->pointer();
+                double** Dap = Da_list_[wfn_idx]->pointer();
+                double** Dbp = Db_list_[wfn_idx]->pointer();
+
+                // Get gradients for THIS wavefunction
+                double** Jp = Jgrad_all[rank][wfn_idx]->pointer();
+                double** Kp = Kgrad_all[rank][wfn_idx]->pointer();
 
             // Loop over all of the P,Q,R,S shells within the blocks.  We have P>=Q, R>=S and PQ<=RS.
             for (const auto& pairPQ : blockPQ) {
@@ -2611,26 +2625,44 @@ std::map<std::string, std::shared_ptr<Matrix>> DirectJKGrad::compute1(
                     pDz += block_size;
                 }  // pairRS
             }      // pairPQ
+            }      // wfn_idx (Phase B: end of wfn loop)
         }          // blockRS
     }              // blockPQ
 
-    for (int thread = 1; thread < nthreads; thread++) {
-        Jgrad[0]->add(Jgrad[thread]);
-        Kgrad[0]->add(Kgrad[thread]);
+    // === Phase B: Per-wfn thread reduction === //
+    // Accumulate gradients from all threads, separately for each wavefunction
+    for (int wfn_idx = 0; wfn_idx < nwfn; wfn_idx++) {
+        // Thread reduction for this wfn
+        for (int thread = 1; thread < nthreads; thread++) {
+            Jgrad_all[0][wfn_idx]->add(Jgrad_all[thread][wfn_idx]);
+            Kgrad_all[0][wfn_idx]->add(Kgrad_all[thread][wfn_idx]);
+        }
+
+        // Apply scaling factor (0.5 for symmetry)
+        Jgrad_all[0][wfn_idx]->scale(0.5);
+        Kgrad_all[0][wfn_idx]->scale(0.5);
     }
 
-    Jgrad[0]->scale(0.5);
-    Kgrad[0]->scale(0.5);
-
+    // Legacy return format: return first wfn gradients
+    // (For multi-wfn usage, caller should access gradients_list_ directly)
     std::map<std::string, std::shared_ptr<Matrix>> val;
-    val["J"] = Jgrad[0];
-    val["K"] = Kgrad[0];
+    val["J"] = Jgrad_all[0][0];  // First wfn
+    val["K"] = Kgrad_all[0][0];  // First wfn
     return val;
 }
 void DirectJKGrad::compute_hessian() {
     if (!do_J_ && !do_K_ && !do_wK_) return;
 
-    if (!(Ca_ && Cb_ && Da_ && Db_ && Dt_)) throw PSIEXCEPTION("Occupation/Density not set");
+    // Phase B: Validate lists (DirectJKGrad hessian supports single-wfn only)
+    if (Ca_list_.empty() || Cb_list_.empty() || Da_list_.empty() || Db_list_.empty() || Dt_list_.empty()) {
+        throw PSIEXCEPTION("DirectJKGrad::compute_hessian(): Occupation/Density lists not set.");
+    }
+
+    int nwfn = Dt_list_.size();
+    if (nwfn != 1) {
+        throw PSIEXCEPTION("DirectJKGrad::compute_hessian(): Only single-wfn supported. "
+                           "Multi-wfn hessians not implemented.");
+    }
 
     // => Set up hessians <= //
     int natom = primary_->molecule()->natom();
@@ -2682,9 +2714,10 @@ std::map<std::string, std::shared_ptr<Matrix>> DirectJKGrad::compute2(
         Khess.push_back(std::make_shared<Matrix>("KHess", 3 * natom, 3 * natom));
     }
 
-    double** Dtp = Dt_->pointer();
-    double** Dap = Da_->pointer();
-    double** Dbp = Db_->pointer();
+    // Phase B: compute2 uses list[0] (single-wfn hessian only)
+    double** Dtp = Dt_list_[0]->pointer();
+    double** Dap = Da_list_[0]->pointer();
+    double** Dbp = Db_list_[0]->pointer();
 
     size_t computed_shells = 0L;
     // shell pair blocks
