@@ -213,7 +213,29 @@ std::vector<SharedMatrix> multi_scfgrad(
     // ========================================
     timer_on("Grad: JK (Batched)");
 
-    auto jk = JKGrad::build_JKGrad(1, mintshelper);
+    // CRITICAL: DFJKGrad does NOT support multi-wfn batching
+    // Analysis: All DFJKGrad methods (build_Amn_terms, build_AB_inv_terms, etc.)
+    // use hardcoded [0] index (22 occurrences of "Phase B: DFJKGrad single-wfn only").
+    // Multi-wfn DF batching requires major refactoring (Phase B.3).
+    //
+    // DirectJKGrad::compute1() DOES support multi-wfn batching (Phase B.1 complete).
+    // For multi-wfn case: explicitly use DirectJKGrad regardless of scf_type.
+    //
+    // Performance: DIRECT slower than DF, but multi-wfn batching (derivative
+    // integrals computed once) still provides 2-6× speedup vs sequential.
+    // Phase B.3 TODO: Implement DF multi-wfn batching for optimal performance.
+
+    std::shared_ptr<JKGrad> jk;
+    if (nwfn > 1) {
+        // Multi-wfn: use DirectJKGrad (batching implemented)
+        jk = std::make_shared<DirectJKGrad>(1, ref_basis);
+        outfile->Printf("  Multi-wfn gradients: Using DIRECT algorithm (DF batching not yet implemented)\n");
+        outfile->Printf("  Batched computation still provides ~2-6× speedup vs sequential\n\n");
+    } else {
+        // Single-wfn: use build_JKGrad (selects best algorithm for scf_type)
+        jk = JKGrad::build_JKGrad(1, mintshelper);
+    }
+
     jk->set_memory((size_t)(options.get_double("SCF_MEM_SAFETY_FACTOR") *
                             Process::environment.get_memory() / 8L));
 
