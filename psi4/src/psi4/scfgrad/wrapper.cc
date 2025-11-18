@@ -38,7 +38,6 @@
 #include "psi4/libmints/mintshelper.h"
 #include "psi4/libmints/molecule.h"
 #include "psi4/libmints/vector.h"
-#include "psi4/libmints/basisset.h"
 #include "psi4/libfock/v.h"
 #include "psi4/libfunctional/superfunctional.h"
 
@@ -115,23 +114,13 @@ std::vector<SharedMatrix> multi_scfgrad(
     // Get MintsHelper from first wavefunction and ensure DF_BASIS_SCF is set
     auto mintshelper = wfns[0]->mintshelper();
 
-    // Check if we need DF basis (only for DF-type SCF)
-    std::string scf_type = options.get_str("SCF_TYPE");
-    bool df_needed = (scf_type.find("DF") != std::string::npos);
-
-    if (df_needed) {
-        // Check if DF_BASIS_SCF is already set
-        if (!wfns[0]->basisset_exists("DF_BASIS_SCF")) {
-            // Build and set DF_BASIS_SCF (following scf_helper pattern)
-            auto aux_basis = BasisSet::build(
-                ref_mol,
-                "DF_BASIS_SCF",
-                options.get_str("DF_BASIS_SCF"),
-                "JKFIT",
-                options.get_str("BASIS"),
-                ref_basis->has_puream()
-            );
-            mintshelper->set_basisset("DF_BASIS_SCF", aux_basis);
+    // For DF calculations, ensure MintsHelper has DF_BASIS_SCF configured
+    // Get it from the wavefunction where it was set during SCF convergence
+    if (wfns[0]->basisset_exists("DF_BASIS_SCF")) {
+        auto df_basis = wfns[0]->get_basisset("DF_BASIS_SCF");
+        // Ensure MintsHelper has it (may not if MintsHelper was created fresh)
+        if (!mintshelper->basisset_exists("DF_BASIS_SCF")) {
+            mintshelper->set_basisset("DF_BASIS_SCF", df_basis);
         }
     }
 
