@@ -90,12 +90,22 @@ class ROHF : public HF {
 
     /// Returns {Cdocc, Csocc} for multi-cycle JK computation
     /// IMPORTANT: Returns ONLY occupied orbitals (docc and socc blocks)
+    /// PERFORMANCE: Cached to avoid repeated deep copies (Phase 1.8 optimization)
     std::vector<SharedMatrix> get_orbital_matrices() const override {
+        // Fast path: return cached if valid (common for converged wfn)
+        if (orbital_cache_valid_) {
+            return cached_orbital_matrices_;
+        }
+
+        // Slow path: ROHF returns 2 matrices (docc + socc blocks)
         // ROHF needs separate docc and socc blocks (same as form_G())
         Dimension dim_zero(nirrep_, "Zero Dim");
         SharedMatrix Cdocc = Ca_->get_block({dim_zero, nsopi_}, {dim_zero, nbetapi_});
         SharedMatrix Csocc = Ca_->get_block({dim_zero, nsopi_}, {nbetapi_, nalphapi_});
-        return {Cdocc, Csocc};
+
+        cached_orbital_matrices_ = {Cdocc, Csocc};
+        orbital_cache_valid_ = true;
+        return cached_orbital_matrices_;
     }
 
     void save_density_and_energy() override;

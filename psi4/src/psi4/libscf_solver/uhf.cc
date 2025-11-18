@@ -352,6 +352,9 @@ void UHF::form_C(double shift) {
         Ca_->print("outfile");
         Cb_->print("outfile");
     }
+
+    // Phase 1.8: Invalidate orbital cache after orbitals updated
+    orbital_cache_valid_ = false;
 }
 
 void UHF::form_D() {
@@ -1122,6 +1125,9 @@ int UHF::soscf_update(double soscf_conv, int soscf_min_iter, int soscf_max_iter,
     // => Rotate orbitals <= //
     rotate_orbitals(Ca_, ret_x[0]);
     rotate_orbitals(Cb_, ret_x[1]);
+
+    // Phase 1.8: Invalidate orbital cache after orbital rotation
+    orbital_cache_valid_ = false;
 
     return cphf_nfock_builds_;
 }

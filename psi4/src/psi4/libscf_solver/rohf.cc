@@ -427,6 +427,9 @@ void ROHF::form_C(double shift) {
         outfile->Printf("In ROHF::form_C:\n");
         Ct_->eivprint(epsilon_a_);
     }
+
+    // Phase 1.8: Invalidate orbital cache after orbitals updated
+    orbital_cache_valid_ = false;
 }
 
 void ROHF::prepare_canonical_orthogonalization() {
@@ -932,6 +935,9 @@ int ROHF::soscf_update(double soscf_conv, int soscf_min_iter, int soscf_max_iter
     // => Rotate orbitals <= //
     rotate_orbitals(Ca_, x);
     rotate_orbitals(Ct_, x);
+
+    // Phase 1.8: Invalidate orbital cache after orbital rotation
+    orbital_cache_valid_ = false;
 
     // // => Cleanup <= //
     Precon.reset();

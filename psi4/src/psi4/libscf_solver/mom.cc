@@ -720,6 +720,9 @@ void HF::MOM() {
         delete[] p;
     }
     Cb_old_->copy(Cb_);
+
+    // Phase 1.8: Invalidate orbital cache after orbital swapping/reordering
+    orbital_cache_valid_ = false;
 }
 }  // namespace scf
 }  // namespace psi

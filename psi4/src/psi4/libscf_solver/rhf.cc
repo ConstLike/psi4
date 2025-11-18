@@ -300,6 +300,9 @@ void RHF::form_C(double shift) {
         diagonalize_F(shifted_F, Ca_, epsilon_a_);
     }
     find_occupation();
+
+    // Phase 1.8: Invalidate orbital cache after orbitals updated
+    orbital_cache_valid_ = false;
 }
 
 void RHF::form_D() {
@@ -912,6 +915,9 @@ int RHF::soscf_update(double soscf_conv, int soscf_min_iter, int soscf_max_iter,
 
     // => Rotate orbitals <= //
     rotate_orbitals(Ca_, ret_x[0]);
+
+    // Phase 1.8: Invalidate orbital cache after orbital rotation
+    orbital_cache_valid_ = false;
 
     return cphf_nfock_builds_;
 }
