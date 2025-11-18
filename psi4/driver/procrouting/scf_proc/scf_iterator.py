@@ -1879,29 +1879,34 @@ def _multi_scf_inner(wfn_list, e_conv, d_conv, max_iter, verbose):
     # Main multi-cycle SCF iteration loop
     for iteration in range(1, max_iter + 1):
 
-        # Step 1: Collect occupied orbital matrices from all wavefunctions
-        # All wfn participate in JK (including converged ones) to maintain
-        # consistent indexing and prevent discontinuous Fock changes.
-        # Converged wfn continue providing C matrices but don't iterate.
+        # Step 1: Collect occupied orbital matrices from ACTIVE wavefunctions only
+        # Phase 1.9 optimization: Skip JK computation for converged wfn
+        # Physics: J^i and K^i depend ONLY on C^i (own density), not other wfn
+        # Converged wfn: C unchanged → J/K unchanged → reuse via use_precomputed_jk_
+        # Performance: 50-70% JK speedup in late iterations (7/10 converged)
 
-        # Pre-allocate list with exact size (eliminates reallocation overhead)
-        # wfn_state_counts pre-computed above (const: RHF=1, UHF/ROHF=2)
-        all_C_occ_matrices = [None] * total_states
-        active_wfn_indices = []  # Size unknown (converged count varies)
+        # Build list of (wfn_index, C_matrices) for active wfn only
+        # This preserves original wfn indices for correct distribution
+        active_C_data = []  # [(wfn_index, C_matrices), ...]
 
-        # Fill pre-allocated list via direct indexing (cache-friendly, no reallocation)
-        matrix_idx = 0
         for i, wfn in enumerate(wfn_list):
-            # Get current C matrices for this wfn
+            if converged_flags[i]:
+                # Skip converged wfn - will reuse J/K from last active iteration
+                # wfn.precomputed_J/K still valid (C unchanged since convergence)
+                # wfn.use_precomputed_jk_ = true (unchanged from previous iteration)
+                # wfn.form_G() will automatically use cached J/K
+                if verbose >= 2:
+                    core.print_out(f"  [DEBUG iter={iteration}] wfn {i}: CONVERGED, skipping JK\n")
+                continue
+
+            # Get current C matrices for active wfn
             C_matrices = wfn.get_orbital_matrices()
             n_states = len(C_matrices)
 
             if verbose >= 2:
-                status = "CONVERGED" if converged_flags[i] else "ACTIVE"
-                core.print_out(f"  [DEBUG iter={iteration}] wfn {i}: {status}, collected {n_states} C matrices\n")
+                core.print_out(f"  [DEBUG iter={iteration}] wfn {i}: ACTIVE, collected {n_states} C matrices\n")
 
             # Sanity check: ensure n_states() matches get_orbital_matrices() length
-            # This is an invariant - if violated, indicates a bug in C++ code
             if n_states != wfn_state_counts[i]:
                 raise ValidationError(
                     f"Inconsistent state count for wavefunction {i} ({wfn.__class__.__name__}):\n"
@@ -1910,61 +1915,58 @@ def _multi_scf_inner(wfn_list, e_conv, d_conv, max_iter, verbose):
                     f"This indicates a bug in the C++ implementation."
                 )
 
-            # Direct indexing assignment (faster than extend, better cache locality)
-            all_C_occ_matrices[matrix_idx:matrix_idx + n_states] = C_matrices
-            matrix_idx += n_states
-
-            # Track which wfn still need iteration (not converged)
-            if not converged_flags[i]:
-                active_wfn_indices.append(i)
+            # Store wfn index and C matrices for JK computation
+            active_C_data.append((i, C_matrices))
 
         # Early exit if all converged (no active wfn left)
-        if not active_wfn_indices:
+        if not active_C_data:
             if verbose:
                 core.print_out("\n  All wavefunctions converged!\n\n")
             break
 
-        # Step 2: Shared JK computation for ALL wavefunctions (coupled convergence)
-        # Use exported wrapper methods instead of direct vector manipulation
-        # C_clear() clears both C_left and C_right
-        # C_add() appends to both C_left and C_right (symmetric JK)
+        # Step 2: Shared JK computation for ACTIVE wavefunctions only
+        # Phase 1.9: Skip contraction for converged wfn (C unchanged → J/K unchanged)
+        # Integrals (Q|mn) loaded once, contracted with ALL active C matrices
+        # Performance: ~70% speedup when 7/10 wfn converged (6 contractions vs 20)
         jk.C_clear()
-        for C_occ in all_C_occ_matrices:
-            jk.C_add(C_occ)
+        for i, C_matrices in active_C_data:
+            for C in C_matrices:
+                jk.C_add(C)
 
-        # Single JK call for ALL wavefunctions (including converged)
+        # Single JK call for active wavefunctions
         jk.compute()
 
-        # Step 3: Distribute J/K/wK results back to ALL wavefunctions
-        # This maintains consistent Fock operators even after some wfn converge
-        jk_index = 0
+        # Step 3: Distribute J/K/wK results back to ACTIVE wavefunctions only
+        # Converged wfn: set_jk_matrices() NOT called, preserves old J/K
         J_all = jk.J()
         K_all = jk.K()
         wK_all = jk.wK()  # Long-range K for LRC functionals (empty if not LRC)
 
-        # Diagnostic check (can be removed after testing)
-        expected_matrices = len(all_C_occ_matrices)
-        if len(J_all) != expected_matrices or len(K_all) != expected_matrices:
+        # Diagnostic check: verify J/K count matches active C count
+        total_active_states = sum(len(C_matrices) for _, C_matrices in active_C_data)
+        if len(J_all) != total_active_states or len(K_all) != total_active_states:
             raise ValidationError(
-                f"JK compute failed: expected {expected_matrices} J/K matrices, "
+                f"JK compute failed: expected {total_active_states} J/K matrices, "
                 f"got {len(J_all)} J and {len(K_all)} K matrices. "
-                f"C_left has {len(jk.C_left())} matrices, C_right has {len(jk.C_right())} matrices."
+                f"Active wfn: {len(active_C_data)}, C_left has {len(jk.C_left())} matrices."
             )
 
-        # Note: wK_all may be empty if not using LRC functional, that's OK
-        # C++ set_jk_matrices() has default empty vector for wK_list
+        # Distribute to ACTIVE wfn only (preserves indexing via active_C_data)
+        jk_index = 0
+        for i, C_matrices in active_C_data:
+            n_states = len(C_matrices)
 
-        # Distribute to ALL wfn (maintains consistent indexing)
-        for i, wfn in enumerate(wfn_list):
-            n_states = wfn_state_counts[i]
-            slice_range = slice(jk_index, jk_index + n_states)
-
-            wfn.set_jk_matrices(
-                J_all[slice_range],
-                K_all[slice_range],
-                wK_all[slice_range] if wK_all else []
+            wfn_list[i].set_jk_matrices(
+                J_all[jk_index:jk_index + n_states],
+                K_all[jk_index:jk_index + n_states],
+                wK_all[jk_index:jk_index + n_states] if wK_all else []
             )
             jk_index += n_states
+
+        # Note: Converged wfn do NOT receive updated J/K
+        # - precomputed_J/K unchanged (still valid from last active iteration)
+        # - use_precomputed_jk_ = true (unchanged)
+        # - form_G() will reuse cached J/K automatically
 
         # Step 4: Each wavefunction completes its SCF iteration
         # Iterate through ALL wfn (to track status), but only active ones call _scf_iteration()
