@@ -63,12 +63,23 @@ protected:
 
     std::shared_ptr<BasisSet> primary_;
 
-    SharedMatrix Ca_;
-    SharedMatrix Cb_;
+    // === Phase B: Multi-wfn Architecture (lists-only, like JK) === //
+    // Design Philosophy:
+    // - JKGrad works with lists ONLY (following JK::C_left_ pattern)
+    // - Single-wfn mode = list of size 1
+    // - No batch_mode_ flag needed - always iterate over list
+    // - Legacy set_Da() API provided as wrappers (clear + push_back)
 
-    SharedMatrix Da_;
-    SharedMatrix Db_;
-    SharedMatrix Dt_;
+    /// Alpha orbital matrices for each wavefunction
+    std::vector<SharedMatrix> Ca_list_;
+    /// Beta orbital matrices for each wavefunction
+    std::vector<SharedMatrix> Cb_list_;
+    /// Alpha density matrices for each wavefunction
+    std::vector<SharedMatrix> Da_list_;
+    /// Beta density matrices for each wavefunction
+    std::vector<SharedMatrix> Db_list_;
+    /// Total density matrices (Da + Db) for each wavefunction
+    std::vector<SharedMatrix> Dt_list_;
 
     bool do_J_;
     bool do_K_;
@@ -76,7 +87,14 @@ protected:
 
     double omega_;
 
+    /// Gradient results for each wavefunction: gradients_list_[wfn_idx]["J"], ["K"], ["Total"]
+    /// This is the primary output - contains gradients for ALL wavefunctions
+    std::vector<std::map<std::string, SharedMatrix>> gradients_list_;
+
+    /// Legacy single-wfn output (for backward compatibility)
+    /// This is populated by gradients() getter as a copy of gradients_list_[0]
     std::map<std::string, SharedMatrix> gradients_;
+
     std::map<std::string, SharedMatrix> hessians_;
 
     void common_init();
@@ -93,11 +111,56 @@ public:
     */
     static std::shared_ptr<JKGrad> build_JKGrad(int deriv, std::shared_ptr<MintsHelper> mints);
 
-    void set_Ca(SharedMatrix Ca) { Ca_ = Ca; }
-    void set_Cb(SharedMatrix Cb) { Cb_ = Cb; }
-    void set_Da(SharedMatrix Da) { Da_ = Da; }
-    void set_Db(SharedMatrix Db) { Db_ = Db; }
-    void set_Dt(SharedMatrix Dt) { Dt_ = Dt; }
+    // === Legacy Single-Wfn API (wrappers for backward compatibility) === //
+    // Design: These wrappers clear the list and add single matrix (list of size 1)
+    // This allows existing code like jk_grad->set_Da(Da) to continue working
+
+    /// Legacy: Set single Ca (internally stored as list of size 1)
+    void set_Ca(SharedMatrix Ca) {
+        Ca_list_.clear();
+        Ca_list_.push_back(Ca);
+    }
+
+    /// Legacy: Set single Cb
+    void set_Cb(SharedMatrix Cb) {
+        Cb_list_.clear();
+        Cb_list_.push_back(Cb);
+    }
+
+    /// Legacy: Set single Da
+    void set_Da(SharedMatrix Da) {
+        Da_list_.clear();
+        Da_list_.push_back(Da);
+    }
+
+    /// Legacy: Set single Db
+    void set_Db(SharedMatrix Db) {
+        Db_list_.clear();
+        Db_list_.push_back(Db);
+    }
+
+    /// Legacy: Set single Dt
+    void set_Dt(SharedMatrix Dt) {
+        Dt_list_.clear();
+        Dt_list_.push_back(Dt);
+    }
+
+    // === Modern List-Based API (like JK::C_left()) === //
+
+    /// Direct access to Ca list (for multi-wfn usage)
+    std::vector<SharedMatrix>& Ca_list() { return Ca_list_; }
+
+    /// Direct access to Cb list
+    std::vector<SharedMatrix>& Cb_list() { return Cb_list_; }
+
+    /// Direct access to Da list
+    std::vector<SharedMatrix>& Da_list() { return Da_list_; }
+
+    /// Direct access to Db list
+    std::vector<SharedMatrix>& Db_list() { return Db_list_; }
+
+    /// Direct access to Dt list
+    std::vector<SharedMatrix>& Dt_list() { return Dt_list_; }
 
     /**
      * Cutoff for individual contributions to the J/K matrices
@@ -153,7 +216,25 @@ public:
     */
     void set_omega(double omega) { omega_ = omega; }
 
-    std::map<std::string, SharedMatrix>& gradients() { return gradients_; }
+    // === Gradient Results Accessors === //
+
+    /// Modern: Get gradients for all wavefunctions (primary interface)
+    /// Returns: gradients_list_[wfn_idx]["J"], ["K"], ["Total"]
+    const std::vector<std::map<std::string, SharedMatrix>>& gradients_list() const {
+        return gradients_list_;
+    }
+
+    /// Legacy: Get gradient for first wavefunction only (backward compatibility)
+    /// This copies gradients_list_[0] into gradients_ and returns it
+    /// For multi-wfn usage, prefer gradients_list() instead
+    std::map<std::string, SharedMatrix>& gradients() {
+        if (gradients_list_.empty()) {
+            throw PSIEXCEPTION("JKGrad::gradients(): No gradients computed. Call compute_gradient() first.");
+        }
+        gradients_ = gradients_list_[0];  // Copy first wfn gradients
+        return gradients_;
+    }
+
     std::map<std::string, SharedMatrix>& hessians() { return hessians_; }
 
     virtual void compute_gradient() = 0;

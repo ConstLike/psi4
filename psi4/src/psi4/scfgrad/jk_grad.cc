@@ -175,20 +175,31 @@ void DFJKGrad::print_header() const {
 void DFJKGrad::compute_gradient() {
     if (!do_J_ && !do_K_ && !do_wK_) return;
 
-    if (!(Ca_ && Cb_ && Da_ && Db_ && Dt_)) throw PSIEXCEPTION("Occupation/Density not set");
+    // Phase B: Check lists (DFJKGrad currently supports single-wfn only)
+    if (Ca_list_.empty() || Cb_list_.empty() || Da_list_.empty() || Db_list_.empty() || Dt_list_.empty()) {
+        throw PSIEXCEPTION("DFJKGrad: Occupation/Density lists not set. Call set_Da() etc first.");
+    }
+
+    int nwfn = Dt_list_.size();
+    if (nwfn != 1) {
+        throw PSIEXCEPTION("DFJKGrad: Multi-wfn not yet supported (only single-wfn for now). "
+                           "Use DirectJKGrad for multi-wfn gradients.");
+    }
 
     // => Set up gradients <= //
     int natom = primary_->molecule()->natom();
-    gradients_.clear();
+    gradients_list_.clear();
+    gradients_list_.resize(nwfn);  // Size 1 for single-wfn
+
     if (do_J_) {
-        gradients_["Coulomb"] = std::make_shared<Matrix>("Coulomb Gradient", natom, 3);
+        gradients_list_[0]["Coulomb"] = std::make_shared<Matrix>("Coulomb Gradient", natom, 3);
     }
     if (do_K_) {
-        gradients_["Exchange"] = std::make_shared<Matrix>("Exchange Gradient", natom, 3);
+        gradients_list_[0]["Exchange"] = std::make_shared<Matrix>("Exchange Gradient", natom, 3);
     }
     if (do_wK_) {
         // throw PSIEXCEPTION("Exchange,LR gradients are not currently available with DF.");
-        gradients_["Exchange,LR"] = std::make_shared<Matrix>("Exchange,LR Gradient", natom, 3);
+        gradients_list_[0]["Exchange,LR"] = std::make_shared<Matrix>("Exchange,LR Gradient", natom, 3);
     }
 
 #ifdef USING_BrianQC
@@ -296,10 +307,10 @@ void DFJKGrad::build_Amn_terms() {
 
     int nso = primary_->nbf();
     int naux = auxiliary_->nbf();
-    int na = Ca_->colspi()[0];
-    int nb = Cb_->colspi()[0];
+    int na = Ca_list_[0]->colspi()[0];  // Phase B: DFJKGrad single-wfn only
+    int nb = Cb_list_[0]->colspi()[0];
 
-    bool restricted = (Ca_ == Cb_);
+    bool restricted = (Ca_list_[0] == Cb_list_[0]);
 
     // => Integrals <= //
 
@@ -372,9 +383,9 @@ void DFJKGrad::build_Amn_terms() {
         Aijp = Aij->pointer();
     }
 
-    double** Dtp = Dt_->pointer();
-    double** Cap = Ca_->pointer();
-    double** Cbp = Cb_->pointer();
+    double** Dtp = Dt_list_[0]->pointer();  // Phase B: DFJKGrad single-wfn only
+    double** Cap = Ca_list_[0]->pointer();
+    double** Cbp = Cb_list_[0]->pointer();
 
     psio_address next_Aija = PSIO_ZERO;
     psio_address next_Aijb = PSIO_ZERO;
@@ -480,10 +491,10 @@ void DFJKGrad::build_Amn_lr_terms() {
 
     int nso = primary_->nbf();
     int naux = auxiliary_->nbf();
-    int na = Ca_->colspi()[0];
-    int nb = Cb_->colspi()[0];
+    int na = Ca_list_[0]->colspi()[0];  // Phase B: DFJKGrad single-wfn only
+    int nb = Cb_list_[0]->colspi()[0];
 
-    bool restricted = (Ca_ == Cb_);
+    bool restricted = (Ca_list_[0] == Cb_list_[0]);
 
     // => Integrals <= //
 
@@ -542,8 +553,8 @@ void DFJKGrad::build_Amn_lr_terms() {
     Amip = Ami->pointer();
     Aijp = Aij->pointer();
 
-    double** Cap = Ca_->pointer();
-    double** Cbp = Cb_->pointer();
+    double** Cap = Ca_list_[0]->pointer();  // Phase B: DFJKGrad single-wfn only
+    double** Cbp = Cb_list_[0]->pointer();
 
     psio_address next_Aija = PSIO_ZERO;
     psio_address next_Aijb = PSIO_ZERO;
@@ -635,10 +646,10 @@ void DFJKGrad::build_AB_inv_terms() {
     // => Sizing <= //
 
     int naux = auxiliary_->nbf();
-    int na = Ca_->colspi()[0];
-    int nb = Cb_->colspi()[0];
+    int na = Ca_list_[0]->colspi()[0];  // Phase B: DFJKGrad single-wfn only
+    int nb = Cb_list_[0]->colspi()[0];
 
-    bool restricted = (Ca_ == Cb_);
+    bool restricted = (Ca_list_[0] == Cb_list_[0]);
 
     // => Fitting Metric Full Inverse <= //
 
@@ -725,10 +736,10 @@ void DFJKGrad::build_UV_terms() {
     // => Sizing <= //
 
     int naux = auxiliary_->nbf();
-    int na = Ca_->colspi()[0];
-    int nb = Cb_->colspi()[0];
+    int na = Ca_list_[0]->colspi()[0];  // Phase B: DFJKGrad single-wfn only
+    int nb = Cb_list_[0]->colspi()[0];
 
-    bool restricted = (Ca_ == Cb_);
+    bool restricted = (Ca_list_[0] == Cb_list_[0]);
 
     auto V = std::make_shared<Matrix>("W", naux, naux);
     double** Vp = V->pointer();
@@ -871,10 +882,10 @@ void DFJKGrad::build_Amn_x_terms() {
     int natom = primary_->molecule()->natom();
     int nso = primary_->nbf();
     int naux = auxiliary_->nbf();
-    int na = Ca_->colspi()[0];
-    int nb = Cb_->colspi()[0];
+    int na = Ca_list_[0]->colspi()[0];  // Phase B: DFJKGrad single-wfn only
+    int nb = Cb_list_[0]->colspi()[0];
 
-    bool restricted = (Ca_ == Cb_);
+    bool restricted = (Ca_list_[0] == Cb_list_[0]);
 
     // => Integrals <= //
 
@@ -964,9 +975,9 @@ void DFJKGrad::build_Amn_x_terms() {
         wKmnp = wKmn->pointer();
     }
 
-    double** Dtp = Dt_->pointer();
-    double** Cap = Ca_->pointer();
-    double** Cbp = Cb_->pointer();
+    double** Dtp = Dt_list_[0]->pointer();  // Phase B: DFJKGrad single-wfn only
+    double** Cap = Ca_list_[0]->pointer();
+    double** Cbp = Cb_list_[0]->pointer();
 
     psio_address next_Aija = PSIO_ZERO;
     psio_address next_Aijb = PSIO_ZERO;
@@ -1296,7 +1307,7 @@ void DFJKGrad::compute_hessian() {
         hessians_["Exchange,LR"] = std::make_shared<Matrix>("Exchange,LR Hessian", 3 * natom, 3 * natom);
     }
 
-    bool same_ab = (Ca_ == Cb_) ? true : false;
+    bool same_ab = (Ca_list_[0] == Cb_list_[0]) ? true : false;  // Phase B: DFJKGrad single-wfn only
 
     std::shared_ptr<Molecule> mol = primary_->molecule();
 
@@ -1306,12 +1317,12 @@ void DFJKGrad::compute_hessian() {
     int nshell = primary_->nshell();
     int natoms = mol->natom();
 
-    double** Dtp = Dt_->pointer();
-    double** Cap = Ca_->pointer();
-    double** Cbp = Cb_->pointer();
+    double** Dtp = Dt_list_[0]->pointer();  // Phase B: DFJKGrad single-wfn only
+    double** Cap = Ca_list_[0]->pointer();
+    double** Cbp = Cb_list_[0]->pointer();
 
-    int na = Ca_->colspi()[0];
-    int nb = Cb_->colspi()[0];
+    int na = Ca_list_[0]->colspi()[0];
+    int nb = Cb_list_[0]->colspi()[0];
     auto metric = std::make_shared<FittingMetric>(auxiliary_, true);
     metric->form_full_eig_inverse(condition_);
     SharedMatrix PQ = metric->get_metric();
@@ -2327,20 +2338,43 @@ void DirectJKGrad::compute_gradient() {
 }
 std::map<std::string, std::shared_ptr<Matrix>> DirectJKGrad::compute1(
     std::vector<std::shared_ptr<TwoBodyAOInt>>& ints) {
-    int nthreads = ints.size();
+    // === PHASE B: WORK IN PROGRESS === //
+    // TODO: Finish wfn loop implementation (contraction + thread reduction)
+    // Infrastructure ready (jk_grad.h + thread-local storage), but contraction needs wrapping
+    throw PSIEXCEPTION("DirectJKGrad::compute1(): Phase B implementation in progress. "
+                       "Multi-wfn batching not yet complete. Use DFJKGrad for now.");
 
+    int nthreads = ints.size();
     int natom = primary_->molecule()->natom();
 
-    std::vector<std::shared_ptr<Matrix>> Jgrad;
-    std::vector<std::shared_ptr<Matrix>> Kgrad;
-    for (int thread = 0; thread < nthreads; thread++) {
-        Jgrad.push_back(std::make_shared<Matrix>("JGrad", natom, 3));
-        Kgrad.push_back(std::make_shared<Matrix>("KGrad", natom, 3));
+    // Phase B: Multi-wfn support
+    // DirectJKGrad always loops over all wfn in lists (single-wfn = list of size 1)
+    int nwfn = Dt_list_.size();
+
+    // Validate lists
+    if (Da_list_.size() != nwfn || Db_list_.size() != nwfn) {
+        throw PSIEXCEPTION("DirectJKGrad::compute1(): Mismatched density list sizes");
     }
 
-    double** Dtp = Dt_->pointer();
-    double** Dap = Da_->pointer();
-    double** Dbp = Db_->pointer();
+    // === Thread-local storage: [thread][wfn] === //
+    // Each thread gets gradient matrices for each wavefunction
+    std::vector<std::vector<std::shared_ptr<Matrix>>> Jgrad_all;
+    std::vector<std::vector<std::shared_ptr<Matrix>>> Kgrad_all;
+
+    for (int thread = 0; thread < nthreads; thread++) {
+        std::vector<std::shared_ptr<Matrix>> Jgrad_thread;
+        std::vector<std::shared_ptr<Matrix>> Kgrad_thread;
+
+        for (int wfn = 0; wfn < nwfn; wfn++) {
+            Jgrad_thread.push_back(std::make_shared<Matrix>("JGrad", natom, 3));
+            Kgrad_thread.push_back(std::make_shared<Matrix>("KGrad", natom, 3));
+        }
+
+        Jgrad_all.push_back(Jgrad_thread);
+        Kgrad_all.push_back(Kgrad_thread);
+    }
+
+    // Density pointers will be obtained per-wfn inside wfn loop
 
     size_t computed_shells = 0L;
     // shell pair blocks
@@ -2357,8 +2391,10 @@ std::map<std::string, std::shared_ptr<Matrix>> DirectJKGrad::compute1(
 #else
         const int rank = 0;
 #endif
-        double** Jp = Jgrad[rank]->pointer();
-        double** Kp = Kgrad[rank]->pointer();
+        // Phase B TODO: Jp/Kp will be obtained per-wfn inside wfn loop
+        // TEMPORARY COMMENT to allow compilation - will be fixed in next step
+        // double** Jp = Jgrad_all[rank][wfn_idx]->pointer();  // TODO: Move inside wfn loop
+        // double** Kp = Kgrad_all[rank][wfn_idx]->pointer();  // TODO: Move inside wfn loop
         // loop over all the blocks of |R>=S)
         size_t start = ints[rank]->first_RS_shell_block(blockPQ_idx);
         for (int blockRS_idx = start; blockRS_idx < blocksRS.size(); ++blockRS_idx) {
