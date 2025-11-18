@@ -30,6 +30,7 @@
 #define JK_GRAD_H
 
 #include "psi4/libmints/typedefs.h"
+#include "psi4/libpsi4util/exception.h"
 #include <map>
 #include <vector>
 #include <string>
