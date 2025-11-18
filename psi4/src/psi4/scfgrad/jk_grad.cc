@@ -2522,16 +2522,12 @@ void DirectJKGrad::print_header() const {
 void DirectJKGrad::compute_gradient() {
     if (!do_J_ && !do_K_ && !do_wK_) return;
 
-    // Phase B: Validate lists (DirectJKGrad supports single-wfn for now, multi-wfn via compute1)
+    // Validate lists
     if (Ca_list_.empty() || Cb_list_.empty() || Da_list_.empty() || Db_list_.empty() || Dt_list_.empty()) {
         throw PSIEXCEPTION("DirectJKGrad: Occupation/Density lists not set. Call set_Da() etc first.");
     }
 
     int nwfn = Dt_list_.size();
-    if (nwfn != 1) {
-        throw PSIEXCEPTION("DirectJKGrad::compute_gradient(): Only single-wfn supported via this path. "
-                           "Multi-wfn batching happens inside compute1().");
-    }
 
 #ifdef USING_BrianQC
     if (brianEnable) {
@@ -2591,45 +2587,39 @@ void DirectJKGrad::compute_gradient() {
 #endif
 
     // => Set up gradients <= //
-    int natom = primary_->molecule()->natom();
+    // FIX-3: gradients_list_ will be populated by compute1() for ALL wavefunctions
     gradients_list_.clear();
-    gradients_list_.resize(nwfn);  // Size 1 for single-wfn
-
-    if (do_J_) {
-        gradients_list_[0]["Coulomb"] = std::make_shared<Matrix>("Coulomb Gradient", natom, 3);
-    }
-    if (do_K_) {
-        gradients_list_[0]["Exchange"] = std::make_shared<Matrix>("Exchange Gradient", natom, 3);
-    }
-    if (do_wK_) {
-        gradients_list_[0]["Exchange,LR"] = std::make_shared<Matrix>("Exchange,LR Gradient", natom, 3);
-    }
+    gradients_list_.resize(nwfn);
 
     auto factory = std::make_shared<IntegralFactory>(primary_, primary_, primary_, primary_);
 
+    // Compute J and K gradients (if needed)
     if (do_J_ || do_K_) {
         std::vector<std::shared_ptr<TwoBodyAOInt>> ints;
         for (int thread = 0; thread < ints_num_threads_; thread++) {
             ints.push_back(std::shared_ptr<TwoBodyAOInt>(factory->eri(1)));
         }
-        std::map<std::string, std::shared_ptr<Matrix>> vals = compute1(ints);
-        if (do_J_) {
-            gradients_list_[0]["Coulomb"]->copy(vals["J"]);  // Phase B: Use gradients_list_
-            // gradients_list_[0]["Coulomb"]->print();
-        }
-        if (do_K_) {
-            gradients_list_[0]["Exchange"]->copy(vals["K"]);  // Phase B: Use gradients_list_
-            // gradients_list_[0]["Exchange"]->print();
-        }
+        // FIX-3: compute1() now saves results to gradients_list_[*]["Coulomb"/"Exchange"]
+        compute1(ints);
     }
+
+    // Compute wK (long-range) gradients (if needed)
     if (do_wK_) {
         std::vector<std::shared_ptr<TwoBodyAOInt>> ints;
         for (int thread = 0; thread < ints_num_threads_; thread++) {
             ints.push_back(std::shared_ptr<TwoBodyAOInt>(factory->erf_eri(omega_, 1)));
         }
+        // FIX-3: compute1() saves results to gradients_list_[*]["Exchange,LR"]
+        // Note: compute1() stores in "Coulomb"/"Exchange", so we need to rename
         std::map<std::string, std::shared_ptr<Matrix>> vals = compute1(ints);
-        gradients_list_[0]["Exchange,LR"]->copy(vals["K"]);  // Phase B: Use gradients_list_
-        // gradients_list_[0]["Exchange,LR"]->print();
+
+        // Copy wK results to Exchange,LR for all wfn
+        for (int w = 0; w < nwfn; w++) {
+            if (gradients_list_[w].count("Exchange") > 0) {
+                gradients_list_[w]["Exchange,LR"] = gradients_list_[w]["Exchange"];
+                gradients_list_[w].erase("Exchange");
+            }
+        }
     }
 }
 std::map<std::string, std::shared_ptr<Matrix>> DirectJKGrad::compute1(
@@ -2927,8 +2917,18 @@ std::map<std::string, std::shared_ptr<Matrix>> DirectJKGrad::compute1(
         Kgrad_all[0][wfn_idx]->scale(0.5);
     }
 
-    // Legacy return format: return first wfn gradients
-    // (For multi-wfn usage, caller should access gradients_list_ directly)
+    // FIX-2: Store results in gradients_list_ for ALL wavefunctions
+    // This enables multi-wfn gradient batching
+    if (gradients_list_.size() != static_cast<size_t>(nwfn)) {
+        gradients_list_.resize(nwfn);
+    }
+
+    for (int wfn_idx = 0; wfn_idx < nwfn; wfn_idx++) {
+        gradients_list_[wfn_idx]["Coulomb"] = Jgrad_all[0][wfn_idx];
+        gradients_list_[wfn_idx]["Exchange"] = Kgrad_all[0][wfn_idx];
+    }
+
+    // Legacy return format: return first wfn gradients for backward compatibility
     std::map<std::string, std::shared_ptr<Matrix>> val;
     val["J"] = Jgrad_all[0][0];  // First wfn
     val["K"] = Kgrad_all[0][0];  // First wfn

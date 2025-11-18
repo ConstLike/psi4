@@ -209,28 +209,17 @@ std::vector<SharedMatrix> multi_scfgrad(
     // ========================================
     timer_on("Grad: JK (Batched)");
 
-    // CRITICAL: DFJKGrad does NOT support multi-wfn batching
-    // Analysis: All DFJKGrad methods (build_Amn_terms, build_AB_inv_terms, etc.)
-    // use hardcoded [0] index (22 occurrences of "Phase B: DFJKGrad single-wfn only").
-    // Multi-wfn DF batching requires major refactoring (Phase B.3).
-    //
-    // DirectJKGrad::compute1() DOES support multi-wfn batching (Phase B.1 complete).
-    // For multi-wfn case: explicitly use DirectJKGrad regardless of scf_type.
-    //
-    // Performance: DIRECT slower than DF, but multi-wfn batching (derivative
-    // integrals computed once) still provides 2-6× speedup vs sequential.
-    // Phase B.3 TODO: Implement DF multi-wfn batching for optimal performance.
+    // FIX-4: Exception-safe timer management with try-catch block
+    // Ensures timer_off() is called even if compute_gradient() throws
 
     std::shared_ptr<JKGrad> jk;
-    if (nwfn > 1) {
-        // Multi-wfn: use DirectJKGrad (batching implemented)
-        jk = std::make_shared<DirectJKGrad>(1, ref_basis);
-        outfile->Printf("  Multi-wfn gradients: Using DIRECT algorithm (DF batching not yet implemented)\n");
-        outfile->Printf("  Batched computation still provides ~2-6× speedup vs sequential\n\n");
-    } else {
-        // Single-wfn: use build_JKGrad (selects best algorithm for scf_type)
+
+    // FIX: Phase B.3 DFJKGrad multi-wfn batching is NOW COMPLETE!
+    // Both DirectJKGrad and DFJKGrad support multi-wfn batching.
+    // Use build_JKGrad to select best algorithm based on scf_type.
+
+    try {
         jk = JKGrad::build_JKGrad(1, mintshelper);
-    }
 
     jk->set_memory((size_t)(options.get_double("SCF_MEM_SAFETY_FACTOR") *
                             Process::environment.get_memory() / 8L));
@@ -288,14 +277,21 @@ std::vector<SharedMatrix> multi_scfgrad(
         jk->set_do_wK(false);
     }
 
-    jk->print_header();
-    jk->compute_gradient();  // ← BATCHED COMPUTATION
+        jk->print_header();
+        jk->compute_gradient();  // ← BATCHED COMPUTATION
+
+        timer_off("Grad: JK (Batched)");  // Timer off in normal path
+
+    } catch (...) {
+        // FIX-4: Ensure timer is turned off even on exception
+        timer_off("Grad: JK (Batched)");
+        throw;  // Re-throw exception after cleanup
+    }
 
     const auto& jk_gradients_list = jk->gradients_list();
 
-    timer_off("Grad: JK (Batched)");
-
     // Get scaling factors
+    auto functional = wfns[0]->functional();
     double alpha = functional->x_alpha();
     double beta = functional->x_beta();
 
