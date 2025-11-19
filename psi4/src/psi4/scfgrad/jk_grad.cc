@@ -200,12 +200,15 @@ void DFJKGrad::compute_gradient() {
     for (int w = 0; w < nwfn; w++) {
         if (do_J_) {
             gradients_list_[w]["Coulomb"] = std::make_shared<Matrix>("Coulomb Gradient", natom, 3);
+            gradients_list_[w]["Coulomb"]->zero();
         }
         if (do_K_) {
             gradients_list_[w]["Exchange"] = std::make_shared<Matrix>("Exchange Gradient", natom, 3);
+            gradients_list_[w]["Exchange"]->zero();
         }
         if (do_wK_) {
             gradients_list_[w]["Exchange,LR"] = std::make_shared<Matrix>("Exchange,LR Gradient", natom, 3);
+            gradients_list_[w]["Exchange,LR"]->zero();
         }
     }
 
