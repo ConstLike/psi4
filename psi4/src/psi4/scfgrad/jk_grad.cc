@@ -1128,6 +1128,7 @@ void DFJKGrad::build_Amn_x_terms() {
         for (int t = 0; t < df_ints_num_threads_; t++) {
             for (int w = 0; w < nwfn; w++) {
                 Jtemps[t].push_back(std::make_shared<Matrix>("Jtemp", natom, 3));
+                Jtemps[t][w]->zero();
             }
         }
     }
@@ -1135,6 +1136,7 @@ void DFJKGrad::build_Amn_x_terms() {
         for (int t = 0; t < df_ints_num_threads_; t++) {
             for (int w = 0; w < nwfn; w++) {
                 Ktemps[t].push_back(std::make_shared<Matrix>("Ktemp", natom, 3));
+                Ktemps[t][w]->zero();
             }
         }
     }
@@ -1142,6 +1144,7 @@ void DFJKGrad::build_Amn_x_terms() {
         for (int t = 0; t < df_ints_num_threads_; t++) {
             for (int w = 0; w < nwfn; w++) {
                 wKtemps[t].push_back(std::make_shared<Matrix>("wKtemp", natom, 3));
+                wKtemps[t][w]->zero();
             }
         }
     }
