@@ -478,6 +478,16 @@ void DFJKGrad::build_Amn_terms() {
             // Get per-wfn PSIO units
             auto [unit_a_w, unit_b_w, unit_c_w] = wfn_units_[w];
 
+            // Get or initialize per-wfn PSIO addresses (stored in static map)
+            static std::map<std::tuple<int, size_t>, psio_address> psio_addrs;
+            auto key_a = std::make_tuple(w, unit_a_w);
+            auto key_b = std::make_tuple(w, unit_b_w);
+
+            if (block == 0) {
+                psio_addrs[key_a] = PSIO_ZERO;
+                psio_addrs[key_b] = PSIO_ZERO;
+            }
+
             // > (A|mn) D_mn -> c_A < //
             if (do_J_) {
                 // Allocate c vector for this wfn (will accumulate across blocks)
@@ -509,16 +519,9 @@ void DFJKGrad::build_Amn_terms() {
                     C_DGEMM('T', 'N', na, na, nso, 1.0, Amip[p], na, Cap[0], na, 0.0, &Aijp[0][p * (size_t)na * na], na);
                 }
 
-                // CRITICAL FIX: Write each Q with absolute addressing to match read format
-                // build_AB_inv_terms reads with absolute addressing: Q * nmo_size2 + ij
-                // So we must write in the same format: each Q sequentially with all ij pairs
-                for (int p = 0; p < np; p++) {
-                    int Q = pstart + p;  // Global auxiliary function index
-                    psio_address addr = psio_get_address(PSIO_ZERO, sizeof(double) * Q * (size_t)na * na);
-                    psio_address next_addr = addr;
-                    psio_->write(unit_a_w, "(A|ij)", (char*)&Aijp[0][p * (size_t)na * na],
-                                sizeof(double) * na * na, addr, &next_addr);
-                }
+                // > Stripe < //
+                psio_->write(unit_a_w, "(A|ij)", (char*)Aijp[0], sizeof(double) * np * na * na,
+                            psio_addrs[key_a], &psio_addrs[key_a]);
             }
 
             // > Beta < //
@@ -534,14 +537,9 @@ void DFJKGrad::build_Amn_terms() {
                         C_DGEMM('T', 'N', nb, nb, nso, 1.0, Amip[p], nb, Cbp[0], nb, 0.0, &Aijp[0][p * (size_t)nb * nb], nb);
                     }
                 }
-                // CRITICAL FIX: Write each Q with absolute addressing
-                for (int p = 0; p < np; p++) {
-                    int Q = pstart + p;  // Global auxiliary function index
-                    psio_address addr = psio_get_address(PSIO_ZERO, sizeof(double) * Q * (size_t)nb * nb);
-                    psio_address next_addr = addr;
-                    psio_->write(unit_b_w, "(A|ij)", (char*)&Aijp[0][p * (size_t)nb * nb],
-                                sizeof(double) * nb * nb, addr, &next_addr);
-                }
+                // > Stripe < //
+                psio_->write(unit_b_w, "(A|ij)", (char*)Aijp[0], sizeof(double) * np * nb * nb,
+                            psio_addrs[key_b], &psio_addrs[key_b]);
             }
         }  // End multi-wfn loop
     }
@@ -685,6 +683,16 @@ void DFJKGrad::build_Amn_lr_terms() {
             // Get per-wfn PSIO units
             auto [unit_a_w, unit_b_w, unit_c_w] = wfn_units_[w];
 
+            // Get or initialize per-wfn PSIO addresses for LR terms (stored in static map)
+            static std::map<std::tuple<int, size_t>, psio_address> psio_addrs_lr;
+            auto key_a = std::make_tuple(w, unit_a_w);
+            auto key_b = std::make_tuple(w, unit_b_w);
+
+            if (block == 0) {
+                psio_addrs_lr[key_a] = PSIO_ZERO;
+                psio_addrs_lr[key_b] = PSIO_ZERO;
+            }
+
             // > Alpha < //
             // > (A|w|mn) C_ni -> (A|w|mi) < //
             C_DGEMM('N', 'N', np * (size_t)nso, na, nso, 1.0, Amnp[0], nso, Cap[0], na, 0.0, Amip[0], na);
@@ -695,14 +703,9 @@ void DFJKGrad::build_Amn_lr_terms() {
                 C_DGEMM('T', 'N', na, na, nso, 1.0, Amip[p], na, Cap[0], na, 0.0, &Aijp[0][p * (size_t)na * na], na);
             }
 
-            // CRITICAL FIX: Write each Q with absolute addressing to match read format
-            for (int p = 0; p < np; p++) {
-                int Q = pstart + p;  // Global auxiliary function index
-                psio_address addr = psio_get_address(PSIO_ZERO, sizeof(double) * Q * (size_t)na * na);
-                psio_address next_addr = addr;
-                psio_->write(unit_a_w, "(A|w|ij)", (char*)&Aijp[0][p * (size_t)na * na],
-                            sizeof(double) * na * na, addr, &next_addr);
-            }
+            // > Stripe < //
+            psio_->write(unit_a_w, "(A|w|ij)", (char*)Aijp[0], sizeof(double) * np * na * na,
+                        psio_addrs_lr[key_a], &psio_addrs_lr[key_a]);
 
             // > Beta < //
             if (!restricted) {
@@ -715,14 +718,9 @@ void DFJKGrad::build_Amn_lr_terms() {
                     C_DGEMM('T', 'N', nb, nb, nso, 1.0, Amip[p], nb, Cbp[0], nb, 0.0, &Aijp[0][p * (size_t)nb * nb], nb);
                 }
 
-                // CRITICAL FIX: Write each Q with absolute addressing
-                for (int p = 0; p < np; p++) {
-                    int Q = pstart + p;  // Global auxiliary function index
-                    psio_address addr = psio_get_address(PSIO_ZERO, sizeof(double) * Q * (size_t)nb * nb);
-                    psio_address next_addr = addr;
-                    psio_->write(unit_b_w, "(A|w|ij)", (char*)&Aijp[0][p * (size_t)nb * nb],
-                                sizeof(double) * nb * nb, addr, &next_addr);
-                }
+                // > Stripe < //
+                psio_->write(unit_b_w, "(A|w|ij)", (char*)Aijp[0], sizeof(double) * np * nb * nb,
+                            psio_addrs_lr[key_b], &psio_addrs_lr[key_b]);
             }
         }  // End multi-wfn loop
     }
@@ -806,26 +804,27 @@ void DFJKGrad::build_AB_inv_terms() {
                 size_t nmo_size = us.second;
                 size_t nmo_size2 = nmo_size * nmo_size;
 
-                psio_address next_Aija = PSIO_ZERO;
+                psio_address read_addr = PSIO_ZERO;
+                psio_address write_addr = PSIO_ZERO;
 
                 for (long int ij = 0L; ij < nmo_size2; ij += max_cols) {
                     int ncols = (ij + max_cols >= nmo_size2 ? nmo_size2 - ij : max_cols);
 
                     // > Read < //
+                    // Sequential read: data stored as [A[0,ij chunk]][A[1,ij chunk]]...
                     for (int Q = 0; Q < naux; Q++) {
-                        next_Aija = psio_get_address(PSIO_ZERO, sizeof(double) * (Q * (size_t)nmo_size2 + ij));
-                        psio_->read(unit_name, buff_name.c_str(), (char*)Aijp[Q], sizeof(double) * ncols, next_Aija,
-                                    &next_Aija);
+                        psio_->read(unit_name, buff_name.c_str(), (char*)Aijp[Q], sizeof(double) * ncols, read_addr,
+                                    &read_addr);
                     }
 
                     // > GEMM <//
                     C_DGEMM('N', 'N', naux, ncols, naux, 1.0, Jp[0], naux, Aijp[0], max_cols, 0.0, Bijp[0], max_cols);
 
                     // > Stripe < //
+                    // Sequential write back (in-place transformation)
                     for (int Q = 0; Q < naux; Q++) {
-                        next_Aija = psio_get_address(PSIO_ZERO, sizeof(double) * (Q * (size_t)nmo_size2 + ij));
-                        psio_->write(unit_name, buff_name.c_str(), (char*)Bijp[Q], sizeof(double) * ncols, next_Aija,
-                                     &next_Aija);
+                        psio_->write(unit_name, buff_name.c_str(), (char*)Bijp[Q], sizeof(double) * ncols, write_addr,
+                                     &write_addr);
                     }
                 }
             }
