@@ -216,9 +216,6 @@ SharedMatrix scfgrad(std::shared_ptr<scf::HF>, Options&);
 namespace scfgrad {
 SharedMatrix scfhess(std::shared_ptr<scf::HF>, Options&);
 }
-namespace scfgrad {
-std::vector<SharedMatrix> multi_scfgrad(const std::vector<std::shared_ptr<scf::HF>>&, Options&);
-}
 
 // Does not create a wavefunction
 // namespace fisapt { PsiReturnType fisapt(SharedWavefunction, Options&); }
@@ -329,11 +326,6 @@ SharedMatrix py_psi_scfgrad(std::shared_ptr<scf::HF> ref_wfn) {
 SharedMatrix py_psi_scfhess(std::shared_ptr<scf::HF> ref_wfn) {
     py_psi_prepare_options_for_module("SCF");
     return scfgrad::scfhess(ref_wfn, Process::environment.options);
-}
-
-std::vector<SharedMatrix> py_psi_multi_scfgrad(const std::vector<std::shared_ptr<scf::HF>>& wfns) {
-    py_psi_prepare_options_for_module("SCF");
-    return scfgrad::multi_scfgrad(wfns, Process::environment.options);
 }
 
 SharedWavefunction py_psi_occ(SharedWavefunction ref_wfn) {
@@ -1385,8 +1377,6 @@ PYBIND11_MODULE(core, core) {
     // modules
     core.def("scfgrad", py_psi_scfgrad, "ref_wfn"_a, "Run scfgrad, which is a specialized DF-SCF gradient program.");
     core.def("scfhess", py_psi_scfhess, "ref_wfn"_a, "Run scfhess, which is a specialized DF-SCF hessian program.");
-    core.def("multi_scfgrad", py_psi_multi_scfgrad, "wfns"_a,
-             "Run multi_scfgrad: batched SCF gradient for multiple wavefunctions.");
     core.def("dct", py_psi_dct, "ref_wfn"_a, "Runs the density cumulant (functional) theory code.");
     core.def("dfmp2", py_psi_dfmp2, "ref_wfn"_a, "Runs the DF-MP2 code.");
     core.def("dlpno", py_psi_dlpno, "Runs the DLPNO codes.");
