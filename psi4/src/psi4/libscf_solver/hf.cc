@@ -429,7 +429,6 @@ std::string HF::get_orbitals_filename(const std::string& base) const {
     }
 
     // Insert wfn_name before file extension
-    // Pre-allocate to avoid reallocations (HPC optimization)
     std::string result;
     result.reserve(base.size() + wfn_name_.size() + 1);
 

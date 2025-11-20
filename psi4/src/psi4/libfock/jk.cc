@@ -360,16 +360,13 @@ void JK::allocate_JK() {
     }
 
     if (!same) {
-        // Pre-allocate vectors with exact capacity to avoid reallocation overhead
-        // Modern C++11+ best practice: reserve() before loop when size is known
         const size_t n_matrices = D_.size();
 
         J_.clear();
         K_.clear();
         wK_.clear();
 
-        // Reserve capacity based on enabled matrices (do_J_, do_K_, do_wK_ flags)
-        // Prevents vector reallocation during push_back operations
+        // Reserve capacity based on enabled matrices
         if (do_J_) J_.reserve(n_matrices);
         if (do_K_) K_.reserve(n_matrices);
         if (do_wK_) wK_.reserve(n_matrices);
@@ -409,7 +406,6 @@ void JK::USO2AO() {
     }
 
     if (J_ao_.size() != D_.size()) {
-        // Pre-allocate vectors with exact capacity (HPC optimization)
         const size_t n_matrices = D_.size();
         const int nao = AO2USO_->rowspi()[0];
 
@@ -447,7 +443,6 @@ void JK::USO2AO() {
     }
 
     // Always reallocate C matrices, the occupations are tricky
-    // Pre-allocate with known size for better memory locality
     const size_t n_matrices = D_.size();
 
     C_left_ao_.clear();

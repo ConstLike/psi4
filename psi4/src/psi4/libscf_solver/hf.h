@@ -241,9 +241,8 @@ class HF : public Wavefunction {
     /** Performs any operations required for a incoming guess **/
     virtual void format_guess();
 
-    // ==== Orbital matrix caching for multi_scf() performance (Phase 1.8) ====
+    // Orbital matrix caching for multi_scf()
     // Cache for get_orbital_matrices() to avoid repeated deep copies of orbital matrices
-    // Typical savings: 40-60% speedup for converged wavefunctions in multi_scf
     //
     // Implementation details:
     //   - RHF: 1 matrix (Ca_occ)
@@ -378,9 +377,7 @@ class HF : public Wavefunction {
     /// ROHF: returns {Cdocc, Csocc}
     /// SA-REKS: returns {C_state0_occ, C_state1_occ, ..., C_stateN_occ}
     ///
-    /// PERFORMANCE OPTIMIZATION (Phase 1.8):
     /// Implements mutable cache to avoid repeated deep copies of orbital matrices
-    /// Typical benefit: 40-60% speedup for converged wavefunctions in multi_scf
     /// Cache invalidated by: form_C(), SOSCF, MOM, FRAC
     virtual std::vector<SharedMatrix> get_orbital_matrices() const {
         // Fast path: return cached matrices if valid (typical for converged wfn)

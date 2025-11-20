@@ -489,7 +489,7 @@ def run_test(molecule_name, reference, method, db, extra_options=None):
     try:
         # Clean previous calculation and options
         psi4.core.clean()
-        psi4.core.clean_options()  # ← CRITICAL: Clear options from previous test
+        psi4.core.clean_options()  # Clear options from previous test to ensure isolation
 
         # Set psi4 output to log file
         psi4.core.set_output_file(log_path, False)

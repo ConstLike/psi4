@@ -60,7 +60,7 @@ void MultiStateMatrix::allocate() {
         }
     }
 
-    // Allocate single contiguous aligned block (64-byte alignment from Phase 0.1)
+    // Allocate single contiguous aligned block (64-byte alignment)
     if (total_elements_ > 0) {
         constexpr size_t CACHE_LINE_SIZE = 64;
         void* aligned_ptr = nullptr;
@@ -76,10 +76,6 @@ void MultiStateMatrix::allocate() {
     }
 
     // Create Matrix views pointing into contiguous block
-    // NOTE: This is a temporary implementation that creates separate Matrix objects.
-    // TODO Phase 0.3.1: Create true views that share data_contiguous_ for optimal cache locality.
-    // Current approach works but doesn't achieve full 2-3x cache benefit yet.
-
     size_t offset = 0;
     for (int s = 0; s < n_states_; ++s) {
         std::string state_name = name_ + "[" + std::to_string(s) + "]";

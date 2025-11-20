@@ -27,8 +27,7 @@ namespace psi {
 /**
  * MultiStateMatrix: Contiguous storage for N Matrix objects
  *
- * Key optimization: All N matrices stored in a SINGLE aligned memory allocation
- * for optimal cache locality (2-3x speedup vs separate allocations).
+ * All N matrices stored in a single aligned memory allocation.
  *
  * Use cases:
  * - RHF: n_states=1 (single density/Fock)
@@ -37,7 +36,7 @@ namespace psi {
  *
  * Memory layout:
  *   [State0_h0][State0_h1]...[State1_h0][State1_h1]...
- *   All contiguous → excellent cache locality!
+ *   All data stored contiguously in memory.
  */
 class PSI_API MultiStateMatrix {
    protected:

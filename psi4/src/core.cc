@@ -1386,7 +1386,7 @@ PYBIND11_MODULE(core, core) {
     core.def("scfgrad", py_psi_scfgrad, "ref_wfn"_a, "Run scfgrad, which is a specialized DF-SCF gradient program.");
     core.def("scfhess", py_psi_scfhess, "ref_wfn"_a, "Run scfhess, which is a specialized DF-SCF hessian program.");
     core.def("multi_scfgrad", py_psi_multi_scfgrad, "wfns"_a,
-             "Run multi_scfgrad: batched SCF gradient for multiple wavefunctions (~2-6× speedup).");
+             "Run multi_scfgrad: batched SCF gradient for multiple wavefunctions.");
     core.def("dct", py_psi_dct, "ref_wfn"_a, "Runs the density cumulant (functional) theory code.");
     core.def("dfmp2", py_psi_dfmp2, "ref_wfn"_a, "Runs the DF-MP2 code.");
     core.def("dlpno", py_psi_dlpno, "Runs the DLPNO codes.");

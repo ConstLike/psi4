@@ -162,7 +162,7 @@ void HF::frac_renormalize() {
     Ca_ = unscaled_Ca_;
     Cb_ = unscaled_Cb_;
 
-    // Phase 1.8: Invalidate orbital cache after orbital restoration
+    // Invalidate orbital cache after orbital restoration
     orbital_cache_valid_ = false;
 }
 
@@ -211,7 +211,7 @@ void HF::frac_helper() {
         C_DSCAL(nso, std::sqrt(val), &Cp[0][j], nmo);
     }
 
-    // Phase 1.8: Invalidate orbital cache after in-place orbital scaling
+    // Invalidate orbital cache after in-place orbital scaling
     orbital_cache_valid_ = false;
 }
 

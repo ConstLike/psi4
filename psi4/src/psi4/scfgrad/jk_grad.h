@@ -64,7 +64,7 @@ protected:
 
     std::shared_ptr<BasisSet> primary_;
 
-    // === Phase B: Multi-wfn Architecture (lists-only, like JK) === //
+    // Multi-wfn Architecture (lists-only, like JK)
     // Design Philosophy:
     // - JKGrad works with lists ONLY (following JK::C_left_ pattern)
     // - Single-wfn mode = list of size 1
@@ -146,7 +146,7 @@ public:
         Dt_list_.push_back(Dt);
     }
 
-    // === Modern List-Based API (like JK::C_left()) === //
+    // List-Based API (like JK::C_left())
 
     /// Direct access to Ca list (for multi-wfn usage)
     std::vector<SharedMatrix>& Ca_list() { return Ca_list_; }
@@ -217,9 +217,9 @@ public:
     */
     void set_omega(double omega) { omega_ = omega; }
 
-    // === Gradient Results Accessors === //
+    // Gradient Results Accessors
 
-    /// Modern: Get gradients for all wavefunctions (primary interface)
+    /// Get gradients for all wavefunctions (primary interface)
     /// Returns: gradients_list_[wfn_idx]["J"], ["K"], ["Total"]
     const std::vector<std::map<std::string, SharedMatrix>>& gradients_list() const {
         return gradients_list_;

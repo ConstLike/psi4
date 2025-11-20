@@ -693,7 +693,7 @@ SharedMatrix Matrix::get_block(const Slice &rows, const Slice &cols) const {
         const int col_offset = cols_begin[h ^ symmetry_];
         const size_t bytes_per_row = max_q * sizeof(double);
 
-        // Vectorized memcpy per row (10-20x faster than element-wise)
+        // Copy rows using memcpy
         for (int p = 0; p < max_p; p++) {
             std::memcpy(&block->matrix_[h][p][0],
                        &matrix_[h][p + row_offset][col_offset],
@@ -753,7 +753,7 @@ void Matrix::set_block(const Slice &rows, const Slice &cols, const Matrix& block
         const int col_offset = cols_begin[h ^ symmetry_];
         const size_t bytes_per_row = max_q * sizeof(double);
 
-        // Vectorized memcpy per row (10-20x faster than element-wise)
+        // Copy rows using memcpy
         for (int p = 0; p < max_p; p++) {
             std::memcpy(&matrix_[h][p + row_offset][col_offset],
                        &block.matrix_[h][p][0],
@@ -3581,7 +3581,7 @@ double **matrix(int nrow, int ncol) {
     double **mat = (double **)malloc(sizeof(double *) * nrow);
     const size_t size = sizeof(double) * nrow * (size_t)ncol;
 
-    // Use aligned allocation for SIMD/cache line optimization (AVX-512 + cache line = 64 bytes)
+    // Allocate memory aligned to 64-byte boundary (cache line size)
     constexpr size_t CACHE_LINE_SIZE = 64;
     void* aligned_ptr = nullptr;
     int ret = posix_memalign(&aligned_ptr, CACHE_LINE_SIZE, size);

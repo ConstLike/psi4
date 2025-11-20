@@ -185,7 +185,7 @@ void DFJKGrad::print_header() const {
 void DFJKGrad::compute_gradient() {
     if (!do_J_ && !do_K_ && !do_wK_) return;
 
-    // Phase B: Check lists (DFJKGrad currently supports single-wfn only)
+    // Check lists (DFJKGrad currently supports single-wfn only)
     if (Ca_list_.empty() || Cb_list_.empty() || Da_list_.empty() || Db_list_.empty() || Dt_list_.empty()) {
         throw PSIEXCEPTION("DFJKGrad: Occupation/Density lists not set. Call set_Da() etc first.");
     }
@@ -960,7 +960,7 @@ void DFJKGrad::build_AB_x_terms()
     auto naux = auxiliary_->nbf();
     int nwfn = Dt_list_.size();
 
-    // CRITICAL FIX: Compute (A|B)^x gradient contribution PER-WAVEFUNCTION
+    // Compute (A|B)^x gradient contribution per-wavefunction
     // Although (A|B)^x derivative integrals are the same for all wfn,
     // the densities (d_A, V_AB, W_AB) are DIFFERENT for each wfn.
     // Previous code accumulated densities then computed gradient once - WRONG!
@@ -1099,9 +1099,8 @@ void DFJKGrad::build_Amn_x_terms() {
         Aijp = Aij->pointer();
     }
 
-    // => Per-wfn data structures <= //
+    // Per-wfn data structures
     // J densities (d vectors), K/wK densities (Kmn, wKmn matrices)
-    // HPC optimization: Check do_J/K/wK ONCE outside loop
     std::vector<SharedVector> d_list(nwfn);
     std::vector<SharedMatrix> Kmn_list(nwfn);
     std::vector<SharedMatrix> wKmn_list(nwfn);
@@ -1122,8 +1121,7 @@ void DFJKGrad::build_Amn_x_terms() {
         }
     }
 
-    // => Temporary Gradients [thread][wfn] <= //
-    // HPC optimization: Check do_J/K/wK ONCE outside double loop
+    // Temporary Gradients [thread][wfn]
 
     std::vector<std::vector<SharedMatrix>> Jtemps(df_ints_num_threads_);
     std::vector<std::vector<SharedMatrix>> Ktemps(df_ints_num_threads_);
@@ -1167,7 +1165,7 @@ void DFJKGrad::build_Amn_x_terms() {
         int pstop = (Pstop == auxiliary_->nshell() ? naux : auxiliary_->shell(Pstop).function_index());
         int np = pstop - pstart;
 
-        // => Phase 1: Per-wfn preparation (read densities & perform transforms) <= //
+        // Per-wfn preparation (read densities & perform transforms)
 
         for (int w = 0; w < nwfn; w++) {
             int na = Ca_list_[w]->colspi()[0];
@@ -1275,9 +1273,9 @@ void DFJKGrad::build_Amn_x_terms() {
             }
         }  // End per-wfn preparation loop
 
-        // => Phase 2: Generate (A|pq)^x derivative integrals ONCE (WFN-INDEPENDENT) <= //
+        // Generate (A|pq)^x derivative integrals once (wfn-independent)
 
-        // > Integrals < //
+        // Integrals
         int nthread_df = df_ints_num_threads_;
 #pragma omp parallel for schedule(dynamic) num_threads(nthread_df)
         for (long int PMN = 0L; PMN < static_cast<long>(NP) * npairs; PMN++) {
@@ -1323,9 +1321,7 @@ void DFJKGrad::build_Amn_x_terms() {
 
             double perm = (M == N ? 1.0 : 2.0);
 
-            // => Phase 3: Contract integrals with ALL wavefunctions <= //
-            // HPC OPTIMIZATION: Check do_J/K/wK ONCE per shell pair (not N×nP×nM×nN times!)
-            // Reduces ~15 million checks to ~3 thousand for typical calculation
+            // Contract integrals with all wavefunctions
 
             // J gradient: (A|pq)^x d_A Dt_pq
             if (do_J_) {
@@ -1509,8 +1505,7 @@ void DFJKGrad::build_Amn_x_terms() {
 
     // => Temporary Gradient Reduction <= //
 
-    // => Phase 4: Accumulate thread gradients for ALL wavefunctions <= //
-    // HPC optimization: Check do_J/K/wK ONCE outside loops (not N×threads times)
+    // Accumulate thread gradients for all wavefunctions
 
     if (do_J_) {
         for (int w = 0; w < nwfn; w++) {
@@ -1587,7 +1582,7 @@ void DFJKGrad::compute_hessian() {
         hessians_["Exchange,LR"] = std::make_shared<Matrix>("Exchange,LR Hessian", 3 * natom, 3 * natom);
     }
 
-    bool same_ab = (Ca_list_[0] == Cb_list_[0]) ? true : false;  // Phase B: DFJKGrad single-wfn only
+    bool same_ab = (Ca_list_[0] == Cb_list_[0]) ? true : false;  // DFJKGrad single-wfn only
 
     std::shared_ptr<Molecule> mol = primary_->molecule();
 
@@ -1597,7 +1592,7 @@ void DFJKGrad::compute_hessian() {
     int nshell = primary_->nshell();
     int natoms = mol->natom();
 
-    double** Dtp = Dt_list_[0]->pointer();  // Phase B: DFJKGrad single-wfn only
+    double** Dtp = Dt_list_[0]->pointer();  // DFJKGrad single-wfn only
     double** Cap = Ca_list_[0]->pointer();
     double** Cbp = Cb_list_[0]->pointer();
 
@@ -2545,7 +2540,7 @@ void DirectJKGrad::compute_gradient() {
         brianOPTBuildGradientRepulsionDeriv(&brianCookie,
             &computeCoulomb,
             &computeExchange,
-            Da_list_[0]->get_pointer(),  // Phase B: Use list[0] for single-wfn
+            Da_list_[0]->get_pointer(),  // Use list[0] for single-wfn
             (betaFlag ? Db_list_[0]->get_pointer() : nullptr),
             (computeCoulomb ? Jgrad->get_pointer() : nullptr),
             (computeExchange ? Kgrada->get_pointer() : nullptr),
@@ -2560,7 +2555,7 @@ void DirectJKGrad::compute_gradient() {
             }
         }
 
-        // Phase B: Store in gradients_list_
+        // Store in gradients_list_
         gradients_list_.clear();
         gradients_list_.resize(1);  // Single-wfn
 
@@ -2583,7 +2578,7 @@ void DirectJKGrad::compute_gradient() {
 #endif
 
     // => Set up gradients <= //
-    // FIX-3: gradients_list_ will be populated by compute1() for ALL wavefunctions
+    // gradients_list_ will be populated by compute1() for ALL wavefunctions
     gradients_list_.clear();
     gradients_list_.resize(nwfn);
 
@@ -2595,7 +2590,7 @@ void DirectJKGrad::compute_gradient() {
         for (int thread = 0; thread < ints_num_threads_; thread++) {
             ints.push_back(std::shared_ptr<TwoBodyAOInt>(factory->eri(1)));
         }
-        // FIX-3: compute1() now saves results to gradients_list_[*]["Coulomb"/"Exchange"]
+        // compute1() now saves results to gradients_list_[*]["Coulomb"/"Exchange"]
         compute1(ints);
     }
 
@@ -2605,7 +2600,7 @@ void DirectJKGrad::compute_gradient() {
         for (int thread = 0; thread < ints_num_threads_; thread++) {
             ints.push_back(std::shared_ptr<TwoBodyAOInt>(factory->erf_eri(omega_, 1)));
         }
-        // FIX-3: compute1() saves results to gradients_list_[*]["Exchange,LR"]
+        // compute1() saves results to gradients_list_[*]["Exchange,LR"]
         // Note: compute1() stores in "Coulomb"/"Exchange", so we need to rename
         std::map<std::string, std::shared_ptr<Matrix>> vals = compute1(ints);
 
@@ -2623,7 +2618,7 @@ std::map<std::string, std::shared_ptr<Matrix>> DirectJKGrad::compute1(
     int nthreads = ints.size();
     int natom = primary_->molecule()->natom();
 
-    // Phase B: Multi-wfn support
+    // Multi-wfn support
     // DirectJKGrad always loops over all wfn in lists (single-wfn = list of size 1)
     int nwfn = Dt_list_.size();
 
@@ -2691,7 +2686,7 @@ std::map<std::string, std::shared_ptr<Matrix>> DirectJKGrad::compute1(
             const double* pDy = buffers[10];
             const double* pDz = buffers[11];
 
-            // === Phase B: Loop over ALL wavefunctions === //
+            // Loop over ALL wavefunctions === //
             // Derivative integrals (pAx, pAy, ...) computed once above, now contract with each wfn
             for (int wfn_idx = 0; wfn_idx < nwfn; wfn_idx++) {
                 // Get densities for THIS wavefunction
@@ -2895,11 +2890,11 @@ std::map<std::string, std::shared_ptr<Matrix>> DirectJKGrad::compute1(
                     pDz += block_size;
                 }  // pairRS
             }      // pairPQ
-            }      // wfn_idx (Phase B: end of wfn loop)
+            }      // wfn_idx (end of wfn loop)
         }          // blockRS
     }              // blockPQ
 
-    // === Phase B: Per-wfn thread reduction === //
+    // Per-wfn thread reduction === //
     // Accumulate gradients from all threads, separately for each wavefunction
     for (int wfn_idx = 0; wfn_idx < nwfn; wfn_idx++) {
         // Thread reduction for this wfn
@@ -2913,7 +2908,7 @@ std::map<std::string, std::shared_ptr<Matrix>> DirectJKGrad::compute1(
         Kgrad_all[0][wfn_idx]->scale(0.5);
     }
 
-    // FIX-2: Store results in gradients_list_ for ALL wavefunctions
+    // Store results in gradients_list_ for ALL wavefunctions
     // This enables multi-wfn gradient batching
     if (gradients_list_.size() != static_cast<size_t>(nwfn)) {
         gradients_list_.resize(nwfn);
@@ -2933,7 +2928,7 @@ std::map<std::string, std::shared_ptr<Matrix>> DirectJKGrad::compute1(
 void DirectJKGrad::compute_hessian() {
     if (!do_J_ && !do_K_ && !do_wK_) return;
 
-    // Phase B: Validate lists (DirectJKGrad hessian supports single-wfn only)
+    // Validate lists (DirectJKGrad hessian supports single-wfn only)
     if (Ca_list_.empty() || Cb_list_.empty() || Da_list_.empty() || Db_list_.empty() || Dt_list_.empty()) {
         throw PSIEXCEPTION("DirectJKGrad::compute_hessian(): Occupation/Density lists not set.");
     }
@@ -2994,7 +2989,7 @@ std::map<std::string, std::shared_ptr<Matrix>> DirectJKGrad::compute2(
         Khess.push_back(std::make_shared<Matrix>("KHess", 3 * natom, 3 * natom));
     }
 
-    // Phase B: compute2 uses list[0] (single-wfn hessian only)
+    // compute2 uses list[0] (single-wfn hessian only)
     double** Dtp = Dt_list_[0]->pointer();
     double** Dap = Da_list_[0]->pointer();
     double** Dbp = Db_list_[0]->pointer();

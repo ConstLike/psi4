@@ -150,7 +150,7 @@ def run_multi(configs, log_suffix=""):
 
     elapsed_time = time.perf_counter() - start_time
 
-    # NOTE: We do NOT compute gradients for multi-SCF wfns
+    # Gradients are not computed for multi-SCF wavefunctions
     # For multi-SCF validation, we compare:
     # 1. Energy (exact match)
     # 2. Iterations (exact match)
