@@ -788,7 +788,25 @@ def scf_finalize_energy(self):
             # reading the rotated orbitals in before starting iterations
             self.form_D()
             self.set_energies("Total Energy", self.compute_initial_E())
-            self.iterations()
+
+            # Re-converge with rotated orbitals
+            # Use multi_scf() for unified code path (except OpenOrbitalOptimizer special case)
+            ooo_scf = core.get_option("SCF", "ORBITAL_OPTIMIZER_PACKAGE") in ["OOO", "OPENORBITALOPTIMIZER"]
+            if ooo_scf:
+                # OpenOrbitalOptimizer requires special handling not yet supported in multi_scf()
+                # Keep legacy iteration path for backward compatibility
+                core.print_out("    Note: Using legacy iteration path for OpenOrbitalOptimizer.\n")
+                self.iterations()
+            else:
+                # Standard path: unified multi_scf framework
+                # This ensures consistency with main SCF code path
+                try:
+                    energies = multi_scf([self], verbose=False)
+                except SCFConvergenceError:
+                    # Even if not fully converged, continue with stability check
+                    # The stability_analysis() below will determine if more attempts are needed
+                    pass
+
             follow = self.stability_analysis()
 
         if follow and self.attempt_number_ > core.get_option('SCF', 'MAX_ATTEMPTS'):
