@@ -4,6 +4,7 @@ list(APPEND sources
   hf.cc
   mom.cc
   multistate_matrix.cc
+  reks.cc
   rhf.cc
   rohf.cc
   sad.cc

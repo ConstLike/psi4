@@ -58,6 +58,7 @@
 #include "psi4/libscf_solver/uhf.h"
 #include "psi4/libscf_solver/rohf.h"
 #include "psi4/libscf_solver/cuhf.h"
+#include "psi4/libscf_solver/reks.h"
 #include "psi4/libfunctional/superfunctional.h"
 #include "psi4/libfock/v.h"
 
@@ -451,6 +452,15 @@ void export_wavefunction(py::module& m) {
     py::class_<scf::CUHF, std::shared_ptr<scf::CUHF>, scf::HF>(m, "CUHF", "docstring")
         .def(py::init<std::shared_ptr<Wavefunction>, std::shared_ptr<SuperFunctional>>())
         .def("c1_deep_copy", &scf::CUHF::c1_deep_copy,
+             "Returns a new wavefunction with internal data converted to C_1 symmetry, using pre-c1-constructed "
+             "BasisSet *basis*",
+             "basis"_a)
+        .def("mintshelper", &Wavefunction::mintshelper, "The MintsHelper object");
+
+    py::class_<scf::REKS, std::shared_ptr<scf::REKS>, scf::RHF>(m, "REKS",
+             "Restricted Ensemble Kohn-Sham wavefunction for multi-configurational DFT")
+        .def(py::init<std::shared_ptr<Wavefunction>, std::shared_ptr<SuperFunctional>>())
+        .def("c1_deep_copy", &scf::REKS::c1_deep_copy,
              "Returns a new wavefunction with internal data converted to C_1 symmetry, using pre-c1-constructed "
              "BasisSet *basis*",
              "basis"_a)
