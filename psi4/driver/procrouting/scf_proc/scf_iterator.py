@@ -789,23 +789,12 @@ def scf_finalize_energy(self):
             self.form_D()
             self.set_energies("Total Energy", self.compute_initial_E())
 
-            # Re-converge with rotated orbitals
-            # Use multi_scf() for unified code path (except OpenOrbitalOptimizer special case)
-            ooo_scf = core.get_option("SCF", "ORBITAL_OPTIMIZER_PACKAGE") in ["OOO", "OPENORBITALOPTIMIZER"]
-            if ooo_scf:
-                # OpenOrbitalOptimizer requires special handling not yet supported in multi_scf()
-                # Keep legacy iteration path for backward compatibility
-                core.print_out("    Note: Using legacy iteration path for OpenOrbitalOptimizer.\n")
-                self.iterations()
-            else:
-                # Standard path: unified multi_scf framework
-                # This ensures consistency with main SCF code path
-                try:
-                    energies = multi_scf([self], verbose=False)
-                except SCFConvergenceError:
-                    # Even if not fully converged, continue with stability check
-                    # The stability_analysis() below will determine if more attempts are needed
-                    pass
+            # Re-converge with rotated orbitals using unified multi_scf framework
+            try:
+                multi_scf([self], verbose=False)
+            except SCFConvergenceError:
+                # Continue with stability check even if not fully converged
+                pass
 
             follow = self.stability_analysis()
 
@@ -1692,6 +1681,106 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
     # Checks: basis set, geometry, LRC parameters, etc.
     # Only checks what affects SHARED components (no half-measures!)
     validate_multi_scf_compatibility(wfn_list)
+
+    # OpenOrbitalOptimizer (OOO) support
+    # OOO is an external optimizer that replaces Psi4's iteration loop.
+    # It calls jk_->compute() internally, so it CANNOT use shared JK batching.
+    #
+    # Architecture decision:
+    # - Single-wfn + OOO compatible: use openorbital_scf() for full OOO support
+    # - Multi-wfn + OOO requested: OOO can't batch JK, fall back to INTERNAL
+    # - OOO incompatible: fall back to INTERNAL (same as scf_iterate behavior)
+    ooo_requested = core.get_option("SCF", "ORBITAL_OPTIMIZER_PACKAGE") in ["OOO", "OPENORBITALOPTIMIZER"]
+
+    if ooo_requested:
+        if len(wfn_list) > 1:
+            # Multi-wfn: OOO fundamentally incompatible with shared JK batching
+            core.print_out("  Note: OpenOrbitalOptimizer cannot batch JK for multiple wavefunctions.\n")
+            core.print_out("        Using internal SCF optimizer for multi-wfn calculation.\n\n")
+        else:
+            # Single-wfn: try OOO if compatible
+            wfn = wfn_list[0]
+            reference = core.get_option('SCF', 'REFERENCE')
+
+            # Check OOO compatibility (same logic as scf_iterate)
+            soscf_enabled = core.get_option('SCF', 'SOSCF')
+            mom_enabled = hasattr(wfn, 'MOM_excited_') and wfn.MOM_excited_
+            frac_enabled = core.get_option('SCF', 'FRAC_OCC')
+            efp_enabled = hasattr(wfn.molecule(), 'EFP')
+            pcm_enabled = core.get_option('SCF', 'PCM')
+            ddx_enabled = core.get_option('SCF', 'DDX')
+            pe_enabled = core.get_option('SCF', 'PE')
+            level_shift_enabled = core.get_option("SCF", "LEVEL_SHIFT") != 0.0
+            guessmix_enabled = core.get_option("SCF", "GUESS_MIX")
+
+            ooo_incompatible = (
+                reference in ["ROHF", "CUHF"] or
+                soscf_enabled or mom_enabled or frac_enabled or
+                efp_enabled or pcm_enabled or ddx_enabled or pe_enabled or
+                level_shift_enabled or guessmix_enabled
+            )
+
+            if ooo_incompatible:
+                core.print_out("  Note: OpenOrbitalOptimizer not compatible with current settings.\n")
+                core.print_out(f"        reference={reference}, soscf={soscf_enabled}, mom={mom_enabled},\n")
+                core.print_out(f"        frac={frac_enabled}, efp={efp_enabled}, pcm={pcm_enabled},\n")
+                core.print_out(f"        ddx={ddx_enabled}, pe={pe_enabled}, level_shift={level_shift_enabled},\n")
+                core.print_out(f"        guess_mix={guessmix_enabled}\n")
+                core.print_out("        Falling back to internal SCF optimizer.\n\n")
+            else:
+                # OOO compatible! Use openorbital_scf()
+                if verbose:
+                    core.print_out("\n  ==> OpenOrbitalOptimizer SCF <==\n\n")
+
+                # Initialize wfn (creates JK, etc.)
+                wfn.initialize()
+
+                # OOO requires SAD setup (same as scf_iterate)
+                is_dfjk = "DF" in core.get_option('SCF', 'SCF_TYPE')
+                if wfn.sad_ and wfn.iteration_ <= 0:
+                    wfn.iteration_ += 1
+                    wfn.form_G()
+                    wfn.form_initial_F()
+                    wfn.form_initial_C()
+                    wfn.reset_occupation()
+                    wfn.find_occupation()
+                    ene_sad = wfn.compute_E()
+                    core.print_out(
+                        "   @%s%s iter %3s: %20.14f   %12.5e   %-11.5e %s\n" %
+                        ("DF-" if is_dfjk else "", reference, "SAD", ene_sad, ene_sad, 0.0, ""))
+
+                if core.get_option("SCF", "GUESS") == "READ" and wfn.iteration_ <= 0:
+                    wfn.form_G()
+                    wfn.form_initial_F()
+                    wfn.form_initial_C()
+                    wfn.reset_occupation()
+                    wfn.find_occupation()
+                    wfn.compute_E()
+
+                try:
+                    wfn.openorbital_scf()
+                except RuntimeError as ex:
+                    if "openorbital_scf is virtual" in str(ex) or "OpenOrbitalOptimizer support has not been enabled" in str(ex):
+                        core.print_out(f"  Note: OpenOrbitalOptimizer not available ({reference}). Falling back to internal.\n\n")
+                        # Fall through to normal multi_scf path
+                    else:
+                        raise ex
+                else:
+                    # OOO succeeded - finalize and return
+                    SCFE = wfn.compute_E()
+                    wfn.set_energies("Total Energy", SCFE)
+                    wfn.set_variable("SCF ITERATION ENERGY", SCFE)
+                    wfn.iteration_energies = [SCFE]  # OOO doesn't track per-iteration
+
+                    wfn.form_G()
+                    wfn.form_F()
+                    wfn.form_C()
+                    wfn.form_D()
+
+                    if verbose:
+                        core.print_out(f"\n  OpenOrbitalOptimizer converged: E = {SCFE:.14f}\n\n")
+
+                    return [SCFE]
 
     # Auto-assign unique wavefunction names for file isolation
     # This enables proper DIIS, stability analysis, and orbital file separation
