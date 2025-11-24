@@ -89,9 +89,10 @@ void REKS::reks_common_init() {
     active_r_ = Ncore_;    // HOMO
     active_s_ = Ncore_ + 1; // LUMO (will be fractionally occupied)
 
-    // Initialize FONs (start at closed-shell limit)
-    n_r_ = 1.0;
-    n_s_ = 1.0;
+    // Initialize FONs (start at closed-shell limit like GAMESS)
+    // GAMESS: DNR=1.0, DNS=0.0 → n_r=2.0, n_s=0.0
+    n_r_ = 2.0;
+    n_s_ = 0.0;
 
     // Initialize SA weights (default: equal weighting)
     w_PPS_ = 0.5;
@@ -154,34 +155,37 @@ void REKS::allocate_reks_matrices() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 double REKS::f_interp(double x) const {
-    // f(x) = (4x(1-x))^(1 - (4x(1-x)+δ)/(2(1+δ)))
-    // Domain: 0 < x < 1, typically x = n_r/2
-    // At x = 0.5: f = 1.0 (maximum coupling)
-    // At x = 0 or x = 1: f = 0 (no coupling)
+    // GAMESS REXCONVF function (used for x = n_r*n_s)
+    // f(x) = x^(1 - 0.5*(x+δ)/(1+δ))
+    // Domain: 0 <= x <= 1, where x = n_r*n_s
+    // At x = 0: f = 0 (no coupling)
+    // At x = 1: f = 1 (maximum coupling, n_r=n_s=1)
 
-    if (x <= 0.0 || x >= 1.0) return 0.0;
+    if (x <= 0.0) return 0.0;
+    if (x >= 1.0) {
+        // At x=1: TMP = 0.5, so f = 1^0.5 = 1
+        return 1.0;
+    }
 
-    double y = 4.0 * x * (1.0 - x);
-    double exponent = 1.0 - 0.5 * (y + DELTA_) / (1.0 + DELTA_);
-    return std::pow(y, exponent);
+    double tmp = 0.5 * (x + DELTA_) / (1.0 + DELTA_);
+    double exponent = 1.0 - tmp;
+    return std::pow(x, exponent);
 }
 
 double REKS::df_interp(double x) const {
-    // df/dx via chain rule
-    // Let y = 4x(1-x), then dy/dx = 4(1-2x)
-    // f = y^g where g = 1 - (y+δ)/(2(1+δ))
-    // df/dx = y^g * [g/y * dy/dx + ln(y) * dg/dy * dy/dx]
+    // df/dx for f(x) = x^(1-tmp) where tmp = 0.5*(x+δ)/(1+δ)
+    // Using logarithmic derivative: ln(f) = (1-tmp)*ln(x)
+    // d[ln(f)]/dx = (1-tmp)/x - 0.5*ln(x)/(1+δ)
+    // df/dx = f(x) * [(1-tmp)/x - 0.5*ln(x)/(1+δ)]
 
-    if (x <= 1e-10 || x >= 1.0 - 1e-10) return 0.0;
+    if (x <= 1e-10) return 0.0;
+    if (x >= 1.0 - 1e-10) return 0.0;  // At x=1, derivative is 0
 
-    double y = 4.0 * x * (1.0 - x);
-    double dy_dx = 4.0 * (1.0 - 2.0 * x);
-    double g = 1.0 - 0.5 * (y + DELTA_) / (1.0 + DELTA_);
-    double dg_dy = -0.5 / (1.0 + DELTA_);
+    double tmp = 0.5 * (x + DELTA_) / (1.0 + DELTA_);
+    double f_val = std::pow(x, 1.0 - tmp);
 
-    double f_val = std::pow(y, g);
-    double term1 = g / y * dy_dx;
-    double term2 = std::log(y) * dg_dy * dy_dx;
+    double term1 = (1.0 - tmp) / x;
+    double term2 = -0.5 * std::log(x) / (1.0 + DELTA_);
 
     return f_val * (term1 + term2);
 }
@@ -306,26 +310,27 @@ void REKS::build_microstate_densities() {
 }
 
 void REKS::compute_weighting_factors() {
-    // Compute C_L weights for SA-REKS (Filatov 2024, Table 1)
-    // For 4 unique microstates mapping to paper's 6 microstates
-    double f = f_interp(n_r_ / 2.0);
+    // Compute C_L weights for SA-REKS (GAMESS REXCM function)
+    // CRITICAL: f_interp argument is n_r*n_s, NOT n_r/2!
+    // GAMESS: TMP = 4*DNR*DNS = 4*(n_r/2)*(n_s/2) = n_r*n_s
+    double f = f_interp(n_r_ * n_s_);  // f(n_r*n_s), NOT f(n_r/2)!
 
-    // C_L for SA = w_PPS * C_L[PPS] + w_OSS * C_L[OSS]
-    // L=0 (paper L=1): w_PPS * n_r/2
+    // C_L for SA-REKS (STATAVG branch, wpps≠1.0)
+    // L=0: WPPS*DNR = w_PPS*(n_r/2)
     C_L_[0] = w_PPS_ * n_r_ / 2.0;
 
-    // L=1 (paper L=2): w_PPS * n_s/2
+    // L=1: WPPS*DNS = w_PPS*(n_s/2)
     C_L_[1] = w_PPS_ * n_s_ / 2.0;
 
-    // L=2 (paper L=3,4 combined): 2*(w_OSS - w_PPS*f/2) = 2*w_OSS - w_PPS*f
-    C_L_[2] = 2.0 * w_OSS_ - w_PPS_ * f;
+    // L=2 (open, ×2): WOSS - 0.5*F = w_OSS - 0.5*w_PPS*f(n_r*n_s)
+    C_L_[2] = w_OSS_ - 0.5 * w_PPS_ * f;
 
-    // L=3 (paper L=5,6 combined): 2*(w_PPS*f/2 - w_OSS/2) = w_PPS*f - w_OSS
-    C_L_[3] = w_PPS_ * f - w_OSS_;
+    // L=3 (triplet, ×2): 0.5*F - 0.5*WOSS = 0.5*w_PPS*f(n_r*n_s) - 0.5*w_OSS
+    C_L_[3] = 0.5 * w_PPS_ * f - 0.5 * w_OSS_;
 
     if (reks_debug_ >= 2) {
         outfile->Printf("\n  === REKS Weighting Factors C_L ===\n");
-        outfile->Printf("  n_r = %.6f, n_s = %.6f, f(n_r/2) = %.6f\n", n_r_, n_s_, f);
+        outfile->Printf("  n_r = %.6f, n_s = %.6f, f(n_r*n_s) = %.6f\n", n_r_, n_s_, f);
         outfile->Printf("  w_PPS = %.4f, w_OSS = %.4f\n", w_PPS_, w_OSS_);
         for (int L = 0; L < N_MICRO_; ++L) {
             outfile->Printf("  C_L[%d] = %12.8f\n", L, C_L_[L]);
@@ -582,6 +587,11 @@ void REKS::compute_microstate_energies() {
         E_micro_[L] = E_1e + E_2e + E_nuc;
     }
 
+    if (reks_debug_ >= 2) {
+        outfile->Printf("  DEBUG_PSI4_E_MICRO: E[0]=%.10f E[1]=%.10f E[2]=%.10f E[3]=%.10f\n",
+                        E_micro_[0], E_micro_[1], E_micro_[2], E_micro_[3]);
+    }
+
     if (reks_debug_ >= 1) {
         print_microstate_energies();
     }
@@ -625,43 +635,50 @@ void REKS::rex_solver() {
     }
 
     for (int iter = 0; iter < max_iter; ++iter) {
-        double x = n_r_ / 2.0;  // x ∈ (0, 1)
         n_s_ = 2.0 - n_r_;
 
-        // Interpolating function and derivatives at current x
+        // Interpolating function and derivatives at x = n_r*n_s
+        // CRITICAL: GAMESS uses f(n_r*n_s), NOT f(n_r/2)!
+        double x = n_r_ * n_s_;  // x = n_r*n_s ∈ [0, 1]
         double f = f_interp(x);
         double df_dx = df_interp(x);
         double d2f_dx2 = d2f_interp(x);
+
+        // Chain rule: df/dn_r = (df/dx) * (dx/dn_r) = (df/dx) * n_s
+        // (since x = n_r*n_s and dx/dn_r = n_s)
+        double df_dnr = df_dx * n_s_;
+        // d²f/dn_r² = d/dn_r[df/dx * n_s] = d²f/dx² * n_s * dx/dn_r + df/dx * dn_s/dn_r
+        //           = d²f/dx² * n_s² + df/dx * (-1)  (since n_s = 2-n_r)
+        double d2f_dnr2 = d2f_dx2 * n_s_ * n_s_ - df_dx;
 
         // Compute C_L at current n_r (before update)
         double C_L_current[4];
         C_L_current[0] = w_PPS_ * n_r_ / 2.0;
         C_L_current[1] = w_PPS_ * n_s_ / 2.0;
-        C_L_current[2] = 2.0 * w_OSS_ - w_PPS_ * f;
-        C_L_current[3] = w_PPS_ * f - w_OSS_;
+        C_L_current[2] = w_OSS_ - 0.5 * w_PPS_ * f;
+        C_L_current[3] = 0.5 * w_PPS_ * f - 0.5 * w_OSS_;
         double sum_CL = C_L_current[0] + C_L_current[1] + C_L_current[2] + C_L_current[3];
-        double E_SA_current = C_L_current[0] * E_micro_[0] + C_L_current[1] * E_micro_[1]
-                            + C_L_current[2] * E_micro_[2] + C_L_current[3] * E_micro_[3];
 
-        // Convert derivatives: df/dn_r = df/dx * dx/dn_r = df/dx * 0.5
-        double df_dnr = 0.5 * df_dx;
-        double d2f_dnr2 = 0.25 * d2f_dx2;
+        // CRITICAL FIX: Apply FACT=2 for L>=2 as in GAMESS REXEM2EE
+        double E_SA_current = C_L_current[0] * E_micro_[0] + C_L_current[1] * E_micro_[1]
+                            + 2.0 * C_L_current[2] * E_micro_[2] + 2.0 * C_L_current[3] * E_micro_[3];
 
         // ─────────── Energy gradient dE_SA/dn_r ───────────
-        // C_L[0] = w_PPS * n_r/2       → dC_0/dn_r = w_PPS/2
-        // C_L[1] = w_PPS * n_s/2       → dC_1/dn_r = -w_PPS/2
-        // C_L[2] = 2*w_OSS - w_PPS*f   → dC_2/dn_r = -w_PPS * df/dn_r
-        // C_L[3] = w_PPS*f - w_OSS     → dC_3/dn_r = w_PPS * df/dn_r
+        // C_L[0] = w_PPS * n_r/2             → dC_0/dn_r = w_PPS/2
+        // C_L[1] = w_PPS * n_s/2             → dC_1/dn_r = -w_PPS/2
+        // C_L[2] = w_OSS - 0.5*w_PPS*f       → dC_2/dn_r = -0.5*w_PPS*df/dn_r
+        // C_L[3] = 0.5*w_PPS*f - 0.5*w_OSS   → dC_3/dn_r = 0.5*w_PPS*df/dn_r
         //
-        // dE/dn_r = Σ (dC_L/dn_r) * E_L
+        // dE/dn_r = Σ FACT * (dC_L/dn_r) * E_L, FACT=2 for L>=2
         double dE_dnr = (w_PPS_ / 2.0) * (E_micro_[0] - E_micro_[1])
-                      + w_PPS_ * df_dnr * (E_micro_[3] - E_micro_[2]);
+                      + 2.0 * 0.5 * w_PPS_ * df_dnr * (E_micro_[3] - E_micro_[2]);
 
         // ─────────── Energy Hessian d²E_SA/dn_r² ───────────
         // Only C_L[2] and C_L[3] have second derivatives (through f)
-        // d²C_2/dn_r² = -w_PPS * d²f/dn_r²
-        // d²C_3/dn_r² = w_PPS * d²f/dn_r²
-        double d2E_dnr2 = w_PPS_ * d2f_dnr2 * (E_micro_[3] - E_micro_[2]);
+        // d²C_2/dn_r² = -0.5*w_PPS * d²f/dn_r²
+        // d²C_3/dn_r² = 0.5*w_PPS * d²f/dn_r²
+        // Apply FACT=2 for L>=2
+        double d2E_dnr2 = 2.0 * 0.5 * w_PPS_ * d2f_dnr2 * (E_micro_[3] - E_micro_[2]);
 
         // Newton-Raphson step (or gradient descent if Hessian ≈ 0)
         double delta;
@@ -689,9 +706,9 @@ void REKS::rex_solver() {
                            sum_CL, E_SA_current, dE_dnr, d2E_dnr2);
         }
 
-        // Update n_r with bounds [0.01, 1.99]
+        // Update n_r with bounds [0.0, 2.0] (same as GAMESS x2 ∈ [0, 1])
         double n_r_new = n_r_ + delta;
-        n_r_new = std::clamp(n_r_new, 0.01, 1.99);
+        n_r_new = std::clamp(n_r_new, 0.0, 2.0);
         delta = n_r_new - n_r_;
         n_r_ = n_r_new;
 
@@ -712,8 +729,12 @@ void REKS::rex_solver() {
 
     // Compute SA-REKS energy with optimized FON
     compute_weighting_factors();  // Update C_L with new n_r
+
+    // CRITICAL FIX: GAMESS REXEM2EE multiplies by 2 for L>=3 (1-based)
+    // In Psi4 (0-based): multiply by 2 for L>=2
+    // GAMESS code: IF(I.GE.3) FACT=TWO; REXEM2EE = REXEM2EE + FACT*CM(I)*EM(I)
     double E_SA = C_L_[0] * E_micro_[0] + C_L_[1] * E_micro_[1]
-                + C_L_[2] * E_micro_[2] + C_L_[3] * E_micro_[3];
+                + 2.0 * C_L_[2] * E_micro_[2] + 2.0 * C_L_[3] * E_micro_[3];
 
     if (reks_debug_ >= 1) {
         outfile->Printf("  Final: n_r = %12.8f, n_s = %12.8f, f(x) = %12.8f\n",
@@ -744,8 +765,11 @@ void REKS::fock_micro_to_macro(int L, double Cl, double** Fa, double** Fb) {
     int nsa = ns_alpha_[L];
     int nsb = ns_beta_[L];
 
-    double fr = n_r_ / 2.0;  // f_r = n_r/2
-    double fs = n_s_ / 2.0;  // f_s = n_s/2
+    // GAMESS formula (reks.src line 1178-1179): FR = DNR*WPPS + 0.5*WOSS
+    // where DNR = n_r/2, DNS = n_s/2 (normalized to [0,1])
+    // So: FR = (n_r/2)*WPPS + 0.5*WOSS
+    double fr = (n_r_ / 2.0) * w_PPS_ + 0.5 * w_OSS_;
+    double fs = (n_s_ / 2.0) * w_PPS_ + 0.5 * w_OSS_;
 
     double Wc = 0.5 * Cl;  // Core block weight
 
@@ -906,7 +930,13 @@ void REKS::form_F() {
     for (int L = 0; L < N_MICRO_; ++L) {
         double** Fa = F_alpha_micro_[L]->pointer(0);
         double** Fb = F_beta_micro_[L]->pointer(0);
-        fock_micro_to_macro(L, C_L_[L], Fa, Fb);
+
+        // CRITICAL FIX: GAMESS multiplies C_L by 2 for L>=3 (1-based)
+        // In Psi4 (0-based): multiply by 2 for L>=2
+        // GAMESS code: IF(L.GE.3) CMTMP = TWO*CMTMP
+        double Cl_scaled = (L >= 2) ? 2.0 * C_L_[L] : C_L_[L];
+
+        fock_micro_to_macro(L, Cl_scaled, Fa, Fb);
     }
 
     // Symmetrize F_reks_ (copy upper triangle to lower triangle)
@@ -953,10 +983,14 @@ double REKS::compute_E() {
         return RHF::compute_E();
     }
 
-    // Compute state-averaged REKS energy: E_SA = Σ C_L * E_L
+    // Compute state-averaged REKS energy: E_SA = Σ FACT * C_L * E_L
+    // CRITICAL FIX: GAMESS REXEM2EE multiplies by 2 for L>=3 (1-based)
+    // In Psi4 (0-based): multiply by 2 for L>=2
+    // GAMESS code: IF(I.GE.3) FACT=TWO; REXEM2EE = REXEM2EE + FACT*CM(I)*EM(I)
     double E_SA = 0.0;
     for (int L = 0; L < N_MICRO_; ++L) {
-        E_SA += C_L_[L] * E_micro_[L];
+        double fact = (L >= 2) ? 2.0 : 1.0;
+        E_SA += fact * C_L_[L] * E_micro_[L];
     }
 
     energies_["Total Energy"] = E_SA;
