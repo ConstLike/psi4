@@ -48,6 +48,7 @@
 #include "psi4/libpsi4util/process.h"
 #include "psi4/libpsio/psio.h"
 #include "psi4/libmints/matrix.h"
+#include "psi4/libmints/vector.h"
 #include "psi4/libfock/jk.h"
 #include "psi4/libfunctional/superfunctional.h"
 
@@ -209,6 +210,23 @@ void REKS::build_base_densities() {
     // D01 = core + orbital s singly occupied
     // D11 = core + r + s both singly occupied
 
+    // PHASE 1 DEBUG: Print C matrix after GUESS (iteration 1 only)
+    if (iteration_ == 1 && reks_debug_ >= 2) {
+        outfile->Printf("\n  === PHASE 1: GUESS C Matrix (Psi4) ===\n");
+        outfile->Printf("  First 5 orbitals, first 5 basis functions:\n");
+        double** Cp = Ca_->pointer(0);
+        int nprint = std::min(5, nsopi_[0]);
+        int nmo_print = std::min(5, nsopi_[0]);
+        for (int mu = 0; mu < nprint; ++mu) {
+            outfile->Printf("  mu=%d:", mu);
+            for (int i = 0; i < nmo_print; ++i) {
+                outfile->Printf(" %12.8f", Cp[mu][i]);
+            }
+            outfile->Printf("\n");
+        }
+        outfile->Printf("  ======================================\n");
+    }
+
     int nso = nsopi_[0];  // Assuming C1 symmetry
 
     // D00: core electrons only
@@ -264,6 +282,28 @@ void REKS::build_base_densities() {
     }
 
     if (reks_debug_ >= 2) {
+        // PHASE 2 DEBUG: Print trace(D) to compare with GAMESS
+        double tr_D00 = 0.0, tr_D10 = 0.0, tr_D01 = 0.0, tr_D11 = 0.0;
+        double** D00p = D00_->pointer(0);
+        double** D10p = D10_->pointer(0);
+        double** D01p = D01_->pointer(0);
+        double** D11p = D11_->pointer(0);
+        for (int mu = 0; mu < nso; ++mu) {
+            tr_D00 += D00p[mu][mu];
+            tr_D10 += D10p[mu][mu];
+            tr_D01 += D01p[mu][mu];
+            tr_D11 += D11p[mu][mu];
+        }
+
+        outfile->Printf("\n  === PHASE 2: Density Matrix Traces (Psi4) ===\n");
+        outfile->Printf("  Tr(D00)= %.10f Tr(D10)= %.10f Tr(D01)= %.10f Tr(D11)= %.10f\n",
+                        tr_D00, tr_D10, tr_D01, tr_D11);
+        outfile->Printf("  Active indices: Ncore=%d, active_r=%d, active_s=%d\n",
+                        Ncore_, active_r_, active_s_);
+        outfile->Printf("  D00[active_r,active_r]= %.10f  D01[active_s,active_s]= %.10f\n",
+                        D00p[active_r_][active_r_], D01p[active_s_][active_s_]);
+        outfile->Printf("  ============================================\n");
+
         // Note: tr(D) != N_electrons in non-orthogonal basis. Use tr(D*S) for electrons.
         outfile->Printf("\n  === REKS Base Densities ===\n");
         outfile->Printf("  D00 (core):    tr(D*S) = %8.4f, N_elec = %d\n",
@@ -804,7 +844,18 @@ void REKS::fock_micro_to_macro(int L, double Cl, double** Fa, double** Fb) {
     // Weight: 0.5 * C_L * n^σ_s / f_s
     double Ws_a = (fs > 1e-10) ? 0.5 * Cl * nsa / fs : 0.0;
     double Ws_b = (fs > 1e-10) ? 0.5 * Cl * nsb / fs : 0.0;
-    Freks[active_s_][active_s_] += Ws_a * Fa[active_s_][active_s_] + Ws_b * Fb[active_s_][active_s_];
+    double contrib_ss = Ws_a * Fa[active_s_][active_s_] + Ws_b * Fb[active_s_][active_s_];
+    Freks[active_s_][active_s_] += contrib_ss;
+
+    // PHASE 3 DETAILED DEBUG: Trace F(s,s) contributions (now in MO basis!)
+    if (reks_debug_ >= 2) {
+        outfile->Printf("  DEBUG_FM2FE_MO L=%d: Cl=%.6f fr=%.6f fs=%.6f nsa=%d nsb=%d\n",
+                       L, Cl, fr, fs, nsa, nsb);
+        outfile->Printf("    Fa_MO(s,s)=%.6f Fb_MO(s,s)=%.6f Ws_a=%.6f Ws_b=%.6f\n",
+                       Fa[active_s_][active_s_], Fb[active_s_][active_s_], Ws_a, Ws_b);
+        outfile->Printf("    contrib_ss=%.6f cumul_F_MO(s,s)=%.6f\n",
+                       contrib_ss, Freks[active_s_][active_s_]);
+    }
 
     // === Core-active coupling (core to r) ===
     // Weight: 0.5 * C_L * (1 - n^σ_r) / (1 - f_r)
@@ -915,8 +966,12 @@ void REKS::form_F() {
     }
 
     // Build REKS coupling Fock matrix F_reks_ from microstate Fock matrices.
-    // Then set Fa_ = F_reks_ for orbital optimization via diagonalization.
-    // Formula from Filatov 2024, pages 7-9: FockMicro2Macro function.
+    // CRITICAL: The REKS coupling formulas (Filatov 2024) are designed for MO basis!
+    // GAMESS procedure:
+    //   1. Build F^σ_L in AO basis
+    //   2. Transform to MO: F^σ_L_MO = C^T * F^σ_L_AO * C
+    //   3. Apply fock_micro_to_macro in MO basis (active_r_, active_s_ are MO indices!)
+    //   4. Transform F_reks back to AO: F_reks_AO = C * F_reks_MO * C^T
 
     // Zero F_reks_ and Lagrange multiplier
     F_reks_->zero();
@@ -924,23 +979,30 @@ void REKS::form_F() {
 
     int N = nsopi_[0];
 
-    // Assemble F_reks_ from all 4 microstates
+    // Step 1: Transform microstate Fock matrices from AO to MO basis
+    // F_MO = C^T * F_AO * C  (using linalg::triplet)
+    std::array<SharedMatrix, N_MICRO_> F_alpha_MO;
+    std::array<SharedMatrix, N_MICRO_> F_beta_MO;
+    for (int L = 0; L < N_MICRO_; ++L) {
+        F_alpha_MO[L] = linalg::triplet(Ca_, F_alpha_micro_[L], Ca_, true, false, false);
+        F_beta_MO[L] = linalg::triplet(Ca_, F_beta_micro_[L], Ca_, true, false, false);
+    }
+
+    // Step 2: Assemble F_reks_ in MO basis from all 4 microstates
     // Note: L=2 (open-shell) represents L=3 and L=4 in paper → factor 2 already in C_L_[2]
     //       L=3 (triplet-like) represents L=5 and L=6 → factor 2 already in C_L_[3]
     for (int L = 0; L < N_MICRO_; ++L) {
-        double** Fa = F_alpha_micro_[L]->pointer(0);
-        double** Fb = F_beta_micro_[L]->pointer(0);
+        double** Fa_MO = F_alpha_MO[L]->pointer(0);
+        double** Fb_MO = F_beta_MO[L]->pointer(0);
 
-        // CRITICAL FIX: GAMESS multiplies C_L by 2 for L>=3 (1-based)
-        // In Psi4 (0-based): multiply by 2 for L>=2
         // GAMESS code: IF(L.GE.3) CMTMP = TWO*CMTMP
+        // In Psi4 (0-based): multiply by 2 for L>=2
         double Cl_scaled = (L >= 2) ? 2.0 * C_L_[L] : C_L_[L];
 
-        fock_micro_to_macro(L, Cl_scaled, Fa, Fb);
+        fock_micro_to_macro(L, Cl_scaled, Fa_MO, Fb_MO);
     }
 
-    // Symmetrize F_reks_ (copy upper triangle to lower triangle)
-    // This must be done ONCE after all microstates are accumulated
+    // Step 3: Symmetrize F_reks_ in MO basis (copy upper triangle to lower triangle)
     double** Freks = F_reks_->pointer(0);
     for (int i = 0; i < N; ++i) {
         for (int j = i + 1; j < N; ++j) {
@@ -948,32 +1010,121 @@ void REKS::form_F() {
         }
     }
 
-    // Set Fa_ = F_reks_ (F_reks_ IS the full Fock matrix, already contains H)
+    // At this point F_reks_ is in MO basis - save for debug output
+    auto F_reks_MO = F_reks_->clone();
+
+    // Store F_reks_MO for GAMESS-style orbital update in form_C()
+    F_reks_MO_ = F_reks_->clone();
+    F_reks_MO_->set_name("F_REKS_MO");
+
+    // Step 4: Transform F_reks from MO back to AO basis for DIIS
+    // GAMESS formula (reks.src lines 1363-1367): F_AO = S * C * F_MO * C^T * S
+    // This is CRITICAL for DIIS to work! The commutator [F,P] = F*D*S - S*D*F
+    // will only go to zero at convergence if F_AO is constructed this way.
+    //
+    // temp = S * C
+    // F_AO = temp * F_MO * temp^T = S * C * F_MO * C^T * S
+    auto SC = linalg::doublet(S_, Ca_, false, false);  // S * C
+    auto F_reks_AO = linalg::triplet(SC, F_reks_, SC, false, false, true);  // SC * F_MO * SC^T
+
+    F_reks_->copy(F_reks_AO);
+
+    // Set Fa_ = F_reks_ (now in AO basis)
     Fa_->copy(F_reks_);
 
-    // DIIS still uses Fa_
+    // For RHF: Fb_ = Fa_
     Fb_->copy(Fa_);
 
     if (reks_debug_ >= 2) {
         outfile->Printf("\n  === REKS Coupling Fock Matrix ===\n");
-        outfile->Printf("  tr(F_reks) = %15.10f\n", F_reks_->trace());
-        outfile->Printf("  Wrs_lagr   = %15.10f\n", Wrs_lagr_);
+        outfile->Printf("  tr(F_reks_AO) = %15.10f\n", F_reks_->trace());
+        outfile->Printf("  tr(F_reks_MO) = %15.10f\n", F_reks_MO->trace());
+        outfile->Printf("  Wrs_lagr      = %15.10f\n", Wrs_lagr_);
 
-        // Check active orbital elements
-        double** Fr = Freks;
-        outfile->Printf("  F_reks[r,r] = %12.6f, F_reks[s,s] = %12.6f\n",
-                       Fr[active_r_][active_r_], Fr[active_s_][active_s_]);
-        outfile->Printf("  F_reks[r,s] = %12.6f\n", Fr[active_r_][active_s_]);
+        // Print MO-basis F_reks diagonal - this is what GAMESS prints!
+        double** Fmo = F_reks_MO->pointer(0);
+        outfile->Printf("  DEBUG_PSI4_FREKS_MO_DIAG: ");
+        for (int i = 0; i < std::min(8, N); ++i) {
+            outfile->Printf("F(%d)=%10.6f ", i, Fmo[i][i]);
+        }
+        outfile->Printf("\n");
+        outfile->Printf("  DEBUG_PSI4_FREKS_MO_ACTIVE: F(r,r)=%10.6f F(s,s)=%10.6f F(r,s)=%10.6f\n",
+                       Fmo[active_r_][active_r_], Fmo[active_s_][active_s_], Fmo[active_r_][active_s_]);
 
-        // Check symmetry
+        // Check symmetry of MO-basis F_reks
         double max_asym = 0.0;
         for (int i = 0; i < N; ++i) {
             for (int j = i+1; j < N; ++j) {
-                double asym = std::abs(Fr[i][j] - Fr[j][i]);
+                double asym = std::abs(Fmo[i][j] - Fmo[j][i]);
                 if (asym > max_asym) max_asym = asym;
             }
         }
-        outfile->Printf("  Max asymmetry: %.3e\n", max_asym);
+        outfile->Printf("  Max MO asymmetry: %.3e\n", max_asym);
+    }
+}
+
+void REKS::form_C(double shift) {
+    // For SAD guess iteration: use standard RHF diagonalization
+    if (sad_ && iteration_ <= 0) {
+        RHF::form_C(shift);
+        return;
+    }
+
+    // GAMESS-style orbital update with DIIS support (reks.src lines 1380-1420):
+    //
+    // After form_F(), Psi4's DIIS may have extrapolated Fa_ (which was set to F_AO = S*C*F_MO*C^T*S).
+    // GAMESS converts F_AO back to MO basis (lines 1380-1386) before diagonalization.
+    //
+    // The back-transformation is: F_MO = C^T * F_AO * C
+    // This works because C is S-orthonormal: C^T * S * C = I
+    // So: C^T * (S*C*F_MO*C^T*S) * C = (C^T*S*C) * F_MO * (C^T*S*C) = I * F_MO * I = F_MO
+    //
+    // After DIIS extrapolation, F_AO may have changed, so we get:
+    // F_MO_after_DIIS = C^T * Fa_diis * C
+
+    int N = nsopi_[0];
+
+    // Convert Fa_ (possibly DIIS-extrapolated) back to MO basis: F_MO = C^T * Fa_ * C
+    auto F_MO_diis = linalg::triplet(Ca_, Fa_, Ca_, true, false, false);
+
+    // Diagonalize F_MO: F_MO * U = U * ε
+    auto U = std::make_shared<Matrix>("Eigenvectors", N, N);
+    auto eps = std::make_shared<Vector>("Eigenvalues", N);
+
+    F_MO_diis->diagonalize(U, eps);
+
+    // Fix orbital phase (GAMESS lines 1413-1417): ensure diagonal elements of U are positive
+    double** Up = U->pointer(0);
+    for (int j = 0; j < N; ++j) {
+        if (Up[j][j] < 0.0) {
+            // Flip sign of this column
+            for (int i = 0; i < N; ++i) {
+                Up[i][j] = -Up[i][j];
+            }
+        }
+    }
+
+    // Update orbitals: C_new = C_old * U (GAMESS lines 1419-1420)
+    auto C_old = Ca_->clone();
+    auto C_new = linalg::doublet(C_old, U, false, false);
+    Ca_->copy(C_new);
+    Cb_->copy(Ca_);  // RHF: Cb = Ca
+
+    // Store orbital energies (eigenvalues of F_MO)
+    double* eps_p = eps->pointer();
+    double* eps_a = epsilon_a_->pointer(0);
+    for (int i = 0; i < N; ++i) {
+        eps_a[i] = eps_p[i];
+    }
+    epsilon_b_->copy(*epsilon_a_);
+
+    if (reks_debug_ >= 2) {
+        outfile->Printf("\n  === GAMESS-style Orbital Update ===\n");
+        outfile->Printf("  Eigenvalues: ");
+        for (int i = std::max(0, active_r_ - 2); i < std::min(N, active_s_ + 3); ++i) {
+            outfile->Printf("ε(%d)=%10.6f ", i, eps_p[i]);
+        }
+        outfile->Printf("\n");
     }
 }
 

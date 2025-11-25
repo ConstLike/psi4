@@ -91,7 +91,8 @@ class REKS : public RHF {
     std::array<double, N_MICRO_> E_micro_;              ///< E_L for L=1,2,3,5
 
     // ─────────── Coupling Fock Matrix ───────────
-    SharedMatrix F_reks_;          ///< Assembled coupling Fock matrix
+    SharedMatrix F_reks_;          ///< Assembled coupling Fock matrix (AO basis)
+    SharedMatrix F_reks_MO_;       ///< F_reks in MO basis (for GAMESS-style orbital update)
     double Wrs_lagr_ = 0.0;        ///< Off-diagonal Lagrange multiplier for SI
 
     // ─────────── Weighting Factors ───────────
@@ -154,7 +155,10 @@ class REKS : public RHF {
     /// Build microstate Fock matrices and compute microstate energies
     void form_G() override;
     /// Build REKS coupling Fock matrix from microstate Fock matrices
+    /// NOTE: Also updates orbitals (Ca_, epsilon_a_) GAMESS-style via MO-basis diagonalization
     void form_F() override;
+    /// REKS uses GAMESS-style orbital update in form_F(), so form_C does nothing
+    void form_C(double shift = 0.0) override;
     /// Compute state-averaged REKS energy
     double compute_E() override;
 
