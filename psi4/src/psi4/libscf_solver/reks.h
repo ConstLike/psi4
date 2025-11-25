@@ -95,6 +95,13 @@ class REKS : public RHF {
     SharedMatrix F_reks_MO_;       ///< F_reks in MO basis (for GAMESS-style orbital update)
     double Wrs_lagr_ = 0.0;        ///< Off-diagonal Lagrange multiplier for SI
 
+    // --- Pre-allocated Work Matrices (for HPC efficiency) ---
+    SharedMatrix C_D00_;           ///< Work matrix: C columns for D00 (core only)
+    SharedMatrix C_D10_;           ///< Work matrix: C columns for D10 (core + r)
+    SharedMatrix C_D01_;           ///< Work matrix: C columns for D01 (core + s)
+    SharedMatrix C_D11_;           ///< Work matrix: C columns for D11 (core + r + s)
+    SharedMatrix J_work_;          ///< Work matrix: temporary for J_total
+
     // --- Weighting Factors ---
     std::array<double, N_MICRO_> C_L_;  ///< Weighting factors for SA-REKS
 
@@ -198,13 +205,13 @@ class REKS : public RHF {
 
     // --- Accessors for Testing & Analysis ---
     /// Get FON for orbital r
-    double get_n_r() const { return n_r_; }
+    [[nodiscard]] double get_n_r() const { return n_r_; }
     /// Get FON for orbital s
-    double get_n_s() const { return n_s_; }
+    [[nodiscard]] double get_n_s() const { return n_s_; }
     /// Get microstate energy for index L (0-3)
-    double get_microstate_energy(int L) const { return E_micro_[L]; }
+    [[nodiscard]] double get_microstate_energy(int L) const { return E_micro_[L]; }
     /// Get interpolating function value at current FON
-    double get_f_value() const { return f_interp(n_r_ / 2.0); }
+    [[nodiscard]] double get_f_value() const { return f_interp(n_r_ / 2.0); }
 };
 
 }  // namespace scf

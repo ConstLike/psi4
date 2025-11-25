@@ -46,6 +46,7 @@
 #include "psi4/libmints/vector.h"
 #include "psi4/libfock/jk.h"
 #include "psi4/libfunctional/superfunctional.h"
+#include "psi4/libqt/qt.h"  // For C_DGEMM, C_DGER (BLAS)
 
 #include <cmath>
 #include <algorithm>
@@ -127,6 +128,8 @@ void REKS::reks_common_init() {
 }
 
 void REKS::allocate_reks_matrices() {
+    int nso = nsopi_[0];  // Assuming C1 symmetry
+
     // Allocate base density matrices
     D00_ = std::make_shared<Matrix>("D00 (core)", nsopi_, nsopi_);
     D10_ = std::make_shared<Matrix>("D10 (core+r)", nsopi_, nsopi_);
@@ -144,6 +147,14 @@ void REKS::allocate_reks_matrices() {
 
     // Allocate coupling Fock matrix
     F_reks_ = std::make_shared<Matrix>("F_REKS (coupling)", nsopi_, nsopi_);
+
+    // Pre-allocate work matrices for JK computation (HPC optimization)
+    // These are reused every SCF iteration instead of being reallocated
+    C_D00_ = std::make_shared<Matrix>("C for D00", nso, std::max(1, Ncore_));
+    C_D10_ = std::make_shared<Matrix>("C for D10", nso, Ncore_ + 1);
+    C_D01_ = std::make_shared<Matrix>("C for D01", nso, Ncore_ + 1);
+    C_D11_ = std::make_shared<Matrix>("C for D11", nso, Ncore_ + 2);
+    J_work_ = std::make_shared<Matrix>("J_work", nsopi_, nsopi_);
 }
 
 // ---------------------------------------------------------------------------
@@ -390,18 +401,14 @@ void REKS::build_microstate_focks() {
 
     int nso = nsopi_[0];
 
-    // Build C matrices for the 4 unique base densities + RHF occupied
-    auto C_D00 = std::make_shared<Matrix>("C for D00", nso, Ncore_);  // Fixed: was std::max(1, Ncore_)
-    auto C_D10 = std::make_shared<Matrix>("C for D10", nso, Ncore_ + 1);
-    auto C_D01 = std::make_shared<Matrix>("C for D01", nso, Ncore_ + 1);
-    auto C_D11 = std::make_shared<Matrix>("C for D11", nso, Ncore_ + 2);
+    // Use pre-allocated work matrices (allocated once in allocate_reks_matrices)
     auto C_occ = Ca_subset("SO", "OCC");  // RHF occupied orbitals for G_
 
     double** Cp = Ca_->pointer(0);
 
     // C_D00: columns [0..Ncore-1] - core only
     if (Ncore_ > 0) {
-        double** C00p = C_D00->pointer(0);
+        double** C00p = C_D00_->pointer(0);
         for (int mu = 0; mu < nso; ++mu) {
             for (int k = 0; k < Ncore_; ++k) {
                 C00p[mu][k] = Cp[mu][k];
@@ -411,7 +418,7 @@ void REKS::build_microstate_focks() {
 
     // C_D10: columns [0..Ncore] - core + r (contiguous)
     {
-        double** C10p = C_D10->pointer(0);
+        double** C10p = C_D10_->pointer(0);
         for (int mu = 0; mu < nso; ++mu) {
             for (int k = 0; k < Ncore_ + 1; ++k) {
                 C10p[mu][k] = Cp[mu][k];
@@ -421,7 +428,7 @@ void REKS::build_microstate_focks() {
 
     // C_D01: columns [0..Ncore-1, s] - core + s (NOT contiguous, s is at Ncore+1)
     {
-        double** C01p = C_D01->pointer(0);
+        double** C01p = C_D01_->pointer(0);
         for (int mu = 0; mu < nso; ++mu) {
             for (int k = 0; k < Ncore_; ++k) {
                 C01p[mu][k] = Cp[mu][k];
@@ -433,7 +440,7 @@ void REKS::build_microstate_focks() {
 
     // C_D11: columns [0..Ncore+1] - core + r + s (contiguous)
     {
-        double** C11p = C_D11->pointer(0);
+        double** C11p = C_D11_->pointer(0);
         for (int mu = 0; mu < nso; ++mu) {
             for (int k = 0; k < Ncore_ + 2; ++k) {
                 C11p[mu][k] = Cp[mu][k];
@@ -454,15 +461,17 @@ void REKS::build_microstate_focks() {
     C_right.clear();
 
     if (Ncore_ > 0) {
-        C_left.push_back(C_D00);  // [0]
+        C_left.push_back(C_D00_);  // [0]
     } else {
-        auto C_empty = std::make_shared<Matrix>("C empty", nso, 0);
-        C_left.push_back(C_empty);  // [0] D00 = 0 for H2
+        // For H2 (Ncore=0), use pre-allocated C_D00_ which has 1 column
+        // Zero it to produce zero J/K
+        C_D00_->zero();
+        C_left.push_back(C_D00_);  // [0] D00 = 0 for H2
     }
-    C_left.push_back(C_D10);  // [1]
-    C_left.push_back(C_D01);  // [2]
-    C_left.push_back(C_D11);  // [3]
-    C_left.push_back(C_occ);  // [4] RHF occupied for G_
+    C_left.push_back(C_D10_);  // [1]
+    C_left.push_back(C_D01_);  // [2]
+    C_left.push_back(C_D11_);  // [3]
+    C_left.push_back(C_occ);   // [4] RHF occupied for G_
 
     jk_->compute();
 
@@ -492,17 +501,17 @@ void REKS::build_microstate_focks() {
         G_->axpy(-alpha, K_);
     }
 
-    // Build Fock matrices for each microstate
+    // Build Fock matrices for each microstate using pre-allocated J_work_
     // F^sigma_L = H + J_total_L - alpha*K^sigma_L
 
     // L=0 (closed-shell r): D^alpha = D^beta = D10
     // J_total = 2*J10, K^alpha = K^beta = K10
     {
-        auto J_total = J[1]->clone();
-        J_total->scale(2.0);
+        J_work_->copy(J[1]);
+        J_work_->scale(2.0);
 
         F_alpha_micro_[0]->copy(H_);
-        F_alpha_micro_[0]->add(J_total);
+        F_alpha_micro_[0]->add(J_work_);
         F_alpha_micro_[0]->axpy(-alpha, K[1]);
 
         F_beta_micro_[0]->copy(F_alpha_micro_[0]);  // Same for closed-shell
@@ -511,11 +520,11 @@ void REKS::build_microstate_focks() {
     // L=1 (closed-shell s): D^alpha = D^beta = D01
     // J_total = 2*J01, K^alpha = K^beta = K01
     {
-        auto J_total = J[2]->clone();
-        J_total->scale(2.0);
+        J_work_->copy(J[2]);
+        J_work_->scale(2.0);
 
         F_alpha_micro_[1]->copy(H_);
-        F_alpha_micro_[1]->add(J_total);
+        F_alpha_micro_[1]->add(J_work_);
         F_alpha_micro_[1]->axpy(-alpha, K[2]);
 
         F_beta_micro_[1]->copy(F_alpha_micro_[1]);  // Same for closed-shell
@@ -524,30 +533,30 @@ void REKS::build_microstate_focks() {
     // L=2 (open-shell r-up s-down): D^alpha = D10, D^beta = D01
     // J_total = J10 + J01, K^alpha = K10, K^beta = K01
     {
-        auto J_total = J[1]->clone();
-        J_total->add(J[2]);
+        J_work_->copy(J[1]);
+        J_work_->add(J[2]);
 
         F_alpha_micro_[2]->copy(H_);
-        F_alpha_micro_[2]->add(J_total);
+        F_alpha_micro_[2]->add(J_work_);
         F_alpha_micro_[2]->axpy(-alpha, K[1]);
 
         F_beta_micro_[2]->copy(H_);
-        F_beta_micro_[2]->add(J_total);
+        F_beta_micro_[2]->add(J_work_);
         F_beta_micro_[2]->axpy(-alpha, K[2]);
     }
 
     // L=3 (triplet-like): D^alpha = D11, D^beta = D00
     // J_total = J11 + J00, K^alpha = K11, K^beta = K00
     {
-        auto J_total = J[3]->clone();
-        J_total->add(J[0]);
+        J_work_->copy(J[3]);
+        J_work_->add(J[0]);
 
         F_alpha_micro_[3]->copy(H_);
-        F_alpha_micro_[3]->add(J_total);
+        F_alpha_micro_[3]->add(J_work_);
         F_alpha_micro_[3]->axpy(-alpha, K[3]);
 
         F_beta_micro_[3]->copy(H_);
-        F_beta_micro_[3]->add(J_total);
+        F_beta_micro_[3]->add(J_work_);
         F_beta_micro_[3]->axpy(-alpha, K[0]);
     }
 
