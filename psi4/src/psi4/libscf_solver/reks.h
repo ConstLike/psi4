@@ -46,7 +46,7 @@ namespace scf {
  * Based on: Filatov, M. "Note on the implementation of SA-REKS, SSR, and CP-REKS" (2024)
  *
  * Key features:
- * - 4 unique microstates (from 6 total, using symmetry: L=3≡L=4, L=5≡L=6)
+ * - 4 unique microstates (from 6 total, using symmetry: L=3=L=4, L=5=L=6)
  * - Fractional occupation numbers (FONs) with constraint: n_r + n_s = 2
  * - Newton-Raphson FON optimization (RexSolver)
  * - Coupling operator technique for orbital optimization
@@ -59,56 +59,56 @@ namespace scf {
  */
 class REKS : public RHF {
    protected:
-    // ─────────── Active Space Parameters ───────────
+    // --- Active Space Parameters ---
     int n_active_electrons_ = 2;   ///< Number of active electrons (2 for REKS(2,2))
     int n_active_orbitals_ = 2;    ///< Number of active orbitals (2 for REKS(2,2))
     int Ncore_ = -1;               ///< Number of core orbitals (computed from nalpha - 1)
     int active_r_ = -1;            ///< Index of active orbital r (= Ncore)
     int active_s_ = -1;            ///< Index of active orbital s (= Ncore + 1)
 
-    // ─────────── Fractional Occupation Numbers ───────────
+    // --- Fractional Occupation Numbers ---
     double n_r_ = 1.0;             ///< FON for orbital r, constraint: n_r + n_s = 2
     double n_s_ = 1.0;             ///< FON for orbital s = 2 - n_r
     static constexpr double DELTA_ = 0.4;  ///< Filatov interpolation parameter
 
-    // ─────────── State Averaging Weights ───────────
+    // --- State Averaging Weights ---
     double w_PPS_ = 0.5;           ///< Weight for PPS (perfectly paired singlet) state
     double w_OSS_ = 0.5;           ///< Weight for OSS (open-shell singlet) state
 
-    // ─────────── Base Density Matrices ───────────
+    // --- Base Density Matrices ---
     SharedMatrix D00_;             ///< Core only density
     SharedMatrix D10_;             ///< Core + r singly occupied
     SharedMatrix D01_;             ///< Core + s singly occupied
     SharedMatrix D11_;             ///< Core + r + s singly occupied
 
-    // ─────────── Microstate Data (4 unique microstates) ───────────
-    static constexpr int N_MICRO_ = 4;  ///< Only 4 needed (L=3≡L=4, L=5≡L=6)
+    // --- Microstate Data (4 unique microstates) ---
+    static constexpr int N_MICRO_ = 4;  ///< Only 4 needed (L=3=L=4, L=5=L=6 by symmetry)
 
-    std::array<SharedMatrix, N_MICRO_> D_alpha_micro_;  ///< D^α for L=1,2,3,5
-    std::array<SharedMatrix, N_MICRO_> D_beta_micro_;   ///< D^β for L=1,2,3,5
-    std::array<SharedMatrix, N_MICRO_> F_alpha_micro_;  ///< F^α for L=1,2,3,5
-    std::array<SharedMatrix, N_MICRO_> F_beta_micro_;   ///< F^β for L=1,2,3,5
+    std::array<SharedMatrix, N_MICRO_> D_alpha_micro_;  ///< D^alpha for L=1,2,3,5
+    std::array<SharedMatrix, N_MICRO_> D_beta_micro_;   ///< D^beta for L=1,2,3,5
+    std::array<SharedMatrix, N_MICRO_> F_alpha_micro_;  ///< F^alpha for L=1,2,3,5
+    std::array<SharedMatrix, N_MICRO_> F_beta_micro_;   ///< F^beta for L=1,2,3,5
     std::array<double, N_MICRO_> E_micro_;              ///< E_L for L=1,2,3,5
 
-    // ─────────── Coupling Fock Matrix ───────────
+    // --- Coupling Fock Matrix ---
     SharedMatrix F_reks_;          ///< Assembled coupling Fock matrix (AO basis)
     SharedMatrix F_reks_MO_;       ///< F_reks in MO basis (for GAMESS-style orbital update)
     double Wrs_lagr_ = 0.0;        ///< Off-diagonal Lagrange multiplier for SI
 
-    // ─────────── Weighting Factors ───────────
+    // --- Weighting Factors ---
     std::array<double, N_MICRO_> C_L_;  ///< Weighting factors for SA-REKS
 
-    // ─────────── Microstate Occupation Tables ───────────
+    // --- Microstate Occupation Tables ---
     /// From Filatov 2024 Table 2 (for 4 unique microstates: L=1,2,3,5)
-    static constexpr int nr_alpha_[4] = {1, 0, 1, 1};  ///< n^α_r for L=1,2,3,5
-    static constexpr int nr_beta_[4]  = {1, 0, 0, 0};  ///< n^β_r for L=1,2,3,5
-    static constexpr int ns_alpha_[4] = {0, 1, 0, 1};  ///< n^α_s for L=1,2,3,5
-    static constexpr int ns_beta_[4]  = {0, 1, 1, 0};  ///< n^β_s for L=1,2,3,5
+    static constexpr int nr_alpha_[4] = {1, 0, 1, 1};  ///< n^alpha_r for L=1,2,3,5
+    static constexpr int nr_beta_[4]  = {1, 0, 0, 0};  ///< n^beta_r for L=1,2,3,5
+    static constexpr int ns_alpha_[4] = {0, 1, 0, 1};  ///< n^alpha_s for L=1,2,3,5
+    static constexpr int ns_beta_[4]  = {0, 1, 1, 0};  ///< n^beta_s for L=1,2,3,5
 
-    // ─────────── Debug Level ───────────
+    // --- Debug Level ---
     int reks_debug_ = 0;           ///< 0=none, 1=energies, 2=matrices, 3=all
 
-    // ─────────── Protected Methods ───────────
+    // --- Protected Methods ---
     /// REKS-specific initialization
     void reks_common_init();
 
@@ -119,12 +119,12 @@ class REKS : public RHF {
     double f_interp(double x) const;
     /// First derivative df/dx
     double df_interp(double x) const;
-    /// Second derivative d²f/dx²
+    /// Second derivative d2f/dx2
     double d2f_interp(double x) const;
 
     /// Build base density matrices D00, D10, D01, D11
     void build_base_densities();
-    /// Map base densities to microstate α/β densities
+    /// Map base densities to microstate alpha/beta densities
     void build_microstate_densities();
 
     /// Build UHF-like Fock matrices for each microstate
@@ -149,8 +149,8 @@ class REKS : public RHF {
     /// Debug output: FON info
     void print_fon_info() const;
 
-    // ─────────── SCF Method Overrides ───────────
-    /// Build REKS density matrices (D00, D10, D01, D11 → microstate densities)
+    // --- SCF Method Overrides ---
+    /// Build REKS density matrices (D00, D10, D01, D11 -> microstate densities)
     void form_D() override;
     /// Build microstate Fock matrices and compute microstate energies
     void form_G() override;
@@ -196,7 +196,7 @@ class REKS : public RHF {
      */
     std::shared_ptr<REKS> c1_deep_copy(std::shared_ptr<BasisSet> basis);
 
-    // ─────────── Accessors for Testing & Analysis ───────────
+    // --- Accessors for Testing & Analysis ---
     /// Get FON for orbital r
     double get_n_r() const { return n_r_; }
     /// Get FON for orbital s

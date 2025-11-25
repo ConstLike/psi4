@@ -30,16 +30,11 @@
  * @file reks.cc
  * @brief Implementation of Restricted Ensemble Kohn-Sham (REKS) method.
  *
- * Current Implementation Status:
- * - Phase 1: REKS class structure inheriting from RHF
- * - All calculations delegate to RHF (functionally equivalent to RHF)
- * - Foundation for REKS-specific features in future phases
+ * REKS(2,2) implementation: 2 electrons in 2 active orbitals.
+ * Uses ensemble averaging of 4 unique microstates with fractional
+ * occupation numbers (FON) optimized via Newton-Raphson.
  *
- * Future Development Phases:
- * - Phase 2: Active space definition and fractional occupations
- * - Phase 3: Ensemble energy functional
- * - Phase 4: SI-SA-REKS (state-interaction state-averaged REKS)
- * - Phase 5: Analytical gradients
+ * Reference: Filatov, M. "Note on SA-REKS, SSR, CP-REKS implementation" (2024)
  */
 
 #include "reks.h"
@@ -107,23 +102,23 @@ void REKS::reks_common_init() {
     allocate_reks_matrices();
 
     if (reks_debug_ >= 1) {
-        outfile->Printf("\n  ╔══════════════════════════════════════════════════════════╗\n");
-        outfile->Printf("  ║              REKS(2,2) Initialization                     ║\n");
-        outfile->Printf("  ╠══════════════════════════════════════════════════════════╣\n");
-        outfile->Printf("  ║  Active space: %d electrons in %d orbitals               ║\n",
+        outfile->Printf("\n  ============================================================\n");
+        outfile->Printf("                REKS(2,2) Initialization\n");
+        outfile->Printf("  ------------------------------------------------------------\n");
+        outfile->Printf("  Active space: %d electrons in %d orbitals\n",
                         n_active_electrons_, n_active_orbitals_);
-        outfile->Printf("  ║  Core orbitals (Ncore): %3d                              ║\n", Ncore_);
-        outfile->Printf("  ║  Active orbital r:      %3d (HOMO)                       ║\n", active_r_);
-        outfile->Printf("  ║  Active orbital s:      %3d (LUMO)                       ║\n", active_s_);
-        outfile->Printf("  ╠══════════════════════════════════════════════════════════╣\n");
-        outfile->Printf("  ║  Initial FON: n_r = %.6f, n_s = %.6f              ║\n", n_r_, n_s_);
-        outfile->Printf("  ║  SA weights:  w_PPS = %.4f, w_OSS = %.4f               ║\n", w_PPS_, w_OSS_);
-        outfile->Printf("  ║  Filatov delta parameter: %.4f                          ║\n", DELTA_);
-        outfile->Printf("  ╠══════════════════════════════════════════════════════════╣\n");
-        outfile->Printf("  ║  f(0.5) = %.8f  (should be 1.0)                    ║\n", f_interp(0.5));
-        outfile->Printf("  ║  f(0.25) = %.8f                                    ║\n", f_interp(0.25));
-        outfile->Printf("  ║  f(0.0) = %.8f  (should be 0.0)                    ║\n", f_interp(0.0));
-        outfile->Printf("  ╚══════════════════════════════════════════════════════════╝\n\n");
+        outfile->Printf("  Core orbitals (Ncore): %3d\n", Ncore_);
+        outfile->Printf("  Active orbital r:      %3d (HOMO)\n", active_r_);
+        outfile->Printf("  Active orbital s:      %3d (LUMO)\n", active_s_);
+        outfile->Printf("  ------------------------------------------------------------\n");
+        outfile->Printf("  Initial FON: n_r = %.6f, n_s = %.6f\n", n_r_, n_s_);
+        outfile->Printf("  SA weights:  w_PPS = %.4f, w_OSS = %.4f\n", w_PPS_, w_OSS_);
+        outfile->Printf("  Filatov delta parameter: %.4f\n", DELTA_);
+        outfile->Printf("  ------------------------------------------------------------\n");
+        outfile->Printf("  f(0.5) = %.8f  (should be 1.0)\n", f_interp(0.5));
+        outfile->Printf("  f(0.25) = %.8f\n", f_interp(0.25));
+        outfile->Printf("  f(0.0) = %.8f  (should be 0.0)\n", f_interp(0.0));
+        outfile->Printf("  ============================================================\n\n");
     }
 
     // NOTE: Ca_ is allocated here but EMPTY (zeros).
@@ -151,13 +146,13 @@ void REKS::allocate_reks_matrices() {
     F_reks_ = std::make_shared<Matrix>("F_REKS (coupling)", nsopi_, nsopi_);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ---------------------------------------------------------------------------
 // Interpolating Function f(x) and Derivatives (Filatov 2024, Eq. 4)
-// ═══════════════════════════════════════════════════════════════════════════
+// ---------------------------------------------------------------------------
 
 double REKS::f_interp(double x) const {
     // GAMESS REXCONVF function (used for x = n_r*n_s)
-    // f(x) = x^(1 - 0.5*(x+δ)/(1+δ))
+    // f(x) = x^(1 - 0.5*(x+delta)/(1+delta))
     // Domain: 0 <= x <= 1, where x = n_r*n_s
     // At x = 0: f = 0 (no coupling)
     // At x = 1: f = 1 (maximum coupling, n_r=n_s=1)
@@ -199,9 +194,9 @@ double REKS::d2f_interp(double x) const {
     return (fp - fm) / (2.0 * h);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ---------------------------------------------------------------------------
 // Density Matrix Construction (Filatov 2024, Section 2)
-// ═══════════════════════════════════════════════════════════════════════════
+// ---------------------------------------------------------------------------
 
 void REKS::build_base_densities() {
     // Builds D00, D10, D01, D11 from current orbitals Ca_
@@ -210,9 +205,9 @@ void REKS::build_base_densities() {
     // D01 = core + orbital s singly occupied
     // D11 = core + r + s both singly occupied
 
-    // PHASE 1 DEBUG: Print C matrix after GUESS (iteration 1 only)
+    // Debug: Print C matrix after GUESS (iteration 1 only)
     if (iteration_ == 1 && reks_debug_ >= 2) {
-        outfile->Printf("\n  === PHASE 1: GUESS C Matrix (Psi4) ===\n");
+        outfile->Printf("\n  === GUESS C Matrix (Psi4) ===\n");
         outfile->Printf("  First 5 orbitals, first 5 basis functions:\n");
         double** Cp = Ca_->pointer(0);
         int nprint = std::min(5, nsopi_[0]);
@@ -282,7 +277,7 @@ void REKS::build_base_densities() {
     }
 
     if (reks_debug_ >= 2) {
-        // PHASE 2 DEBUG: Print trace(D) to compare with GAMESS
+        // Print trace(D) for comparison with GAMESS
         double tr_D00 = 0.0, tr_D10 = 0.0, tr_D01 = 0.0, tr_D11 = 0.0;
         double** D00p = D00_->pointer(0);
         double** D10p = D10_->pointer(0);
@@ -295,7 +290,7 @@ void REKS::build_base_densities() {
             tr_D11 += D11p[mu][mu];
         }
 
-        outfile->Printf("\n  === PHASE 2: Density Matrix Traces (Psi4) ===\n");
+        outfile->Printf("\n  === Density Matrix Traces (Psi4) ===\n");
         outfile->Printf("  Tr(D00)= %.10f Tr(D10)= %.10f Tr(D01)= %.10f Tr(D11)= %.10f\n",
                         tr_D00, tr_D10, tr_D01, tr_D11);
         outfile->Printf("  Active indices: Ncore=%d, active_r=%d, active_s=%d\n",
@@ -318,13 +313,13 @@ void REKS::build_base_densities() {
 }
 
 void REKS::build_microstate_densities() {
-    // Map base densities to microstate α/β densities
-    // Only 4 unique microstates needed (L=3≡L=4, L=5≡L=6)
+    // Map base densities to microstate alpha/beta densities
+    // Only 4 unique microstates needed (L=3=L=4, L=5=L=6 by symmetry)
     //
-    // L=0 (paper L=1): D^α = D10, D^β = D10  (closed-shell n_r)
-    // L=1 (paper L=2): D^α = D01, D^β = D01  (closed-shell n_s)
-    // L=2 (paper L=3): D^α = D10, D^β = D01  (open-shell r↑s↓)
-    // L=3 (paper L=5): D^α = D11, D^β = D00  (triplet-like)
+    // L=0 (paper L=1): D^alpha = D10, D^beta = D10  (closed-shell n_r)
+    // L=1 (paper L=2): D^alpha = D01, D^beta = D01  (closed-shell n_s)
+    // L=2 (paper L=3): D^alpha = D10, D^beta = D01  (open-shell r-up s-down)
+    // L=3 (paper L=5): D^alpha = D11, D^beta = D00  (triplet-like)
 
     D_alpha_micro_[0]->copy(D10_);
     D_beta_micro_[0]->copy(D10_);
@@ -341,8 +336,8 @@ void REKS::build_microstate_densities() {
     if (reks_debug_ >= 2) {
         outfile->Printf("\n  === REKS Microstate Densities ===\n");
         for (int L = 0; L < N_MICRO_; ++L) {
-            outfile->Printf("  L=%d: tr(D^α) = %10.6f, tr(D^β) = %10.6f, "
-                           "n_r^α=%d, n_r^β=%d, n_s^α=%d, n_s^β=%d\n",
+            outfile->Printf("  L=%d: tr(D^alpha) = %10.6f, tr(D^beta) = %10.6f, "
+                           "n_r^alpha=%d, n_r^beta=%d, n_s^alpha=%d, n_s^beta=%d\n",
                 L, D_alpha_micro_[L]->trace(), D_beta_micro_[L]->trace(),
                 nr_alpha_[L], nr_beta_[L], ns_alpha_[L], ns_beta_[L]);
         }
@@ -351,11 +346,10 @@ void REKS::build_microstate_densities() {
 
 void REKS::compute_weighting_factors() {
     // Compute C_L weights for SA-REKS (GAMESS REXCM function)
-    // CRITICAL: f_interp argument is n_r*n_s, NOT n_r/2!
-    // GAMESS: TMP = 4*DNR*DNS = 4*(n_r/2)*(n_s/2) = n_r*n_s
-    double f = f_interp(n_r_ * n_s_);  // f(n_r*n_s), NOT f(n_r/2)!
+    // f_interp argument is n_r*n_s (GAMESS: TMP = 4*DNR*DNS = n_r*n_s)
+    double f = f_interp(n_r_ * n_s_);
 
-    // C_L for SA-REKS (STATAVG branch, wpps≠1.0)
+    // C_L for SA-REKS (STATAVG branch, wpps != 1.0)
     // L=0: WPPS*DNR = w_PPS*(n_r/2)
     C_L_[0] = w_PPS_ * n_r_ / 2.0;
 
@@ -380,19 +374,19 @@ void REKS::compute_weighting_factors() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Step 7: Build Microstate Fock Matrices (Filatov 2024, Section 2)
-// ═══════════════════════════════════════════════════════════════════════════
+// ---------------------------------------------------------------------------
+// Build Microstate Fock Matrices (Filatov 2024, Section 2)
+// ---------------------------------------------------------------------------
 
 void REKS::build_microstate_focks() {
     // Build UHF-like Fock matrices for each of the 4 unique microstates.
     // Single JK batch: D00, D10, D01, D11 + Da_ (for RHF G_ compatibility)
     //
     // Microstate density mapping:
-    //   L=0: D^α = D10, D^β = D10  (closed-shell r)
-    //   L=1: D^α = D01, D^β = D01  (closed-shell s)
-    //   L=2: D^α = D10, D^β = D01  (open-shell r↑s↓)
-    //   L=3: D^α = D11, D^β = D00  (triplet-like)
+    //   L=0: D^alpha = D10, D^beta = D10  (closed-shell r)
+    //   L=1: D^alpha = D01, D^beta = D01  (closed-shell s)
+    //   L=2: D^alpha = D10, D^beta = D01  (open-shell r-up s-down)
+    //   L=3: D^alpha = D11, D^beta = D00  (triplet-like)
 
     int nso = nsopi_[0];
 
@@ -447,14 +441,12 @@ void REKS::build_microstate_focks() {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
     // Batch JK computation: 5 densities in one call
-    // ═══════════════════════════════════════════════════════════════════════
-    //   [0] C_D00 → J00, K00
-    //   [1] C_D10 → J10, K10
-    //   [2] C_D01 → J01, K01
-    //   [3] C_D11 → J11, K11
-    //   [4] C_occ → J_rhf, K_rhf (for RHF G_ matrix)
+    //   [0] C_D00 -> J00, K00
+    //   [1] C_D10 -> J10, K10
+    //   [2] C_D01 -> J01, K01
+    //   [3] C_D11 -> J11, K11
+    //   [4] C_occ -> J_rhf, K_rhf (for RHF G_ matrix)
 
     std::vector<SharedMatrix>& C_left = jk_->C_left();
     std::vector<SharedMatrix>& C_right = jk_->C_right();
@@ -489,10 +481,8 @@ void REKS::build_microstate_focks() {
 
     double alpha = functional_->is_x_hybrid() ? functional_->x_alpha() : 1.0;
 
-    // ═══════════════════════════════════════════════════════════════════════
     // Build RHF J_, K_, G_ for DIIS and compute_E() compatibility
-    // RHF convention: G_ = 2*J - α*K
-    // ═══════════════════════════════════════════════════════════════════════
+    // RHF convention: G_ = 2*J - alpha*K
     J_ = J[4];
     K_ = K[4];
 
@@ -502,13 +492,11 @@ void REKS::build_microstate_focks() {
         G_->axpy(-alpha, K_);
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
     // Build Fock matrices for each microstate
-    // F^σ_L = H + J_total_L - α*K^σ_L
-    // ═══════════════════════════════════════════════════════════════════════
+    // F^sigma_L = H + J_total_L - alpha*K^sigma_L
 
-    // L=0 (closed-shell r): D^α = D^β = D10
-    // J_total = 2*J10, K^α = K^β = K10
+    // L=0 (closed-shell r): D^alpha = D^beta = D10
+    // J_total = 2*J10, K^alpha = K^beta = K10
     {
         auto J_total = J[1]->clone();
         J_total->scale(2.0);
@@ -520,8 +508,8 @@ void REKS::build_microstate_focks() {
         F_beta_micro_[0]->copy(F_alpha_micro_[0]);  // Same for closed-shell
     }
 
-    // L=1 (closed-shell s): D^α = D^β = D01
-    // J_total = 2*J01, K^α = K^β = K01
+    // L=1 (closed-shell s): D^alpha = D^beta = D01
+    // J_total = 2*J01, K^alpha = K^beta = K01
     {
         auto J_total = J[2]->clone();
         J_total->scale(2.0);
@@ -533,8 +521,8 @@ void REKS::build_microstate_focks() {
         F_beta_micro_[1]->copy(F_alpha_micro_[1]);  // Same for closed-shell
     }
 
-    // L=2 (open-shell r↑s↓): D^α = D10, D^β = D01
-    // J_total = J10 + J01, K^α = K10, K^β = K01
+    // L=2 (open-shell r-up s-down): D^alpha = D10, D^beta = D01
+    // J_total = J10 + J01, K^alpha = K10, K^beta = K01
     {
         auto J_total = J[1]->clone();
         J_total->add(J[2]);
@@ -548,8 +536,8 @@ void REKS::build_microstate_focks() {
         F_beta_micro_[2]->axpy(-alpha, K[2]);
     }
 
-    // L=3 (triplet-like): D^α = D11, D^β = D00
-    // J_total = J11 + J00, K^α = K11, K^β = K00
+    // L=3 (triplet-like): D^alpha = D11, D^beta = D00
+    // J_total = J11 + J00, K^alpha = K11, K^beta = K00
     {
         auto J_total = J[3]->clone();
         J_total->add(J[0]);
@@ -565,7 +553,7 @@ void REKS::build_microstate_focks() {
 
     if (reks_debug_ >= 2) {
         outfile->Printf("\n  === REKS Microstate Fock Matrices ===\n");
-        outfile->Printf("  Exchange scaling α = %.4f\n", alpha);
+        outfile->Printf("  Exchange scaling alpha = %.4f\n", alpha);
 
         // Compare with RHF Fock for validation
         Fa_->copy(H_);
@@ -587,24 +575,24 @@ void REKS::build_microstate_focks() {
             double Fss_b = Fb[active_s_][active_s_];
             double Frs_b = Fb[active_r_][active_s_];
 
-            outfile->Printf("  L=%d: tr(F^α)=%15.10f, tr(F^β)=%15.10f\n", L, tr_alpha, tr_beta);
-            outfile->Printf("        F^α[r,r]=%12.6f, F^α[s,s]=%12.6f, F^α[r,s]=%12.6f\n",
+            outfile->Printf("  L=%d: tr(F^alpha)=%15.10f, tr(F^beta)=%15.10f\n", L, tr_alpha, tr_beta);
+            outfile->Printf("        F^alpha[r,r]=%12.6f, F^alpha[s,s]=%12.6f, F^alpha[r,s]=%12.6f\n",
                            Frr_a, Fss_a, Frs_a);
-            outfile->Printf("        F^β[r,r]=%12.6f, F^β[s,s]=%12.6f, F^β[r,s]=%12.6f\n",
+            outfile->Printf("        F^beta[r,r]=%12.6f, F^beta[s,s]=%12.6f, F^beta[r,s]=%12.6f\n",
                            Frr_b, Fss_b, Frs_b);
         }
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Step 8: Compute Microstate Energies (Filatov 2024, Eq. 5)
-// ═══════════════════════════════════════════════════════════════════════════
+// ---------------------------------------------------------------------------
+// Compute Microstate Energies (Filatov 2024, Eq. 5)
+// ---------------------------------------------------------------------------
 
 void REKS::compute_microstate_energies() {
-    // E_L = tr(D^α_L · H) + tr(D^β_L · H)
-    //     + 0.5 * [tr(D^α_L · G^α_L) + tr(D^β_L · G^β_L)]
+    // E_L = tr(D^alpha_L * H) + tr(D^beta_L * H)
+    //     + 0.5 * [tr(D^alpha_L * G^alpha_L) + tr(D^beta_L * G^beta_L)]
     //     + E_nuc
-    // where G^σ = F^σ - H = J - α*K^σ
+    // where G^sigma = F^sigma - H = J - alpha*K^sigma
 
     double E_nuc = energies_["Nuclear"];
 
@@ -614,12 +602,12 @@ void REKS::compute_microstate_energies() {
         SharedMatrix Fa = F_alpha_micro_[L];
         SharedMatrix Fb = F_beta_micro_[L];
 
-        // One-electron energy: tr(D^α · H) + tr(D^β · H)
+        // One-electron energy: tr(D^alpha * H) + tr(D^beta * H)
         double E_1e = Da->vector_dot(H_) + Db->vector_dot(H_);
 
         // Two-electron energy from Fock matrices:
-        // E_2e = 0.5 * [tr(D^α · (F^α - H)) + tr(D^β · (F^β - H))]
-        //      = 0.5 * [tr(D^α · F^α) + tr(D^β · F^β) - E_1e]
+        // E_2e = 0.5 * [tr(D^alpha * (F^alpha - H)) + tr(D^beta * (F^beta - H))]
+        //      = 0.5 * [tr(D^alpha * F^alpha) + tr(D^beta * F^beta) - E_1e]
         double E_Fa = Da->vector_dot(Fa);
         double E_Fb = Db->vector_dot(Fb);
         double E_2e = 0.5 * (E_Fa + E_Fb - E_1e);
@@ -637,12 +625,12 @@ void REKS::compute_microstate_energies() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Step 9: RexSolver - Newton-Raphson FON Optimization (Filatov 2024)
-// ═══════════════════════════════════════════════════════════════════════════
+// ---------------------------------------------------------------------------
+// RexSolver - Newton-Raphson FON Optimization (Filatov 2024)
+// ---------------------------------------------------------------------------
 
 void REKS::rex_solver() {
-    // Optimize n_r to minimize E_SA = Σ C_L(n_r) * E_L
+    // Optimize n_r to minimize E_SA = sum_L C_L(n_r) * E_L
     // Constraint: n_s = 2 - n_r
     //
     // For SA-REKS energy (w_PPS, w_OSS weights):
@@ -678,8 +666,8 @@ void REKS::rex_solver() {
         n_s_ = 2.0 - n_r_;
 
         // Interpolating function and derivatives at x = n_r*n_s
-        // CRITICAL: GAMESS uses f(n_r*n_s), NOT f(n_r/2)!
-        double x = n_r_ * n_s_;  // x = n_r*n_s ∈ [0, 1]
+        // GAMESS uses f(n_r*n_s), not f(n_r/2)
+        double x = n_r_ * n_s_;  // x = n_r*n_s in [0, 1]
         double f = f_interp(x);
         double df_dx = df_interp(x);
         double d2f_dx2 = d2f_interp(x);
@@ -699,28 +687,28 @@ void REKS::rex_solver() {
         C_L_current[3] = 0.5 * w_PPS_ * f - 0.5 * w_OSS_;
         double sum_CL = C_L_current[0] + C_L_current[1] + C_L_current[2] + C_L_current[3];
 
-        // CRITICAL FIX: Apply FACT=2 for L>=2 as in GAMESS REXEM2EE
+        // GAMESS applies FACT=2 for L>=2 in REXEM2EE
         double E_SA_current = C_L_current[0] * E_micro_[0] + C_L_current[1] * E_micro_[1]
                             + 2.0 * C_L_current[2] * E_micro_[2] + 2.0 * C_L_current[3] * E_micro_[3];
 
-        // ─────────── Energy gradient dE_SA/dn_r ───────────
-        // C_L[0] = w_PPS * n_r/2             → dC_0/dn_r = w_PPS/2
-        // C_L[1] = w_PPS * n_s/2             → dC_1/dn_r = -w_PPS/2
-        // C_L[2] = w_OSS - 0.5*w_PPS*f       → dC_2/dn_r = -0.5*w_PPS*df/dn_r
-        // C_L[3] = 0.5*w_PPS*f - 0.5*w_OSS   → dC_3/dn_r = 0.5*w_PPS*df/dn_r
+        // Energy gradient dE_SA/dn_r
+        // C_L[0] = w_PPS * n_r/2             -> dC_0/dn_r = w_PPS/2
+        // C_L[1] = w_PPS * n_s/2             -> dC_1/dn_r = -w_PPS/2
+        // C_L[2] = w_OSS - 0.5*w_PPS*f       -> dC_2/dn_r = -0.5*w_PPS*df/dn_r
+        // C_L[3] = 0.5*w_PPS*f - 0.5*w_OSS   -> dC_3/dn_r = 0.5*w_PPS*df/dn_r
         //
-        // dE/dn_r = Σ FACT * (dC_L/dn_r) * E_L, FACT=2 for L>=2
+        // dE/dn_r = sum_L FACT * (dC_L/dn_r) * E_L, FACT=2 for L>=2
         double dE_dnr = (w_PPS_ / 2.0) * (E_micro_[0] - E_micro_[1])
                       + 2.0 * 0.5 * w_PPS_ * df_dnr * (E_micro_[3] - E_micro_[2]);
 
-        // ─────────── Energy Hessian d²E_SA/dn_r² ───────────
+        // Energy Hessian d2E_SA/dn_r2
         // Only C_L[2] and C_L[3] have second derivatives (through f)
-        // d²C_2/dn_r² = -0.5*w_PPS * d²f/dn_r²
-        // d²C_3/dn_r² = 0.5*w_PPS * d²f/dn_r²
+        // d2C_2/dn_r2 = -0.5*w_PPS * d2f/dn_r2
+        // d2C_3/dn_r2 = 0.5*w_PPS * d2f/dn_r2
         // Apply FACT=2 for L>=2
         double d2E_dnr2 = 2.0 * 0.5 * w_PPS_ * d2f_dnr2 * (E_micro_[3] - E_micro_[2]);
 
-        // Newton-Raphson step (or gradient descent if Hessian ≈ 0)
+        // Newton-Raphson step (or gradient descent if Hessian ~ 0)
         double delta;
         if (std::abs(d2E_dnr2) < 1e-10) {
             // Hessian near zero (saddle point at x=0.5) - use gradient descent
@@ -770,9 +758,7 @@ void REKS::rex_solver() {
     // Compute SA-REKS energy with optimized FON
     compute_weighting_factors();  // Update C_L with new n_r
 
-    // CRITICAL FIX: GAMESS REXEM2EE multiplies by 2 for L>=3 (1-based)
-    // In Psi4 (0-based): multiply by 2 for L>=2
-    // GAMESS code: IF(I.GE.3) FACT=TWO; REXEM2EE = REXEM2EE + FACT*CM(I)*EM(I)
+    // GAMESS REXEM2EE multiplies by 2 for L>=3 (1-based), i.e. L>=2 in 0-based
     double E_SA = C_L_[0] * E_micro_[0] + C_L_[1] * E_micro_[1]
                 + 2.0 * C_L_[2] * E_micro_[2] + 2.0 * C_L_[3] * E_micro_[3];
 
@@ -783,9 +769,9 @@ void REKS::rex_solver() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Step 10: FockMicro2Macro - Coupling Operator Assembly (Filatov 2024, Eq.11-15)
-// ═══════════════════════════════════════════════════════════════════════════
+// ---------------------------------------------------------------------------
+// FockMicro2Macro - Coupling Operator Assembly (Filatov 2024, Eq.11-15)
+// ---------------------------------------------------------------------------
 
 void REKS::fock_micro_to_macro(int L, double Cl, double** Fa, double** Fb) {
     // Add contribution from microstate L to coupling Fock matrix F_reks_
@@ -813,41 +799,41 @@ void REKS::fock_micro_to_macro(int L, double Cl, double** Fa, double** Fb) {
 
     double Wc = 0.5 * Cl;  // Core block weight
 
-    // === Core-core block (i,j < Ncore) ===
+    // Core-core block (i,j < Ncore)
     for (int i = 0; i < Ncore_; ++i) {
         for (int j = i; j < Ncore_; ++j) {
             Freks[i][j] += Wc * (Fa[i][j] + Fb[i][j]);
         }
     }
 
-    // === Virtual-virtual block (i,j > active_s) ===
+    // Virtual-virtual block (i,j > active_s)
     for (int i = active_s_ + 1; i < nsopi_[0]; ++i) {
         for (int j = i; j < nsopi_[0]; ++j) {
             Freks[i][j] += Wc * (Fa[i][j] + Fb[i][j]);
         }
     }
 
-    // === Core-virtual block ===
+    // Core-virtual block
     for (int i = 0; i < Ncore_; ++i) {
         for (int j = active_s_ + 1; j < nsopi_[0]; ++j) {
             Freks[i][j] += Wc * (Fa[i][j] + Fb[i][j]);
         }
     }
 
-    // === Active orbital r diagonal ===
-    // Weight: 0.5 * C_L * n^σ_r / f_r
+    // Active orbital r diagonal
+    // Weight: 0.5 * C_L * n^sigma_r / f_r
     double Wr_a = (fr > 1e-10) ? 0.5 * Cl * nra / fr : 0.0;
     double Wr_b = (fr > 1e-10) ? 0.5 * Cl * nrb / fr : 0.0;
     Freks[active_r_][active_r_] += Wr_a * Fa[active_r_][active_r_] + Wr_b * Fb[active_r_][active_r_];
 
-    // === Active orbital s diagonal ===
-    // Weight: 0.5 * C_L * n^σ_s / f_s
+    // Active orbital s diagonal
+    // Weight: 0.5 * C_L * n^sigma_s / f_s
     double Ws_a = (fs > 1e-10) ? 0.5 * Cl * nsa / fs : 0.0;
     double Ws_b = (fs > 1e-10) ? 0.5 * Cl * nsb / fs : 0.0;
     double contrib_ss = Ws_a * Fa[active_s_][active_s_] + Ws_b * Fb[active_s_][active_s_];
     Freks[active_s_][active_s_] += contrib_ss;
 
-    // PHASE 3 DETAILED DEBUG: Trace F(s,s) contributions (now in MO basis!)
+    // Debug: Trace F(s,s) contributions in MO basis
     if (reks_debug_ >= 2) {
         outfile->Printf("  DEBUG_FM2FE_MO L=%d: Cl=%.6f fr=%.6f fs=%.6f nsa=%d nsb=%d\n",
                        L, Cl, fr, fs, nsa, nsb);
@@ -857,13 +843,13 @@ void REKS::fock_micro_to_macro(int L, double Cl, double** Fa, double** Fb) {
                        contrib_ss, Freks[active_s_][active_s_]);
     }
 
-    // === Core-active coupling (core to r) ===
-    // Weight: 0.5 * C_L * (1 - n^σ_r) / (1 - f_r)
+    // Core-active coupling (core to r)
+    // Weight: 0.5 * C_L * (1 - n^sigma_r) / (1 - f_r)
     double omfr = 1.0 - fr;  // 1 - f_r
     double Wcr_a = (omfr > 1e-10) ? 0.5 * Cl * (1 - nra) / omfr : 0.0;
     double Wcr_b = (omfr > 1e-10) ? 0.5 * Cl * (1 - nrb) / omfr : 0.0;
 
-    // === Core-active coupling (core to s) ===
+    // Core-active coupling (core to s)
     double omfs = 1.0 - fs;  // 1 - f_s
     double Wcs_a = (omfs > 1e-10) ? 0.5 * Cl * (1 - nsa) / omfs : 0.0;
     double Wcs_b = (omfs > 1e-10) ? 0.5 * Cl * (1 - nsb) / omfs : 0.0;
@@ -873,14 +859,14 @@ void REKS::fock_micro_to_macro(int L, double Cl, double** Fa, double** Fb) {
         Freks[c][active_s_] += Wcs_a * Fa[c][active_s_] + Wcs_b * Fb[c][active_s_];
     }
 
-    // === Active-virtual coupling ===
+    // Active-virtual coupling
     for (int v = active_s_ + 1; v < nsopi_[0]; ++v) {
         Freks[active_r_][v] += Wr_a * Fa[active_r_][v] + Wr_b * Fb[active_r_][v];
         Freks[active_s_][v] += Ws_a * Fa[active_s_][v] + Ws_b * Fb[active_s_][v];
     }
 
-    // === Active-active coupling (r,s) ===
-    // Weight: C_L * (n^σ_r - n^σ_s) * sign(f_r - f_s)
+    // Active-active coupling (r,s)
+    // Weight: C_L * (n^sigma_r - n^sigma_s) * sign(f_r - f_s)
     int signrs = (fr > fs) ? 1 : ((fr < fs) ? -1 : 0);
     double Wrs_a = Cl * (nra - nsa) * signrs;
     double Wrs_b = Cl * (nrb - nsb) * signrs;
@@ -892,9 +878,9 @@ void REKS::fock_micro_to_macro(int L, double Cl, double** Fa, double** Fb) {
     // Note: Symmetrization will be done ONCE in form_F() after all microstates are accumulated
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ---------------------------------------------------------------------------
 // SCF Method Overrides
-// ═══════════════════════════════════════════════════════════════════════════
+// ---------------------------------------------------------------------------
 
 void REKS::form_D() {
     // 1. Build standard RHF density Da_ (needed for DIIS, convergence checks)
@@ -966,11 +952,11 @@ void REKS::form_F() {
     }
 
     // Build REKS coupling Fock matrix F_reks_ from microstate Fock matrices.
-    // CRITICAL: The REKS coupling formulas (Filatov 2024) are designed for MO basis!
+    // The REKS coupling formulas (Filatov 2024) are designed for MO basis.
     // GAMESS procedure:
-    //   1. Build F^σ_L in AO basis
-    //   2. Transform to MO: F^σ_L_MO = C^T * F^σ_L_AO * C
-    //   3. Apply fock_micro_to_macro in MO basis (active_r_, active_s_ are MO indices!)
+    //   1. Build F^sigma_L in AO basis
+    //   2. Transform to MO: F^sigma_L_MO = C^T * F^sigma_L_AO * C
+    //   3. Apply fock_micro_to_macro in MO basis (active_r_, active_s_ are MO indices)
     //   4. Transform F_reks back to AO: F_reks_AO = C * F_reks_MO * C^T
 
     // Zero F_reks_ and Lagrange multiplier
@@ -1019,11 +1005,9 @@ void REKS::form_F() {
 
     // Step 4: Transform F_reks from MO back to AO basis for DIIS
     // GAMESS formula (reks.src lines 1363-1367): F_AO = S * C * F_MO * C^T * S
-    // This is CRITICAL for DIIS to work! The commutator [F,P] = F*D*S - S*D*F
-    // will only go to zero at convergence if F_AO is constructed this way.
-    //
-    // temp = S * C
-    // F_AO = temp * F_MO * temp^T = S * C * F_MO * C^T * S
+    // The commutator [F,P] = F*D*S - S*D*F goes to zero at convergence
+    // only if F_AO is constructed this way.
+    // temp = S * C, then F_AO = temp * F_MO * temp^T
     auto SC = linalg::doublet(S_, Ca_, false, false);  // S * C
     auto F_reks_AO = linalg::triplet(SC, F_reks_, SC, false, false, true);  // SC * F_MO * SC^T
 
@@ -1134,10 +1118,8 @@ double REKS::compute_E() {
         return RHF::compute_E();
     }
 
-    // Compute state-averaged REKS energy: E_SA = Σ FACT * C_L * E_L
-    // CRITICAL FIX: GAMESS REXEM2EE multiplies by 2 for L>=3 (1-based)
-    // In Psi4 (0-based): multiply by 2 for L>=2
-    // GAMESS code: IF(I.GE.3) FACT=TWO; REXEM2EE = REXEM2EE + FACT*CM(I)*EM(I)
+    // Compute state-averaged REKS energy: E_SA = sum_L FACT * C_L * E_L
+    // GAMESS REXEM2EE multiplies by 2 for L>=3 (1-based), i.e. L>=2 in 0-based
     double E_SA = 0.0;
     for (int L = 0; L < N_MICRO_; ++L) {
         double fact = (L >= 2) ? 2.0 : 1.0;
@@ -1154,16 +1136,16 @@ double REKS::compute_E() {
     return E_SA;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ---------------------------------------------------------------------------
 // Debug Output Functions
-// ═══════════════════════════════════════════════════════════════════════════
+// ---------------------------------------------------------------------------
 
 void REKS::print_microstate_energies() const {
     outfile->Printf("\n  === REKS Microstate Energies ===\n");
-    outfile->Printf("  E_1 (L=0, r↑r↓)     = %20.12f\n", E_micro_[0]);
-    outfile->Printf("  E_2 (L=1, s↑s↓)     = %20.12f\n", E_micro_[1]);
-    outfile->Printf("  E_3 (L=2, r↑s↓)     = %20.12f\n", E_micro_[2]);
-    outfile->Printf("  E_5 (L=3, r↑s↑/r↓s↓)= %20.12f\n", E_micro_[3]);
+    outfile->Printf("  E_1 (L=0, r-up r-down)      = %20.12f\n", E_micro_[0]);
+    outfile->Printf("  E_2 (L=1, s-up s-down)      = %20.12f\n", E_micro_[1]);
+    outfile->Printf("  E_3 (L=2, r-up s-down)      = %20.12f\n", E_micro_[2]);
+    outfile->Printf("  E_5 (L=3, r-up s-up/r-dn s-dn)= %20.12f\n", E_micro_[3]);
 }
 
 void REKS::print_fon_info() const {

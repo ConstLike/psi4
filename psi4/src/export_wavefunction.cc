@@ -464,6 +464,11 @@ void export_wavefunction(py::module& m) {
              "Returns a new wavefunction with internal data converted to C_1 symmetry, using pre-c1-constructed "
              "BasisSet *basis*",
              "basis"_a)
+        .def("get_n_r", &scf::REKS::get_n_r, "Returns the fractional occupation number for orbital r")
+        .def("get_n_s", &scf::REKS::get_n_s, "Returns the fractional occupation number for orbital s")
+        .def("get_microstate_energy", &scf::REKS::get_microstate_energy,
+             "Returns the microstate energy for index L (0-3)", "L"_a)
+        .def("get_f_value", &scf::REKS::get_f_value, "Returns the interpolating function value at current FON")
         .def("mintshelper", &Wavefunction::mintshelper, "The MintsHelper object");
 
     /// EP2 functions
