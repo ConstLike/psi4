@@ -234,57 +234,39 @@ void REKS::build_base_densities() {
     }
 
     int nso = nsopi_[0];  // Assuming C1 symmetry
+    int nmo = Ca_->colspi()[0];
+    double** Cp = Ca_->pointer(0);
 
     // D00: core electrons only
+    // D00 = C[:,:Ncore] * C[:,:Ncore]^T (BLAS DGEMM)
     D00_->zero();
     if (Ncore_ > 0) {
         double** D00p = D00_->pointer(0);
-        double** Cp = Ca_->pointer(0);
-        for (int mu = 0; mu < nso; ++mu) {
-            for (int nu = 0; nu < nso; ++nu) {
-                double val = 0.0;
-                for (int k = 0; k < Ncore_; ++k) {
-                    val += Cp[mu][k] * Cp[nu][k];
-                }
-                D00p[mu][nu] = val;
-            }
-        }
+        C_DGEMM('N', 'T', nso, nso, Ncore_, 1.0, Cp[0], nmo, Cp[0], nmo, 0.0, D00p[0], nso);
     }
 
     // D10: core + orbital r
+    // D10 = D00 + C[:,r] * C[:,r]^T (copy + BLAS DGER rank-1 update)
     D10_->copy(D00_);
     {
         double** D10p = D10_->pointer(0);
-        double** Cp = Ca_->pointer(0);
-        for (int mu = 0; mu < nso; ++mu) {
-            for (int nu = 0; nu < nso; ++nu) {
-                D10p[mu][nu] += Cp[mu][active_r_] * Cp[nu][active_r_];
-            }
-        }
+        C_DGER(nso, nso, 1.0, &Cp[0][active_r_], nmo, &Cp[0][active_r_], nmo, D10p[0], nso);
     }
 
     // D01: core + orbital s
+    // D01 = D00 + C[:,s] * C[:,s]^T (copy + BLAS DGER rank-1 update)
     D01_->copy(D00_);
     {
         double** D01p = D01_->pointer(0);
-        double** Cp = Ca_->pointer(0);
-        for (int mu = 0; mu < nso; ++mu) {
-            for (int nu = 0; nu < nso; ++nu) {
-                D01p[mu][nu] += Cp[mu][active_s_] * Cp[nu][active_s_];
-            }
-        }
+        C_DGER(nso, nso, 1.0, &Cp[0][active_s_], nmo, &Cp[0][active_s_], nmo, D01p[0], nso);
     }
 
     // D11: core + r + s (both singly occupied)
+    // D11 = D10 + C[:,s] * C[:,s]^T (copy + BLAS DGER rank-1 update)
     D11_->copy(D10_);
     {
         double** D11p = D11_->pointer(0);
-        double** Cp = Ca_->pointer(0);
-        for (int mu = 0; mu < nso; ++mu) {
-            for (int nu = 0; nu < nso; ++nu) {
-                D11p[mu][nu] += Cp[mu][active_s_] * Cp[nu][active_s_];
-            }
-        }
+        C_DGER(nso, nso, 1.0, &Cp[0][active_s_], nmo, &Cp[0][active_s_], nmo, D11p[0], nso);
     }
 
     if (reks_debug_ >= 2) {
