@@ -101,6 +101,9 @@ class REKS : public RHF {
     SharedMatrix C_D01_;           ///< Work matrix: C columns for D01 (core + s)
     SharedMatrix C_D11_;           ///< Work matrix: C columns for D11 (core + r + s)
     SharedMatrix J_work_;          ///< Work matrix: temporary for J_total
+    SharedMatrix Temp_work_;       ///< Work matrix: temporary for AO→MO transforms (N×N)
+    std::array<SharedMatrix, N_MICRO_> F_alpha_MO_;  ///< Pre-allocated MO-basis alpha Fock
+    std::array<SharedMatrix, N_MICRO_> F_beta_MO_;   ///< Pre-allocated MO-basis beta Fock
 
     // --- Weighting Factors ---
     std::array<double, N_MICRO_> C_L_;  ///< Weighting factors for SA-REKS

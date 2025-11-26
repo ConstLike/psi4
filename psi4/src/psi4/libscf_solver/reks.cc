@@ -155,6 +155,14 @@ void REKS::allocate_reks_matrices() {
     C_D01_ = std::make_shared<Matrix>("C for D01", nso, Ncore_ + 1);
     C_D11_ = std::make_shared<Matrix>("C for D11", nso, Ncore_ + 2);
     J_work_ = std::make_shared<Matrix>("J_work", nsopi_, nsopi_);
+
+    // Pre-allocate work matrices for AO→MO transforms in form_F() (HPC optimization)
+    Temp_work_ = std::make_shared<Matrix>("Temp_work", nso, nso);
+    for (int L = 0; L < N_MICRO_; ++L) {
+        std::string suffix = " L=" + std::to_string(L);
+        F_alpha_MO_[L] = std::make_shared<Matrix>("F_alpha_MO" + suffix, nso, nso);
+        F_beta_MO_[L] = std::make_shared<Matrix>("F_beta_MO" + suffix, nso, nso);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -955,22 +963,33 @@ void REKS::form_F() {
     Wrs_lagr_ = 0.0;
 
     int N = nsopi_[0];
+    int nmo = Ca_->colspi()[0];
+    double** Cp = Ca_->pointer(0);
+    double** Tp = Temp_work_->pointer(0);
 
     // Step 1: Transform microstate Fock matrices from AO to MO basis
-    // F_MO = C^T * F_AO * C  (using linalg::triplet)
-    std::array<SharedMatrix, N_MICRO_> F_alpha_MO;
-    std::array<SharedMatrix, N_MICRO_> F_beta_MO;
+    // F_MO = C^T * F_AO * C  (using BLAS DGEMM, reusing pre-allocated matrices)
+    // Two-step: Temp = F_AO * C, then F_MO = C^T * Temp
     for (int L = 0; L < N_MICRO_; ++L) {
-        F_alpha_MO[L] = linalg::triplet(Ca_, F_alpha_micro_[L], Ca_, true, false, false);
-        F_beta_MO[L] = linalg::triplet(Ca_, F_beta_micro_[L], Ca_, true, false, false);
+        // Alpha: F_alpha_MO_[L] = C^T * F_alpha_micro_[L] * C
+        double** Fa_AO = F_alpha_micro_[L]->pointer(0);
+        double** Fa_MO = F_alpha_MO_[L]->pointer(0);
+        C_DGEMM('N', 'N', N, N, N, 1.0, Fa_AO[0], N, Cp[0], nmo, 0.0, Tp[0], N);
+        C_DGEMM('T', 'N', N, N, N, 1.0, Cp[0], nmo, Tp[0], N, 0.0, Fa_MO[0], N);
+
+        // Beta: F_beta_MO_[L] = C^T * F_beta_micro_[L] * C
+        double** Fb_AO = F_beta_micro_[L]->pointer(0);
+        double** Fb_MO = F_beta_MO_[L]->pointer(0);
+        C_DGEMM('N', 'N', N, N, N, 1.0, Fb_AO[0], N, Cp[0], nmo, 0.0, Tp[0], N);
+        C_DGEMM('T', 'N', N, N, N, 1.0, Cp[0], nmo, Tp[0], N, 0.0, Fb_MO[0], N);
     }
 
     // Step 2: Assemble F_reks_ in MO basis from all 4 microstates
     // Note: L=2 (open-shell) represents L=3 and L=4 in paper → factor 2 already in C_L_[2]
     //       L=3 (triplet-like) represents L=5 and L=6 → factor 2 already in C_L_[3]
     for (int L = 0; L < N_MICRO_; ++L) {
-        double** Fa_MO = F_alpha_MO[L]->pointer(0);
-        double** Fb_MO = F_beta_MO[L]->pointer(0);
+        double** Fa_MO = F_alpha_MO_[L]->pointer(0);
+        double** Fb_MO = F_beta_MO_[L]->pointer(0);
 
         // GAMESS code: IF(L.GE.3) CMTMP = TWO*CMTMP
         // In Psi4 (0-based): multiply by 2 for L>=2
