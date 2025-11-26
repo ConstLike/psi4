@@ -71,18 +71,17 @@ class REKS : public RHF {
     // Core Orbital Information
     // ========================================================================
 
-    int Ncore_ = -1;               ///< Number of core (doubly occupied) orbitals
-    int active_r_ = -1;            ///< Index of first active orbital (= Ncore)
-    int active_s_ = -1;            ///< Index of second active orbital (= Ncore + 1)
+    int Ncore_ = -1;                       ///< Number of core (doubly occupied) orbitals
+    std::vector<int> active_mo_indices_;   ///< Active orbital MO indices (generalized from active_r_, active_s_)
 
     // ========================================================================
-    // Base Density Matrices (for efficient construction)
+    // Base Density Matrices (generalized for REKS(N,M))
     // ========================================================================
 
-    SharedMatrix D00_;             ///< Core only density
-    SharedMatrix D10_;             ///< Core + orbital r singly occupied
-    SharedMatrix D01_;             ///< Core + orbital s singly occupied
-    SharedMatrix D11_;             ///< Core + both r and s singly occupied
+    /// Base densities indexed by occupation bitmask
+    /// For REKS(2,2): 4 densities (patterns 0-3)
+    /// For REKS(4,4): 16 densities (patterns 0-15)
+    std::vector<SharedMatrix> base_densities_;
 
     // ========================================================================
     // Microstate Data (dynamically sized)
@@ -107,12 +106,10 @@ class REKS : public RHF {
     // Pre-allocated Work Matrices (for HPC efficiency)
     // ========================================================================
 
-    SharedMatrix C_D00_;           ///< Work matrix: C columns for D00 (core only)
-    SharedMatrix C_D10_;           ///< Work matrix: C columns for D10 (core + r)
-    SharedMatrix C_D01_;           ///< Work matrix: C columns for D01 (core + s)
-    SharedMatrix C_D11_;           ///< Work matrix: C columns for D11 (core + r + s)
-    SharedMatrix J_work_;          ///< Work matrix: temporary for J_total
-    SharedMatrix Temp_work_;       ///< Work matrix: temporary for AO→MO transforms
+    /// Work matrices for C columns for each base density pattern
+    std::vector<SharedMatrix> C_base_;     ///< Generalized from C_D00_, C_D10_, etc.
+    SharedMatrix J_work_;                   ///< Work matrix: temporary for J_total
+    SharedMatrix Temp_work_;                ///< Work matrix: temporary for AO→MO transforms
     std::vector<SharedMatrix> F_alpha_MO_;  ///< Pre-allocated MO-basis alpha Fock
     std::vector<SharedMatrix> F_beta_MO_;   ///< Pre-allocated MO-basis beta Fock
 
@@ -161,6 +158,8 @@ class REKS : public RHF {
     void print_microstate_energies() const;
     /// Debug output: FON info
     void print_fon_info() const;
+    /// Print SI-SA state energies (called after SCF convergence)
+    void print_SI_energies() const;
 
     // ========================================================================
     // SCF Method Overrides

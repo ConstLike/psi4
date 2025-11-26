@@ -168,6 +168,181 @@ public:
     virtual int beta_occ(int L, int orbital) const = 0;
 
     // ========================================================================
+    // Orbital Index Management (NEW for REKS(N,M) generalization)
+    // ========================================================================
+
+    /**
+     * @brief Get active orbital indices in MO space
+     * @param Ncore Number of core (doubly occupied) orbitals
+     * @return Vector of active MO indices (0-based)
+     *
+     * For REKS(2,2): returns {Ncore, Ncore+1}
+     * For REKS(4,4): returns {Ncore, Ncore+1, Ncore+2, Ncore+3}
+     */
+    [[nodiscard]] virtual std::vector<int> get_active_mo_indices(int Ncore) const = 0;
+
+    // ========================================================================
+    // Base Density Pattern Enumeration (for efficient JK batching)
+    // ========================================================================
+
+    /**
+     * @brief Get unique base density occupation patterns
+     * @return Vector of bitmask patterns
+     *
+     * Pattern: bitmask where bit i = occupation of active orbital i
+     * REKS(2,2): {0b00, 0b01, 0b10, 0b11} = {0, 1, 2, 3}
+     * REKS(4,4): {0b0000, ..., 0b1111} = {0, ..., 15}
+     */
+    [[nodiscard]] virtual std::vector<int> get_base_density_patterns() const = 0;
+
+    /**
+     * @brief Number of unique base densities
+     * @return 2^M for REKS(N,M)
+     */
+    [[nodiscard]] virtual int n_base_densities() const = 0;
+
+    // ========================================================================
+    // Microstate-to-BaseDensity Mapping
+    // ========================================================================
+
+    /**
+     * @brief Get base density index for alpha density of microstate L
+     * @param L Microstate index
+     * @return Index into base_density_patterns array
+     *
+     * Converts alpha occupation pattern to bitmask index
+     */
+    [[nodiscard]] virtual int get_alpha_base_idx(int L) const = 0;
+
+    /**
+     * @brief Get base density index for beta density of microstate L
+     * @param L Microstate index
+     * @return Index into base_density_patterns array
+     */
+    [[nodiscard]] virtual int get_beta_base_idx(int L) const = 0;
+
+    // ========================================================================
+    // Energy Weighting (Symmetry Factors)
+    // ========================================================================
+
+    /**
+     * @brief Get symmetry factor (FACT) for microstate L
+     * @param L Microstate index
+     * @return Multiplier for energy contribution (1.0 or 2.0)
+     *
+     * Accounts for spin-paired microstates counted once.
+     * For REKS(2,2): FACT=1.0 for L=0,1; FACT=2.0 for L=2,3
+     */
+    [[nodiscard]] virtual double get_symmetry_factor(int L) const = 0;
+
+    // ========================================================================
+    // Multi-variable FON Optimization
+    // ========================================================================
+
+    /**
+     * @brief Number of independent FON variables
+     * @return Number of GVB pairs (1 for REKS(2,2), 2 for REKS(4,4), etc.)
+     */
+    [[nodiscard]] virtual int n_fon_variables() const = 0;
+
+    /**
+     * @brief Get all FON values as vector
+     * @return Vector of fon_p values for each pair
+     */
+    [[nodiscard]] virtual std::vector<double> get_fon_vector() const = 0;
+
+    /**
+     * @brief Set FON values from vector
+     * @param fons Vector of fon_p values (one per pair)
+     */
+    virtual void set_fon_vector(const std::vector<double>& fons) = 0;
+
+    /**
+     * @brief Compute gradient of E_SA w.r.t. FON variables
+     * @param E_micro Vector of microstate energies
+     * @param C_L Vector of current weights
+     * @return Gradient vector of length n_fon_variables()
+     *
+     * For REKS(2,2): returns {dE/dn_r}
+     * For REKS(4,4): returns {dE/dn_a, dE/dn_b}
+     */
+    [[nodiscard]] virtual std::vector<double> compute_energy_gradient(
+        const std::vector<double>& E_micro,
+        const std::vector<double>& C_L) const = 0;
+
+    /**
+     * @brief Compute Hessian of E_SA w.r.t. FON variables
+     * @param E_micro Vector of microstate energies
+     * @param C_L Vector of current weights
+     * @return Hessian matrix (row-major, n_fon_variables x n_fon_variables)
+     *
+     * For REKS(2,2): returns {d²E/dn_r²}
+     * For REKS(4,4): returns {d²E/dn_a², d²E/dn_a dn_b, d²E/dn_b dn_a, d²E/dn_b²}
+     */
+    [[nodiscard]] virtual std::vector<double> compute_energy_hessian(
+        const std::vector<double>& E_micro,
+        const std::vector<double>& C_L) const = 0;
+
+    // ========================================================================
+    // Fock Coupling Weights
+    // ========================================================================
+
+    /**
+     * @brief Get effective FON for active orbital
+     * @param orbital_idx Active orbital index (0-based within active space)
+     * @return Effective occupation for Fock coupling
+     *
+     * f_i = (n_i/2)*w_PPS + 0.5*w_OSS for SA-REKS
+     *
+     * For REKS(2,2): orbital_idx=0 -> f_r, orbital_idx=1 -> f_s
+     */
+    [[nodiscard]] virtual double get_effective_fon(int orbital_idx) const = 0;
+
+    // ========================================================================
+    // SI-SA (State Interaction) Methods
+    // ========================================================================
+
+    /**
+     * @brief SI Hamiltonian result structure
+     *
+     * For 2SI-2SA-REKS: 2x2 matrix between PPS and OSS
+     * For 3SI-2SA-REKS: 3x3 matrix including DES
+     */
+    struct SIResult {
+        int n_states;                    ///< Number of states (2 or 3)
+        std::vector<double> energies;    ///< Eigenvalues (state energies)
+        std::vector<double> coeffs;      ///< Eigenvectors (row-major: coeffs[state*n_states + component])
+        double E_PPS;                    ///< PPS diagonal element
+        double E_OSS;                    ///< OSS diagonal element
+        double E_DES;                    ///< DES diagonal element (3SI only)
+        double H_12;                     ///< PPS-OSS coupling
+        double H_23;                     ///< OSS-DES coupling (3SI only)
+    };
+
+    /**
+     * @brief Compute SI Hamiltonian and solve eigenvalue problem
+     *
+     * @param E_micro Microstate energies from SCF
+     * @param Wrs Lagrange multiplier (off-diagonal coupling)
+     * @param n_si_states Number of SI states (2 for 2SI, 3 for 3SI)
+     * @return SIResult with eigenvalues and eigenvectors
+     *
+     * 2SI-2SA Hamiltonian:
+     *   H_11 = E_PPS = sum_L C_L^{PPS} * FACT * E_L  (C_L computed with w_PPS=1, w_OSS=0)
+     *   H_22 = E_OSS = 2*E_L[2] - E_L[3]
+     *   H_12 = Wrs * (sqrt(n_r) - sqrt(n_s)) * sqrt(2)
+     *
+     * 3SI-2SA adds:
+     *   H_33 = E_DES
+     *   H_23 = Wrs * (sqrt(n_r) + sqrt(n_s)) * sqrt(2)
+     *   H_13 = 0
+     */
+    [[nodiscard]] virtual SIResult compute_SI_energies(
+        const std::vector<double>& E_micro,
+        double Wrs,
+        int n_si_states = 2) const = 0;
+
+    // ========================================================================
     // Factory Methods
     // ========================================================================
 
@@ -239,6 +414,57 @@ public:
     }
 
     // ========================================================================
+    // NEW Interface Methods Implementation
+    // ========================================================================
+
+    [[nodiscard]] std::vector<int> get_active_mo_indices(int Ncore) const override {
+        return {Ncore, Ncore + 1};
+    }
+
+    [[nodiscard]] std::vector<int> get_base_density_patterns() const override {
+        // 4 patterns: 0b00=0 (none), 0b01=1 (s only), 0b10=2 (r only), 0b11=3 (r and s)
+        return {0, 1, 2, 3};
+    }
+
+    [[nodiscard]] int n_base_densities() const override { return 4; }  // 2^2
+
+    [[nodiscard]] int get_alpha_base_idx(int L) const override;
+    [[nodiscard]] int get_beta_base_idx(int L) const override;
+
+    [[nodiscard]] double get_symmetry_factor(int L) const override {
+        // L=0,1: closed-shell, FACT=1.0
+        // L=2,3: open-shell, FACT=2.0 (spin symmetry)
+        return (L >= 2) ? 2.0 : 1.0;
+    }
+
+    [[nodiscard]] int n_fon_variables() const override { return 1; }
+
+    [[nodiscard]] std::vector<double> get_fon_vector() const override {
+        return {pair_.fon_p};
+    }
+
+    void set_fon_vector(const std::vector<double>& fons) override {
+        if (!fons.empty()) {
+            pair_.set_fon(fons[0]);
+        }
+    }
+
+    [[nodiscard]] std::vector<double> compute_energy_gradient(
+        const std::vector<double>& E_micro,
+        const std::vector<double>& C_L) const override;
+
+    [[nodiscard]] std::vector<double> compute_energy_hessian(
+        const std::vector<double>& E_micro,
+        const std::vector<double>& C_L) const override;
+
+    [[nodiscard]] double get_effective_fon(int orbital_idx) const override;
+
+    [[nodiscard]] SIResult compute_SI_energies(
+        const std::vector<double>& E_micro,
+        double Wrs,
+        int n_si_states = 2) const override;
+
+    // ========================================================================
     // REKS(2,2) Specific Accessors
     // ========================================================================
 
@@ -307,6 +533,59 @@ public:
     int beta_occ(int L, int orbital) const override {
         return microstates_[L].beta[orbital];
     }
+
+    // ========================================================================
+    // NEW Interface Methods Implementation
+    // ========================================================================
+
+    [[nodiscard]] std::vector<int> get_active_mo_indices(int Ncore) const override {
+        return {Ncore, Ncore + 1, Ncore + 2, Ncore + 3};
+    }
+
+    [[nodiscard]] std::vector<int> get_base_density_patterns() const override {
+        // 16 patterns: 0b0000=0 to 0b1111=15
+        std::vector<int> patterns;
+        patterns.reserve(16);
+        for (int p = 0; p < 16; ++p) {
+            patterns.push_back(p);
+        }
+        return patterns;
+    }
+
+    [[nodiscard]] int n_base_densities() const override { return 16; }  // 2^4
+
+    [[nodiscard]] int get_alpha_base_idx(int L) const override;
+    [[nodiscard]] int get_beta_base_idx(int L) const override;
+
+    [[nodiscard]] double get_symmetry_factor(int L) const override;
+
+    [[nodiscard]] int n_fon_variables() const override { return 2; }
+
+    [[nodiscard]] std::vector<double> get_fon_vector() const override {
+        return {pairs_[0].fon_p, pairs_[1].fon_p};
+    }
+
+    void set_fon_vector(const std::vector<double>& fons) override {
+        if (fons.size() >= 2) {
+            pairs_[0].set_fon(fons[0]);
+            pairs_[1].set_fon(fons[1]);
+        }
+    }
+
+    [[nodiscard]] std::vector<double> compute_energy_gradient(
+        const std::vector<double>& E_micro,
+        const std::vector<double>& C_L) const override;
+
+    [[nodiscard]] std::vector<double> compute_energy_hessian(
+        const std::vector<double>& E_micro,
+        const std::vector<double>& C_L) const override;
+
+    [[nodiscard]] double get_effective_fon(int orbital_idx) const override;
+
+    [[nodiscard]] SIResult compute_SI_energies(
+        const std::vector<double>& E_micro,
+        double Wrs,
+        int n_si_states = 2) const override;
 
 private:
     std::array<GVBPair, 2> pairs_;       ///< Two GVB pairs: (a,d) and (b,c)

@@ -39,6 +39,7 @@
 #include "reks_active_space.h"
 #include <stdexcept>
 #include <cmath>
+#include <algorithm>
 
 namespace psi {
 namespace reks {
@@ -182,6 +183,299 @@ void REKS22Space::compute_weight_derivs(
     d2C_dfon2[3] = 0.5 * w_pps_ * d2f_dnr2;
 }
 
+int REKS22Space::get_alpha_base_idx(int L) const {
+    // Convert alpha occupation pattern to bitmask index
+    // Bit 0 = orbital r (index 0), Bit 1 = orbital s (index 1)
+    //
+    // Microstate alpha patterns:
+    //   L=0: alpha={1,0} -> bit pattern = 0b01 = 1 (wait, {r,s}={1,0} means r=1, s=0)
+    //   Actually: alpha[0]=r, alpha[1]=s
+    //   So {1,0} means r occupied, s not -> bit 0 set = 1... but we want r=bit0
+    //
+    // Let me recalculate: if alpha = {occ_r, occ_s}
+    //   bitmask = occ_r * 1 + occ_s * 2 = alpha[0] + 2*alpha[1]
+    //
+    // L=0: alpha={1,0} -> 1 + 0 = 1? No wait pattern is {r_occ, s_occ}
+    //   Pattern 2 = 0b10 means bit 1 set = orbital 1 (s) occupied?
+    //   No, let me use: bit i = orbital i occupied
+    //   So pattern = sum(alpha[i] << i)
+    //   L=0: alpha={1,0} -> 1<<0 + 0<<1 = 1
+    //   L=1: alpha={0,1} -> 0<<0 + 1<<1 = 2
+    //   L=2: alpha={1,0} -> 1
+    //   L=3: alpha={1,1} -> 1 + 2 = 3
+    //
+    // Wait, the base_density_patterns are {0,1,2,3} with:
+    //   0 = 0b00 = none
+    //   1 = 0b01 = orbital 0 (r) only
+    //   2 = 0b10 = orbital 1 (s) only
+    //   3 = 0b11 = both
+    //
+    // So get_alpha_base_idx should return the bitmask directly
+
+    const auto& micro = microstates_[L];
+    return micro.alpha[0] + 2 * micro.alpha[1];
+}
+
+int REKS22Space::get_beta_base_idx(int L) const {
+    // Same logic as alpha
+    const auto& micro = microstates_[L];
+    return micro.beta[0] + 2 * micro.beta[1];
+}
+
+std::vector<double> REKS22Space::compute_energy_gradient(
+    const std::vector<double>& E_micro,
+    const std::vector<double>& C_L) const {
+
+    // For REKS(2,2): single FON variable n_r
+    // dE_SA/dn_r = sum_L { FACT_L * dC_L/dn_r * E_L }
+    //
+    // Where FACT_L accounts for spin symmetry:
+    //   L=0,1: FACT=1.0 (closed-shell)
+    //   L=2,3: FACT=2.0 (open-shell with spin partner)
+
+    std::vector<double> dC_dfon(4), d2C_dfon2(4);
+    compute_weight_derivs(dC_dfon, d2C_dfon2);
+
+    double gradient = 0.0;
+    for (int L = 0; L < 4; ++L) {
+        double FACT = (L >= 2) ? 2.0 : 1.0;
+        gradient += FACT * dC_dfon[L] * E_micro[L];
+    }
+
+    return {gradient};
+}
+
+std::vector<double> REKS22Space::compute_energy_hessian(
+    const std::vector<double>& E_micro,
+    const std::vector<double>& C_L) const {
+
+    // For REKS(2,2): single FON variable n_r
+    // d²E_SA/dn_r² = sum_L { FACT_L * d²C_L/dn_r² * E_L }
+
+    std::vector<double> dC_dfon(4), d2C_dfon2(4);
+    compute_weight_derivs(dC_dfon, d2C_dfon2);
+
+    double hessian = 0.0;
+    for (int L = 0; L < 4; ++L) {
+        double FACT = (L >= 2) ? 2.0 : 1.0;
+        hessian += FACT * d2C_dfon2[L] * E_micro[L];
+    }
+
+    return {hessian};
+}
+
+double REKS22Space::get_effective_fon(int orbital_idx) const {
+    // Effective FON for Fock coupling (FR, FS in GAMESS reks.src:1178-1179)
+    // f_i = (n_i/2)*w_PPS + 0.5*w_OSS
+    //
+    // For REKS(2,2):
+    //   orbital_idx=0 (r): f_r = (n_r/2)*w_PPS + 0.5*w_OSS
+    //   orbital_idx=1 (s): f_s = (n_s/2)*w_PPS + 0.5*w_OSS
+
+    double n_i = (orbital_idx == 0) ? pair_.fon_p : pair_.fon_q;
+    return (n_i / 2.0) * w_pps_ + 0.5 * w_oss_;
+}
+
+REKSActiveSpace::SIResult REKS22Space::compute_SI_energies(
+    const std::vector<double>& E_micro,
+    double Wrs,
+    int n_si_states) const {
+
+    // SI-SA-REKS State Interaction implementation
+    // Reference: GAMESS reks.src lines 1784-1810
+    //
+    // The SI Hamiltonian couples PPS, OSS, and optionally DES states.
+    // Eigenvalues give state energies, eigenvectors give state compositions.
+
+    SIResult result;
+    result.n_states = n_si_states;
+
+    double n_r = pair_.fon_p;
+    double n_s = pair_.fon_q;
+
+    // Step 1: Compute diagonal energies (PPS, OSS, DES)
+    //
+    // E_PPS = sum_L C_L^{PPS} * FACT_L * E_L
+    // where C_L^{PPS} are weights computed with (w_PPS=1, w_OSS=0)
+    //
+    // From GAMESS (lines 1759-1761):
+    // CALL REXCM(X(LCM),DNR,DNS,DELTA,1.d0,0.d0,NMIC)  ! pure PPS weights
+    // EPPS = X(LCM)*X(LEM) + X(LCM+1)*X(LEM+1) + 2.d0*X(LCM+2)*X(LEM+2) + 2.d0*X(LCM+3)*X(LEM+3)
+    //
+    // For pure PPS (w_PPS=1, w_OSS=0):
+    //   C_L[0] = n_r/2, C_L[1] = n_s/2, C_L[2] = -f/2, C_L[3] = f/2
+    double f = f_interp(n_r * n_s);
+    double C_pps[4] = {n_r / 2.0, n_s / 2.0, -f / 2.0, f / 2.0};
+
+    result.E_PPS = C_pps[0] * E_micro[0] + C_pps[1] * E_micro[1]
+                 + 2.0 * C_pps[2] * E_micro[2] + 2.0 * C_pps[3] * E_micro[3];
+
+    // E_OSS = 2*E_L[2] - E_L[3]  (GAMESS line 1765)
+    result.E_OSS = 2.0 * E_micro[2] - E_micro[3];
+
+    // E_DES = C_L[1]*E_L[0] + C_L[0]*E_L[1] - 2*C_L[2]*E_L[2] - 2*C_L[3]*E_L[3]
+    // (swap C_L[0] and C_L[1], negate open-shell terms)
+    result.E_DES = C_pps[1] * E_micro[0] + C_pps[0] * E_micro[1]
+                 - 2.0 * C_pps[2] * E_micro[2] - 2.0 * C_pps[3] * E_micro[3];
+
+    // Step 2: Compute off-diagonal coupling elements
+    //
+    // H_12 = Wrs * (sqrt(n_r) - sqrt(n_s)) * sqrt(2)  (GAMESS line 1787)
+    result.H_12 = Wrs * (std::sqrt(n_r) - std::sqrt(n_s)) * std::sqrt(2.0);
+
+    // H_23 = Wrs * (sqrt(n_r) + sqrt(n_s)) * sqrt(2)  (GAMESS line 1808 for 3SI)
+    result.H_23 = Wrs * (std::sqrt(n_r) + std::sqrt(n_s)) * std::sqrt(2.0);
+
+    // Step 3: Build and diagonalize SI Hamiltonian
+    if (n_si_states == 2) {
+        // 2SI-2SA: 2x2 symmetric matrix
+        // H = | E_PPS   H_12  |
+        //     | H_12    E_OSS |
+
+        double H11 = result.E_PPS;
+        double H22 = result.E_OSS;
+        double H12 = result.H_12;
+
+        // Analytic diagonalization of 2x2 symmetric matrix
+        double trace = H11 + H22;
+        double det = H11 * H22 - H12 * H12;
+        double disc = std::sqrt(trace * trace / 4.0 - det);
+
+        double E0 = trace / 2.0 - disc;  // Lower eigenvalue
+        double E1 = trace / 2.0 + disc;  // Upper eigenvalue
+
+        result.energies = {E0, E1};
+
+        // Eigenvectors: for eigenvalue E, (H - E*I) v = 0
+        // v1 = (H12, E - H11) normalized, or (E - H22, H12) normalized
+        //
+        // For E0: v0 = (H12, E0 - H11) / norm
+        double v0_pps = H12;
+        double v0_oss = E0 - H11;
+        double norm0 = std::sqrt(v0_pps * v0_pps + v0_oss * v0_oss);
+        if (norm0 > 1e-14) {
+            v0_pps /= norm0;
+            v0_oss /= norm0;
+        } else {
+            // Degenerate case: E0 = H11
+            v0_pps = 1.0;
+            v0_oss = 0.0;
+        }
+
+        // For E1: v1 = (H12, E1 - H11) / norm
+        double v1_pps = H12;
+        double v1_oss = E1 - H11;
+        double norm1 = std::sqrt(v1_pps * v1_pps + v1_oss * v1_oss);
+        if (norm1 > 1e-14) {
+            v1_pps /= norm1;
+            v1_oss /= norm1;
+        } else {
+            v1_pps = 0.0;
+            v1_oss = 1.0;
+        }
+
+        // Store coefficients: coeffs[state * n_states + component]
+        // State 0 (ground): coeffs[0] = C_PPS, coeffs[1] = C_OSS
+        // State 1 (excited): coeffs[2] = C_PPS, coeffs[3] = C_OSS
+        result.coeffs = {v0_pps, v0_oss, v1_pps, v1_oss};
+
+    } else if (n_si_states == 3) {
+        // 3SI-2SA: 3x3 symmetric matrix
+        // H = | E_PPS   H_12    0    |
+        //     | H_12    E_OSS   H_23 |
+        //     |   0     H_23  E_DES  |
+        //
+        // Use explicit 3x3 eigenvalue solver (Cardano's formula)
+        // For simplicity, we use iterative Jacobi diagonalization
+
+        double H[3][3] = {
+            {result.E_PPS, result.H_12, 0.0},
+            {result.H_12, result.E_OSS, result.H_23},
+            {0.0, result.H_23, result.E_DES}
+        };
+
+        // Initialize eigenvectors to identity
+        double V[3][3] = {
+            {1.0, 0.0, 0.0},
+            {0.0, 1.0, 0.0},
+            {0.0, 0.0, 1.0}
+        };
+
+        // Jacobi iteration for 3x3 symmetric matrix
+        const int max_iter = 50;
+        const double tol = 1e-14;
+
+        for (int iter = 0; iter < max_iter; ++iter) {
+            // Find largest off-diagonal element
+            double max_off = 0.0;
+            int p = 0, q = 1;
+            for (int i = 0; i < 3; ++i) {
+                for (int j = i + 1; j < 3; ++j) {
+                    if (std::abs(H[i][j]) > max_off) {
+                        max_off = std::abs(H[i][j]);
+                        p = i;
+                        q = j;
+                    }
+                }
+            }
+
+            if (max_off < tol) break;
+
+            // Compute rotation angle
+            double theta = (H[q][q] - H[p][p]) / (2.0 * H[p][q]);
+            double t = (theta >= 0) ?
+                       1.0 / (theta + std::sqrt(1.0 + theta * theta)) :
+                      -1.0 / (-theta + std::sqrt(1.0 + theta * theta));
+            double c = 1.0 / std::sqrt(1.0 + t * t);
+            double s = t * c;
+
+            // Apply Jacobi rotation to H
+            double H_pp = H[p][p];
+            double H_qq = H[q][q];
+            double H_pq = H[p][q];
+
+            H[p][p] = c * c * H_pp - 2.0 * s * c * H_pq + s * s * H_qq;
+            H[q][q] = s * s * H_pp + 2.0 * s * c * H_pq + c * c * H_qq;
+            H[p][q] = H[q][p] = 0.0;
+
+            for (int k = 0; k < 3; ++k) {
+                if (k != p && k != q) {
+                    double H_kp = H[k][p];
+                    double H_kq = H[k][q];
+                    H[k][p] = H[p][k] = c * H_kp - s * H_kq;
+                    H[k][q] = H[q][k] = s * H_kp + c * H_kq;
+                }
+            }
+
+            // Apply rotation to eigenvectors
+            for (int k = 0; k < 3; ++k) {
+                double V_kp = V[k][p];
+                double V_kq = V[k][q];
+                V[k][p] = c * V_kp - s * V_kq;
+                V[k][q] = s * V_kp + c * V_kq;
+            }
+        }
+
+        // Extract eigenvalues and sort them
+        std::vector<std::pair<double, int>> eig_pairs = {
+            {H[0][0], 0}, {H[1][1], 1}, {H[2][2], 2}
+        };
+        std::sort(eig_pairs.begin(), eig_pairs.end());
+
+        result.energies.resize(3);
+        result.coeffs.resize(9);
+        for (int i = 0; i < 3; ++i) {
+            result.energies[i] = eig_pairs[i].first;
+            int col = eig_pairs[i].second;
+            for (int j = 0; j < 3; ++j) {
+                result.coeffs[i * 3 + j] = V[j][col];
+            }
+        }
+    }
+
+    return result;
+}
+
 // ============================================================================
 // REKS44Space Implementation (Placeholder)
 // ============================================================================
@@ -288,6 +582,96 @@ void REKS44Space::compute_weight_derivs(
 
     // TODO: Implement full derivative computation for REKS(4,4)
     // This requires derivatives w.r.t. both FON variables
+}
+
+int REKS44Space::get_alpha_base_idx(int L) const {
+    // Convert alpha occupation pattern to bitmask index
+    // For REKS(4,4): 4 active orbitals, pattern = sum(alpha[i] << i)
+    const auto& micro = microstates_[L];
+    int pattern = 0;
+    for (int i = 0; i < 4; ++i) {
+        pattern += micro.alpha[i] << i;
+    }
+    return pattern;
+}
+
+int REKS44Space::get_beta_base_idx(int L) const {
+    const auto& micro = microstates_[L];
+    int pattern = 0;
+    for (int i = 0; i < 4; ++i) {
+        pattern += micro.beta[i] << i;
+    }
+    return pattern;
+}
+
+double REKS44Space::get_symmetry_factor(int L) const {
+    // TODO: Implement proper symmetry factors for REKS(4,4)
+    // This requires analysis of microstate spin symmetry from Table IV
+    // For now, return 1.0 (placeholder)
+    return 1.0;
+}
+
+std::vector<double> REKS44Space::compute_energy_gradient(
+    const std::vector<double>& E_micro,
+    const std::vector<double>& C_L) const {
+
+    // TODO: Implement multi-variable gradient for REKS(4,4)
+    // Returns {dE/dn_a, dE/dn_b}
+    // For now, return zeros (placeholder)
+    return {0.0, 0.0};
+}
+
+std::vector<double> REKS44Space::compute_energy_hessian(
+    const std::vector<double>& E_micro,
+    const std::vector<double>& C_L) const {
+
+    // TODO: Implement 2x2 Hessian for REKS(4,4)
+    // Returns {d²E/dn_a², d²E/dn_a dn_b, d²E/dn_b dn_a, d²E/dn_b²}
+    // For now, return zeros (placeholder)
+    return {0.0, 0.0, 0.0, 0.0};
+}
+
+double REKS44Space::get_effective_fon(int orbital_idx) const {
+    // Effective FON for Fock coupling
+    // For REKS(4,4): orbitals ordered as (a, b, c, d) = (0, 1, 2, 3)
+    // Pair 0: (a, d), Pair 1: (b, c)
+    //
+    // f_i = (n_i/2)*w_PPS + 0.5*w_OSS
+    // where w_OSS = (1 - w_PPS) / 2 for REKS(4,4)
+
+    double n_i = 0.0;
+    switch (orbital_idx) {
+        case 0: n_i = pairs_[0].fon_p; break;  // n_a
+        case 1: n_i = pairs_[1].fon_p; break;  // n_b
+        case 2: n_i = pairs_[1].fon_q; break;  // n_c
+        case 3: n_i = pairs_[0].fon_q; break;  // n_d
+        default: n_i = 0.0;
+    }
+
+    double w_oss = (1.0 - w_pps_) / 2.0;
+    return (n_i / 2.0) * w_pps_ + 0.5 * w_oss;
+}
+
+REKSActiveSpace::SIResult REKS44Space::compute_SI_energies(
+    const std::vector<double>& E_micro,
+    double Wrs,
+    int n_si_states) const {
+
+    // TODO: Implement SI-SA for REKS(4,4)
+    // This requires computing 5-state SI Hamiltonian
+    // For now, return placeholder result
+
+    SIResult result;
+    result.n_states = n_si_states;
+    result.E_PPS = 0.0;
+    result.E_OSS = 0.0;
+    result.E_DES = 0.0;
+    result.H_12 = 0.0;
+    result.H_23 = 0.0;
+    result.energies.resize(n_si_states, 0.0);
+    result.coeffs.resize(n_si_states * n_si_states, 0.0);
+
+    return result;
 }
 
 }  // namespace reks

@@ -80,17 +80,18 @@ void REKS::reks_common_init() {
     // Use existing DEBUG option for REKS debug output
     reks_debug_ = options_.get_int("DEBUG");
 
-    // Compute active space indices
-    // For REKS(2,2): 2 electrons in 2 orbitals at HOMO/LUMO
-    Ncore_ = nalpha_ - 1;  // All doubly occupied except HOMO
-    active_r_ = Ncore_;    // HOMO
-    active_s_ = Ncore_ + 1; // LUMO (will be fractionally occupied)
+    // Compute number of core (doubly occupied) orbitals
+    // For REKS(2,2): Ncore = nalpha - 1 (HOMO becomes active)
+    Ncore_ = nalpha_ - 1;
 
     // Create REKS(2,2) active space with default SA weights
     // Initial FONs: n_r=2.0, n_s=0.0 (closed-shell limit like GAMESS)
     double w_PPS = 0.5;
     double w_OSS = 0.5;
     active_space_ = reks::REKSActiveSpace::create_2_2(w_PPS, w_OSS);
+
+    // Get active orbital MO indices from active_space_ (generalized)
+    active_mo_indices_ = active_space_->get_active_mo_indices(Ncore_);
 
     // Initialize vectors for microstate energies and weights
     int n_micro = n_microstates();
@@ -109,9 +110,13 @@ void REKS::reks_common_init() {
                         active_space_->n_electrons(), active_space_->n_orbitals());
         outfile->Printf("  Number of GVB pairs:   %d\n", active_space_->n_pairs());
         outfile->Printf("  Number of microstates: %d\n", n_micro);
+        outfile->Printf("  Number of base densities: %d\n", active_space_->n_base_densities());
         outfile->Printf("  Core orbitals (Ncore): %3d\n", Ncore_);
-        outfile->Printf("  Active orbital r:      %3d (HOMO)\n", active_r_);
-        outfile->Printf("  Active orbital s:      %3d (LUMO)\n", active_s_);
+        outfile->Printf("  Active MO indices:     ");
+        for (int idx : active_mo_indices_) {
+            outfile->Printf("%d ", idx);
+        }
+        outfile->Printf("\n");
         outfile->Printf("  ------------------------------------------------------------\n");
         outfile->Printf("  Initial FON: n_r = %.6f, n_s = %.6f\n", get_n_r(), get_n_s());
         outfile->Printf("  SA weights:  w_PPS = %.4f, w_OSS = %.4f\n",
@@ -132,12 +137,17 @@ void REKS::reks_common_init() {
 void REKS::allocate_reks_matrices() {
     int nso = nsopi_[0];  // Assuming C1 symmetry
     int n_micro = n_microstates();
+    int n_base = active_space_->n_base_densities();
+    int n_active = active_space_->n_orbitals();
 
-    // Allocate base density matrices
-    D00_ = std::make_shared<Matrix>("D00 (core)", nsopi_, nsopi_);
-    D10_ = std::make_shared<Matrix>("D10 (core+r)", nsopi_, nsopi_);
-    D01_ = std::make_shared<Matrix>("D01 (core+s)", nsopi_, nsopi_);
-    D11_ = std::make_shared<Matrix>("D11 (core+r+s)", nsopi_, nsopi_);
+    // Allocate base density matrices (generalized for REKS(N,M))
+    // For REKS(2,2): 4 densities (patterns 0-3)
+    // For REKS(4,4): 16 densities (patterns 0-15)
+    base_densities_.resize(n_base);
+    for (int p = 0; p < n_base; ++p) {
+        std::string name = "D_base_" + std::to_string(p);
+        base_densities_[p] = std::make_shared<Matrix>(name, nsopi_, nsopi_);
+    }
 
     // Allocate microstate density and Fock matrices (dynamically sized)
     D_alpha_micro_.resize(n_micro);
@@ -158,10 +168,14 @@ void REKS::allocate_reks_matrices() {
 
     // Pre-allocate work matrices for JK computation (HPC optimization)
     // These are reused every SCF iteration instead of being reallocated
-    C_D00_ = std::make_shared<Matrix>("C for D00", nso, std::max(1, Ncore_));
-    C_D10_ = std::make_shared<Matrix>("C for D10", nso, Ncore_ + 1);
-    C_D01_ = std::make_shared<Matrix>("C for D01", nso, Ncore_ + 1);
-    C_D11_ = std::make_shared<Matrix>("C for D11", nso, Ncore_ + 2);
+    C_base_.resize(n_base);
+    for (int p = 0; p < n_base; ++p) {
+        // Number of occupied orbitals for pattern p = Ncore + popcount(p)
+        int n_occ = Ncore_ + __builtin_popcount(p);
+        n_occ = std::max(1, n_occ);  // At least 1 column to avoid empty matrix
+        std::string name = "C_base_" + std::to_string(p);
+        C_base_[p] = std::make_shared<Matrix>(name, nso, n_occ);
+    }
     J_work_ = std::make_shared<Matrix>("J_work", nsopi_, nsopi_);
 
     // Pre-allocate work matrices for AO→MO transforms in form_F() (HPC optimization)
@@ -181,11 +195,11 @@ void REKS::allocate_reks_matrices() {
 // ---------------------------------------------------------------------------
 
 void REKS::build_base_densities() {
-    // Builds D00, D10, D01, D11 from current orbitals Ca_
-    // D00 = core only (Ncore doubly occupied)
-    // D10 = core + orbital r singly occupied
-    // D01 = core + orbital s singly occupied
-    // D11 = core + r + s both singly occupied
+    // Builds base density matrices for all occupation patterns from current orbitals Ca_
+    // For REKS(2,2): patterns 0-3 (D00, D01, D10, D11)
+    // For REKS(4,4): patterns 0-15
+    //
+    // Pattern bitmask: bit i set = active orbital i occupied
 
     // Debug: Print C matrix after GUESS (iteration 1 only)
     if (iteration_ == 1 && reks_debug_ >= 2) {
@@ -207,105 +221,69 @@ void REKS::build_base_densities() {
     int nso = nsopi_[0];  // Assuming C1 symmetry
     int nmo = Ca_->colspi()[0];
     double** Cp = Ca_->pointer(0);
+    int n_active = active_space_->n_orbitals();
+    int n_base = active_space_->n_base_densities();
 
-    // D00: core electrons only
-    // D00 = C[:,:Ncore] * C[:,:Ncore]^T (BLAS DGEMM)
-    D00_->zero();
+    // Build base density for pattern 0 (core only, no active orbitals occupied)
+    base_densities_[0]->zero();
     if (Ncore_ > 0) {
-        double** D00p = D00_->pointer(0);
-        C_DGEMM('N', 'T', nso, nso, Ncore_, 1.0, Cp[0], nmo, Cp[0], nmo, 0.0, D00p[0], nso);
+        double** Dp = base_densities_[0]->pointer(0);
+        C_DGEMM('N', 'T', nso, nso, Ncore_, 1.0, Cp[0], nmo, Cp[0], nmo, 0.0, Dp[0], nso);
     }
 
-    // D10: core + orbital r
-    // D10 = D00 + C[:,r] * C[:,r]^T (copy + BLAS DGER rank-1 update)
-    D10_->copy(D00_);
-    {
-        double** D10p = D10_->pointer(0);
-        C_DGER(nso, nso, 1.0, &Cp[0][active_r_], nmo, &Cp[0][active_r_], nmo, D10p[0], nso);
-    }
+    // Build remaining base densities by adding active orbitals based on pattern bits
+    for (int p = 1; p < n_base; ++p) {
+        // Start with core density
+        base_densities_[p]->copy(base_densities_[0]);
+        double** Dp = base_densities_[p]->pointer(0);
 
-    // D01: core + orbital s
-    // D01 = D00 + C[:,s] * C[:,s]^T (copy + BLAS DGER rank-1 update)
-    D01_->copy(D00_);
-    {
-        double** D01p = D01_->pointer(0);
-        C_DGER(nso, nso, 1.0, &Cp[0][active_s_], nmo, &Cp[0][active_s_], nmo, D01p[0], nso);
-    }
-
-    // D11: core + r + s (both singly occupied)
-    // D11 = D10 + C[:,s] * C[:,s]^T (copy + BLAS DGER rank-1 update)
-    D11_->copy(D10_);
-    {
-        double** D11p = D11_->pointer(0);
-        C_DGER(nso, nso, 1.0, &Cp[0][active_s_], nmo, &Cp[0][active_s_], nmo, D11p[0], nso);
+        // Add each active orbital that is occupied in pattern p
+        for (int i = 0; i < n_active; ++i) {
+            if (p & (1 << i)) {
+                int mo_idx = active_mo_indices_[i];
+                C_DGER(nso, nso, 1.0, &Cp[0][mo_idx], nmo, &Cp[0][mo_idx], nmo, Dp[0], nso);
+            }
+        }
     }
 
     if (reks_debug_ >= 2) {
-        // Print trace(D) for comparison with GAMESS
-        double tr_D00 = 0.0, tr_D10 = 0.0, tr_D01 = 0.0, tr_D11 = 0.0;
-        double** D00p = D00_->pointer(0);
-        double** D10p = D10_->pointer(0);
-        double** D01p = D01_->pointer(0);
-        double** D11p = D11_->pointer(0);
-        for (int mu = 0; mu < nso; ++mu) {
-            tr_D00 += D00p[mu][mu];
-            tr_D10 += D10p[mu][mu];
-            tr_D01 += D01p[mu][mu];
-            tr_D11 += D11p[mu][mu];
+        outfile->Printf("\n  === REKS Base Densities (Generalized) ===\n");
+        for (int p = 0; p < n_base; ++p) {
+            int n_occ = Ncore_ + __builtin_popcount(p);
+            outfile->Printf("  Pattern %d (n_occ=%d): tr(D*S) = %8.4f\n",
+                           p, n_occ, base_densities_[p]->vector_dot(S_));
         }
-
-        outfile->Printf("\n  === Density Matrix Traces (Psi4) ===\n");
-        outfile->Printf("  Tr(D00)= %.10f Tr(D10)= %.10f Tr(D01)= %.10f Tr(D11)= %.10f\n",
-                        tr_D00, tr_D10, tr_D01, tr_D11);
-        outfile->Printf("  Active indices: Ncore=%d, active_r=%d, active_s=%d\n",
-                        Ncore_, active_r_, active_s_);
-        outfile->Printf("  D00[active_r,active_r]= %.10f  D01[active_s,active_s]= %.10f\n",
-                        D00p[active_r_][active_r_], D01p[active_s_][active_s_]);
-        outfile->Printf("  ============================================\n");
-
-        // Note: tr(D) != N_electrons in non-orthogonal basis. Use tr(D*S) for electrons.
-        outfile->Printf("\n  === REKS Base Densities ===\n");
-        outfile->Printf("  D00 (core):    tr(D*S) = %8.4f, N_elec = %d\n",
-                        D00_->vector_dot(S_), Ncore_);
-        outfile->Printf("  D10 (core+r):  tr(D*S) = %8.4f, N_elec = %d\n",
-                        D10_->vector_dot(S_), Ncore_ + 1);
-        outfile->Printf("  D01 (core+s):  tr(D*S) = %8.4f, N_elec = %d\n",
-                        D01_->vector_dot(S_), Ncore_ + 1);
-        outfile->Printf("  D11 (core+rs): tr(D*S) = %8.4f, N_elec = %d\n",
-                        D11_->vector_dot(S_), Ncore_ + 2);
     }
 }
 
 void REKS::build_microstate_densities() {
-    // Map base densities to microstate alpha/beta densities
-    // Only 4 unique microstates needed (L=3=L=4, L=5=L=6 by symmetry)
-    //
-    // L=0 (paper L=1): D^alpha = D10, D^beta = D10  (closed-shell n_r)
-    // L=1 (paper L=2): D^alpha = D01, D^beta = D01  (closed-shell n_s)
-    // L=2 (paper L=3): D^alpha = D10, D^beta = D01  (open-shell r-up s-down)
-    // L=3 (paper L=5): D^alpha = D11, D^beta = D00  (triplet-like)
+    // Map base densities to microstate alpha/beta densities using active_space_ interface
+    // This is now generalized for any REKS(N,M)
 
-    D_alpha_micro_[0]->copy(D10_);
-    D_beta_micro_[0]->copy(D10_);
+    int n_micro = n_microstates();
+    for (int L = 0; L < n_micro; ++L) {
+        int alpha_idx = active_space_->get_alpha_base_idx(L);
+        int beta_idx = active_space_->get_beta_base_idx(L);
 
-    D_alpha_micro_[1]->copy(D01_);
-    D_beta_micro_[1]->copy(D01_);
-
-    D_alpha_micro_[2]->copy(D10_);
-    D_beta_micro_[2]->copy(D01_);
-
-    D_alpha_micro_[3]->copy(D11_);
-    D_beta_micro_[3]->copy(D00_);
+        D_alpha_micro_[L]->copy(base_densities_[alpha_idx]);
+        D_beta_micro_[L]->copy(base_densities_[beta_idx]);
+    }
 
     if (reks_debug_ >= 2) {
         outfile->Printf("\n  === REKS Microstate Densities ===\n");
-        int n_micro = n_microstates();
+        int n_active = active_space_->n_orbitals();
         for (int L = 0; L < n_micro; ++L) {
-            outfile->Printf("  L=%d: tr(D^alpha) = %10.6f, tr(D^beta) = %10.6f, "
-                           "n_r^alpha=%d, n_r^beta=%d, n_s^alpha=%d, n_s^beta=%d\n",
-                L, D_alpha_micro_[L]->trace(), D_beta_micro_[L]->trace(),
-                active_space_->alpha_occ(L, 0), active_space_->beta_occ(L, 0),
-                active_space_->alpha_occ(L, 1), active_space_->beta_occ(L, 1));
+            outfile->Printf("  L=%d: base_idx(alpha=%d, beta=%d), tr(D^alpha)=%10.6f, tr(D^beta)=%10.6f\n",
+                L, active_space_->get_alpha_base_idx(L), active_space_->get_beta_base_idx(L),
+                D_alpha_micro_[L]->trace(), D_beta_micro_[L]->trace());
+
+            // Print active orbital occupations
+            outfile->Printf("        occupations: ");
+            for (int i = 0; i < n_active; ++i) {
+                outfile->Printf("orb%d(a=%d,b=%d) ", i,
+                    active_space_->alpha_occ(L, i), active_space_->beta_occ(L, i));
+            }
+            outfile->Printf("\n");
         }
     }
 }
@@ -339,99 +317,83 @@ void REKS::compute_weighting_factors() {
 // ---------------------------------------------------------------------------
 
 void REKS::build_microstate_focks() {
-    // Build UHF-like Fock matrices for each of the 4 unique microstates.
-    // Single JK batch: D00, D10, D01, D11 + Da_ (for RHF G_ compatibility)
+    // Build UHF-like Fock matrices for each microstate.
+    // Single JK batch for all unique base densities + RHF density for G_
     //
-    // Microstate density mapping:
-    //   L=0: D^alpha = D10, D^beta = D10  (closed-shell r)
-    //   L=1: D^alpha = D01, D^beta = D01  (closed-shell s)
-    //   L=2: D^alpha = D10, D^beta = D01  (open-shell r-up s-down)
-    //   L=3: D^alpha = D11, D^beta = D00  (triplet-like)
+    // For REKS(2,2): 4 base densities (patterns 0-3)
+    // For REKS(4,4): 16 base densities (patterns 0-15)
 
     int nso = nsopi_[0];
+    int nmo = Ca_->colspi()[0];
+    int n_base = active_space_->n_base_densities();
+    int n_active = active_space_->n_orbitals();
+    int n_micro = n_microstates();
 
     // Use pre-allocated work matrices (allocated once in allocate_reks_matrices)
     auto C_occ = Ca_subset("SO", "OCC");  // RHF occupied orbitals for G_
 
     double** Cp = Ca_->pointer(0);
 
-    // C_D00: columns [0..Ncore-1] - core only
-    if (Ncore_ > 0) {
-        double** C00p = C_D00_->pointer(0);
+    // Populate C_base_ matrices for JK computation
+    for (int p = 0; p < n_base; ++p) {
+        double** Cbp = C_base_[p]->pointer(0);
+        int n_occ_in_pattern = __builtin_popcount(p);
+        int col = 0;
+
+        // Copy core orbitals first
         for (int mu = 0; mu < nso; ++mu) {
             for (int k = 0; k < Ncore_; ++k) {
-                C00p[mu][k] = Cp[mu][k];
+                Cbp[mu][col + k] = Cp[mu][k];
             }
         }
-    }
+        col = Ncore_;
 
-    // C_D10: columns [0..Ncore] - core + r (contiguous)
-    {
-        double** C10p = C_D10_->pointer(0);
+        // Add active orbitals based on pattern bits
+        for (int i = 0; i < n_active; ++i) {
+            if (p & (1 << i)) {
+                int mo_idx = active_mo_indices_[i];
+                for (int mu = 0; mu < nso; ++mu) {
+                    Cbp[mu][col] = Cp[mu][mo_idx];
+                }
+                col++;
+            }
+        }
+
+        // Zero remaining columns if any (shouldn't happen if allocation is correct)
+        int expected_cols = Ncore_ + n_occ_in_pattern;
+        expected_cols = std::max(1, expected_cols);
         for (int mu = 0; mu < nso; ++mu) {
-            for (int k = 0; k < Ncore_ + 1; ++k) {
-                C10p[mu][k] = Cp[mu][k];
+            for (int k = col; k < expected_cols; ++k) {
+                Cbp[mu][k] = 0.0;
             }
         }
     }
 
-    // C_D01: columns [0..Ncore-1, s] - core + s (NOT contiguous, s is at Ncore+1)
-    {
-        double** C01p = C_D01_->pointer(0);
-        for (int mu = 0; mu < nso; ++mu) {
-            for (int k = 0; k < Ncore_; ++k) {
-                C01p[mu][k] = Cp[mu][k];
-            }
-            // s orbital at position Ncore+1 in Ca_, placed at Ncore in C_D01
-            C01p[mu][Ncore_] = Cp[mu][active_s_];
-        }
+    // Handle special case: Ncore=0 with pattern 0 (empty density)
+    if (Ncore_ == 0) {
+        C_base_[0]->zero();
     }
 
-    // C_D11: columns [0..Ncore+1] - core + r + s (contiguous)
-    {
-        double** C11p = C_D11_->pointer(0);
-        for (int mu = 0; mu < nso; ++mu) {
-            for (int k = 0; k < Ncore_ + 2; ++k) {
-                C11p[mu][k] = Cp[mu][k];
-            }
-        }
-    }
-
-    // Batch JK computation: 5 densities in one call
-    //   [0] C_D00 -> J00, K00
-    //   [1] C_D10 -> J10, K10
-    //   [2] C_D01 -> J01, K01
-    //   [3] C_D11 -> J11, K11
-    //   [4] C_occ -> J_rhf, K_rhf (for RHF G_ matrix)
+    // Batch JK computation: n_base + 1 densities in one call
+    // [0..n_base-1]: base densities
+    // [n_base]: RHF occupied for G_
 
     std::vector<SharedMatrix>& C_left = jk_->C_left();
     std::vector<SharedMatrix>& C_right = jk_->C_right();
     C_left.clear();
     C_right.clear();
 
-    if (Ncore_ > 0) {
-        C_left.push_back(C_D00_);  // [0]
-    } else {
-        // For H2 (Ncore=0), use pre-allocated C_D00_ which has 1 column
-        // Zero it to produce zero J/K
-        C_D00_->zero();
-        C_left.push_back(C_D00_);  // [0] D00 = 0 for H2
+    for (int p = 0; p < n_base; ++p) {
+        C_left.push_back(C_base_[p]);
     }
-    C_left.push_back(C_D10_);  // [1]
-    C_left.push_back(C_D01_);  // [2]
-    C_left.push_back(C_D11_);  // [3]
-    C_left.push_back(C_occ);   // [4] RHF occupied for G_
+    C_left.push_back(C_occ);  // Last one for RHF G_
 
     jk_->compute();
 
     const std::vector<SharedMatrix>& J = jk_->J();
     const std::vector<SharedMatrix>& K = jk_->K();
 
-    // J00=J[0], J10=J[1], J01=J[2], J11=J[3], J_rhf=J[4]
-    // K00=K[0], K10=K[1], K01=K[2], K11=K[3], K_rhf=K[4]
-
-    // For H2 (Ncore=0), J[0]/K[0] may contain garbage from empty C matrix
-    // Explicitly zero them to avoid contaminating microstate energies
+    // Handle special case: pattern 0 with Ncore=0 may have garbage
     if (Ncore_ == 0) {
         J[0]->zero();
         K[0]->zero();
@@ -441,8 +403,8 @@ void REKS::build_microstate_focks() {
 
     // Build RHF J_, K_, G_ for DIIS and compute_E() compatibility
     // RHF convention: G_ = 2*J - alpha*K
-    J_ = J[4];
-    K_ = K[4];
+    J_ = J[n_base];
+    K_ = K[n_base];
 
     G_->zero();
     G_->axpy(2.0, J_);
@@ -450,68 +412,33 @@ void REKS::build_microstate_focks() {
         G_->axpy(-alpha, K_);
     }
 
-    // Build Fock matrices for each microstate using pre-allocated J_work_
+    // Build Fock matrices for each microstate
     // F^sigma_L = H + J_total_L - alpha*K^sigma_L
+    // where J_total = J^alpha + J^beta, K^sigma uses the sigma density
 
-    // L=0 (closed-shell r): D^alpha = D^beta = D10
-    // J_total = 2*J10, K^alpha = K^beta = K10
-    {
-        J_work_->copy(J[1]);
-        J_work_->scale(2.0);
+    for (int L = 0; L < n_micro; ++L) {
+        int alpha_idx = active_space_->get_alpha_base_idx(L);
+        int beta_idx = active_space_->get_beta_base_idx(L);
 
-        F_alpha_micro_[0]->copy(H_);
-        F_alpha_micro_[0]->add(J_work_);
-        F_alpha_micro_[0]->axpy(-alpha, K[1]);
+        // J_total = J_alpha + J_beta
+        J_work_->copy(J[alpha_idx]);
+        J_work_->add(J[beta_idx]);
 
-        F_beta_micro_[0]->copy(F_alpha_micro_[0]);  // Same for closed-shell
-    }
+        // F^alpha = H + J_total - alpha*K^alpha
+        F_alpha_micro_[L]->copy(H_);
+        F_alpha_micro_[L]->add(J_work_);
+        F_alpha_micro_[L]->axpy(-alpha, K[alpha_idx]);
 
-    // L=1 (closed-shell s): D^alpha = D^beta = D01
-    // J_total = 2*J01, K^alpha = K^beta = K01
-    {
-        J_work_->copy(J[2]);
-        J_work_->scale(2.0);
-
-        F_alpha_micro_[1]->copy(H_);
-        F_alpha_micro_[1]->add(J_work_);
-        F_alpha_micro_[1]->axpy(-alpha, K[2]);
-
-        F_beta_micro_[1]->copy(F_alpha_micro_[1]);  // Same for closed-shell
-    }
-
-    // L=2 (open-shell r-up s-down): D^alpha = D10, D^beta = D01
-    // J_total = J10 + J01, K^alpha = K10, K^beta = K01
-    {
-        J_work_->copy(J[1]);
-        J_work_->add(J[2]);
-
-        F_alpha_micro_[2]->copy(H_);
-        F_alpha_micro_[2]->add(J_work_);
-        F_alpha_micro_[2]->axpy(-alpha, K[1]);
-
-        F_beta_micro_[2]->copy(H_);
-        F_beta_micro_[2]->add(J_work_);
-        F_beta_micro_[2]->axpy(-alpha, K[2]);
-    }
-
-    // L=3 (triplet-like): D^alpha = D11, D^beta = D00
-    // J_total = J11 + J00, K^alpha = K11, K^beta = K00
-    {
-        J_work_->copy(J[3]);
-        J_work_->add(J[0]);
-
-        F_alpha_micro_[3]->copy(H_);
-        F_alpha_micro_[3]->add(J_work_);
-        F_alpha_micro_[3]->axpy(-alpha, K[3]);
-
-        F_beta_micro_[3]->copy(H_);
-        F_beta_micro_[3]->add(J_work_);
-        F_beta_micro_[3]->axpy(-alpha, K[0]);
+        // F^beta = H + J_total - alpha*K^beta
+        F_beta_micro_[L]->copy(H_);
+        F_beta_micro_[L]->add(J_work_);
+        F_beta_micro_[L]->axpy(-alpha, K[beta_idx]);
     }
 
     if (reks_debug_ >= 2) {
-        outfile->Printf("\n  === REKS Microstate Fock Matrices ===\n");
+        outfile->Printf("\n  === REKS Microstate Fock Matrices (Generalized) ===\n");
         outfile->Printf("  Exchange scaling alpha = %.4f\n", alpha);
+        outfile->Printf("  Number of base densities in JK batch: %d\n", n_base);
 
         // Compare with RHF Fock for validation
         Fa_->copy(H_);
@@ -519,26 +446,15 @@ void REKS::build_microstate_focks() {
         double tr_rhf = Fa_->trace();
         outfile->Printf("  RHF Fock: tr(Fa_RHF) = %15.10f\n", tr_rhf);
 
-        int n_micro = n_microstates();
         for (int L = 0; L < n_micro; ++L) {
             double tr_alpha = F_alpha_micro_[L]->trace();
             double tr_beta = F_beta_micro_[L]->trace();
 
-            // Check active orbital diagonal elements
-            double** Fa = F_alpha_micro_[L]->pointer(0);
-            double** Fb = F_beta_micro_[L]->pointer(0);
-            double Frr_a = Fa[active_r_][active_r_];
-            double Fss_a = Fa[active_s_][active_s_];
-            double Frs_a = Fa[active_r_][active_s_];
-            double Frr_b = Fb[active_r_][active_r_];
-            double Fss_b = Fb[active_s_][active_s_];
-            double Frs_b = Fb[active_r_][active_s_];
+            int alpha_idx = active_space_->get_alpha_base_idx(L);
+            int beta_idx = active_space_->get_beta_base_idx(L);
 
-            outfile->Printf("  L=%d: tr(F^alpha)=%15.10f, tr(F^beta)=%15.10f\n", L, tr_alpha, tr_beta);
-            outfile->Printf("        F^alpha[r,r]=%12.6f, F^alpha[s,s]=%12.6f, F^alpha[r,s]=%12.6f\n",
-                           Frr_a, Fss_a, Frs_a);
-            outfile->Printf("        F^beta[r,r]=%12.6f, F^beta[s,s]=%12.6f, F^beta[r,s]=%12.6f\n",
-                           Frr_b, Fss_b, Frs_b);
+            outfile->Printf("  L=%d: base_idx(alpha=%d, beta=%d), tr(F^alpha)=%15.10f, tr(F^beta)=%15.10f\n",
+                           L, alpha_idx, beta_idx, tr_alpha, tr_beta);
         }
     }
 }
@@ -751,8 +667,16 @@ void REKS::fock_micro_to_macro(int L, double Cl, double** Fa, double** Fb) {
     //   - Active s diagonal: weighted by n^σ_s / f_s
     //   - Core-active coupling: weighted by (1-n^σ_q) / (1-f_q)
     //   - Active-active (r,s): sign(f_r - f_s) weighted
+    //
+    // NOTE: Currently specialized for REKS(2,2). Generalization for REKS(4,4)+
+    // requires extending to multiple active orbital pairs.
 
     double** Freks = F_reks_->pointer(0);
+
+    // Local variables for active orbital indices (from generalized structure)
+    // For REKS(2,2): active_r = active_mo_indices_[0], active_s = active_mo_indices_[1]
+    int active_r = active_mo_indices_[0];
+    int active_s = active_mo_indices_[1];
 
     // Get microstate occupations from active_space_
     int nra = active_space_->alpha_occ(L, 0);  // n_r^alpha
@@ -766,11 +690,9 @@ void REKS::fock_micro_to_macro(int L, double Cl, double** Fa, double** Fb) {
     double w_PPS = active_space_->w_PPS();
     double w_OSS = active_space_->w_OSS();
 
-    // GAMESS formula (reks.src line 1178-1179): FR = DNR*WPPS + 0.5*WOSS
-    // where DNR = n_r/2, DNS = n_s/2 (normalized to [0,1])
-    // So: FR = (n_r/2)*WPPS + 0.5*WOSS
-    double fr = (n_r / 2.0) * w_PPS + 0.5 * w_OSS;
-    double fs = (n_s / 2.0) * w_PPS + 0.5 * w_OSS;
+    // Use generalized effective FON (delegates to active_space_)
+    double fr = active_space_->get_effective_fon(0);  // f_r
+    double fs = active_space_->get_effective_fon(1);  // f_s
 
     double Wc = 0.5 * Cl;  // Core block weight
 
@@ -782,7 +704,7 @@ void REKS::fock_micro_to_macro(int L, double Cl, double** Fa, double** Fb) {
     }
 
     // Virtual-virtual block (i,j > active_s)
-    for (int i = active_s_ + 1; i < nsopi_[0]; ++i) {
+    for (int i = active_s + 1; i < nsopi_[0]; ++i) {
         for (int j = i; j < nsopi_[0]; ++j) {
             Freks[i][j] += Wc * (Fa[i][j] + Fb[i][j]);
         }
@@ -790,7 +712,7 @@ void REKS::fock_micro_to_macro(int L, double Cl, double** Fa, double** Fb) {
 
     // Core-virtual block
     for (int i = 0; i < Ncore_; ++i) {
-        for (int j = active_s_ + 1; j < nsopi_[0]; ++j) {
+        for (int j = active_s + 1; j < nsopi_[0]; ++j) {
             Freks[i][j] += Wc * (Fa[i][j] + Fb[i][j]);
         }
     }
@@ -799,23 +721,23 @@ void REKS::fock_micro_to_macro(int L, double Cl, double** Fa, double** Fb) {
     // Weight: 0.5 * C_L * n^sigma_r / f_r
     double Wr_a = (fr > 1e-10) ? 0.5 * Cl * nra / fr : 0.0;
     double Wr_b = (fr > 1e-10) ? 0.5 * Cl * nrb / fr : 0.0;
-    Freks[active_r_][active_r_] += Wr_a * Fa[active_r_][active_r_] + Wr_b * Fb[active_r_][active_r_];
+    Freks[active_r][active_r] += Wr_a * Fa[active_r][active_r] + Wr_b * Fb[active_r][active_r];
 
     // Active orbital s diagonal
     // Weight: 0.5 * C_L * n^sigma_s / f_s
     double Ws_a = (fs > 1e-10) ? 0.5 * Cl * nsa / fs : 0.0;
     double Ws_b = (fs > 1e-10) ? 0.5 * Cl * nsb / fs : 0.0;
-    double contrib_ss = Ws_a * Fa[active_s_][active_s_] + Ws_b * Fb[active_s_][active_s_];
-    Freks[active_s_][active_s_] += contrib_ss;
+    double contrib_ss = Ws_a * Fa[active_s][active_s] + Ws_b * Fb[active_s][active_s];
+    Freks[active_s][active_s] += contrib_ss;
 
     // Debug: Trace F(s,s) contributions in MO basis
     if (reks_debug_ >= 2) {
         outfile->Printf("  DEBUG_FM2FE_MO L=%d: Cl=%.6f fr=%.6f fs=%.6f nsa=%d nsb=%d\n",
                        L, Cl, fr, fs, nsa, nsb);
         outfile->Printf("    Fa_MO(s,s)=%.6f Fb_MO(s,s)=%.6f Ws_a=%.6f Ws_b=%.6f\n",
-                       Fa[active_s_][active_s_], Fb[active_s_][active_s_], Ws_a, Ws_b);
+                       Fa[active_s][active_s], Fb[active_s][active_s], Ws_a, Ws_b);
         outfile->Printf("    contrib_ss=%.6f cumul_F_MO(s,s)=%.6f\n",
-                       contrib_ss, Freks[active_s_][active_s_]);
+                       contrib_ss, Freks[active_s][active_s]);
     }
 
     // Core-active coupling (core to r)
@@ -830,14 +752,14 @@ void REKS::fock_micro_to_macro(int L, double Cl, double** Fa, double** Fb) {
     double Wcs_b = (omfs > 1e-10) ? 0.5 * Cl * (1 - nsb) / omfs : 0.0;
 
     for (int c = 0; c < Ncore_; ++c) {
-        Freks[c][active_r_] += Wcr_a * Fa[c][active_r_] + Wcr_b * Fb[c][active_r_];
-        Freks[c][active_s_] += Wcs_a * Fa[c][active_s_] + Wcs_b * Fb[c][active_s_];
+        Freks[c][active_r] += Wcr_a * Fa[c][active_r] + Wcr_b * Fb[c][active_r];
+        Freks[c][active_s] += Wcs_a * Fa[c][active_s] + Wcs_b * Fb[c][active_s];
     }
 
     // Active-virtual coupling
-    for (int v = active_s_ + 1; v < nsopi_[0]; ++v) {
-        Freks[active_r_][v] += Wr_a * Fa[active_r_][v] + Wr_b * Fb[active_r_][v];
-        Freks[active_s_][v] += Ws_a * Fa[active_s_][v] + Ws_b * Fb[active_s_][v];
+    for (int v = active_s + 1; v < nsopi_[0]; ++v) {
+        Freks[active_r][v] += Wr_a * Fa[active_r][v] + Wr_b * Fb[active_r][v];
+        Freks[active_s][v] += Ws_a * Fa[active_s][v] + Ws_b * Fb[active_s][v];
     }
 
     // Active-active coupling (r,s)
@@ -845,10 +767,10 @@ void REKS::fock_micro_to_macro(int L, double Cl, double** Fa, double** Fb) {
     int signrs = (fr > fs) ? 1 : ((fr < fs) ? -1 : 0);
     double Wrs_a = Cl * (nra - nsa) * signrs;
     double Wrs_b = Cl * (nrb - nsb) * signrs;
-    Freks[active_r_][active_s_] += Wrs_a * Fa[active_r_][active_s_] + Wrs_b * Fb[active_r_][active_s_];
+    Freks[active_r][active_s] += Wrs_a * Fa[active_r][active_s] + Wrs_b * Fb[active_r][active_s];
 
     // Accumulate Lagrange multiplier for SI (state interaction)
-    Wrs_lagr_ += Cl * (nra * Fa[active_r_][active_s_] + nrb * Fb[active_r_][active_s_]);
+    Wrs_lagr_ += Cl * (nra * Fa[active_r][active_s] + nrb * Fb[active_r][active_s]);
 
     // Note: Symmetrization will be done ONCE in form_F() after all microstates are accumulated
 }
@@ -874,6 +796,10 @@ void REKS::form_D() {
     if (reks_debug_ >= 2) {
         outfile->Printf("\n  === Active Orbitals (after form_D) ===\n");
 
+        // Get active MO indices
+        int active_r = active_mo_indices_[0];
+        int active_s = active_mo_indices_[1];
+
         // Overlap <r|s> = C_r^T · S · C_s
         int nso = nsopi_[0];
         double** Cp = Ca_->pointer(0);
@@ -881,7 +807,7 @@ void REKS::form_D() {
         double overlap_rs = 0.0;
         for (int mu = 0; mu < nso; ++mu) {
             for (int nu = 0; nu < nso; ++nu) {
-                overlap_rs += Cp[mu][active_r_] * Sp[mu][nu] * Cp[nu][active_s_];
+                overlap_rs += Cp[mu][active_r] * Sp[mu][nu] * Cp[nu][active_s];
             }
         }
         outfile->Printf("  <r|s> = %12.8f (should be ~0)\n", overlap_rs);
@@ -890,8 +816,8 @@ void REKS::form_D() {
         double norm_r = 0.0, norm_s = 0.0;
         for (int mu = 0; mu < nso; ++mu) {
             for (int nu = 0; nu < nso; ++nu) {
-                norm_r += Cp[mu][active_r_] * Sp[mu][nu] * Cp[nu][active_r_];
-                norm_s += Cp[mu][active_s_] * Sp[mu][nu] * Cp[nu][active_s_];
+                norm_r += Cp[mu][active_r] * Sp[mu][nu] * Cp[nu][active_r];
+                norm_s += Cp[mu][active_s] * Sp[mu][nu] * Cp[nu][active_s];
             }
         }
         outfile->Printf("  <r|r> = %12.8f, <s|s> = %12.8f (should be 1.0)\n", norm_r, norm_s);
@@ -931,7 +857,7 @@ void REKS::form_F() {
     // GAMESS procedure:
     //   1. Build F^sigma_L in AO basis
     //   2. Transform to MO: F^sigma_L_MO = C^T * F^sigma_L_AO * C
-    //   3. Apply fock_micro_to_macro in MO basis (active_r_, active_s_ are MO indices)
+    //   3. Apply fock_micro_to_macro in MO basis (active_mo_indices_ are MO indices)
     //   4. Transform F_reks back to AO: F_reks_AO = C * F_reks_MO * C^T
 
     // Zero F_reks_ and Lagrange multiplier
@@ -968,9 +894,9 @@ void REKS::form_F() {
         double** Fa_MO = F_alpha_MO_[L]->pointer(0);
         double** Fb_MO = F_beta_MO_[L]->pointer(0);
 
-        // GAMESS code: IF(L.GE.3) CMTMP = TWO*CMTMP
-        // In Psi4 (0-based): multiply by 2 for L>=2
-        double Cl_scaled = (L >= 2) ? 2.0 * C_L_[L] : C_L_[L];
+        // Scale C_L by symmetry factor for degenerate microstates
+        double fact = active_space_->get_symmetry_factor(L);
+        double Cl_scaled = fact * C_L_[L];
 
         fock_micro_to_macro(L, Cl_scaled, Fa_MO, Fb_MO);
     }
@@ -1012,6 +938,10 @@ void REKS::form_F() {
         outfile->Printf("  tr(F_reks_MO) = %15.10f\n", F_reks_MO->trace());
         outfile->Printf("  Wrs_lagr      = %15.10f\n", Wrs_lagr_);
 
+        // Get active MO indices for debug output
+        int active_r = active_mo_indices_[0];
+        int active_s = active_mo_indices_[1];
+
         // Print MO-basis F_reks diagonal - this is what GAMESS prints!
         double** Fmo = F_reks_MO->pointer(0);
         outfile->Printf("  DEBUG_PSI4_FREKS_MO_DIAG: ");
@@ -1020,7 +950,7 @@ void REKS::form_F() {
         }
         outfile->Printf("\n");
         outfile->Printf("  DEBUG_PSI4_FREKS_MO_ACTIVE: F(r,r)=%10.6f F(s,s)=%10.6f F(r,s)=%10.6f\n",
-                       Fmo[active_r_][active_r_], Fmo[active_s_][active_s_], Fmo[active_r_][active_s_]);
+                       Fmo[active_r][active_r], Fmo[active_s][active_s], Fmo[active_r][active_s]);
 
         // Check symmetry of MO-basis F_reks
         double max_asym = 0.0;
@@ -1091,8 +1021,11 @@ void REKS::form_C(double shift) {
 
     if (reks_debug_ >= 2) {
         outfile->Printf("\n  === GAMESS-style Orbital Update ===\n");
+        // Get active MO indices for debug output
+        int active_r = active_mo_indices_[0];
+        int active_s = active_mo_indices_[1];
         outfile->Printf("  Eigenvalues: ");
-        for (int i = std::max(0, active_r_ - 2); i < std::min(N, active_s_ + 3); ++i) {
+        for (int i = std::max(0, active_r - 2); i < std::min(N, active_s + 3); ++i) {
             outfile->Printf("ε(%d)=%10.6f ", i, eps_p[i]);
         }
         outfile->Printf("\n");
@@ -1106,11 +1039,11 @@ double REKS::compute_E() {
     }
 
     // Compute state-averaged REKS energy: E_SA = sum_L FACT * C_L * E_L
-    // GAMESS REXEM2EE multiplies by 2 for L>=3 (1-based), i.e. L>=2 in 0-based
+    // Symmetry factor accounts for degenerate microstates (e.g., REKS(2,2): L=2,3 have factor 2)
     double E_SA = 0.0;
     int n_micro = n_microstates();
     for (int L = 0; L < n_micro; ++L) {
-        double fact = (L >= 2) ? 2.0 : 1.0;
+        double fact = active_space_->get_symmetry_factor(L);
         E_SA += fact * C_L_[L] * E_micro_[L];
     }
 
@@ -1119,6 +1052,12 @@ double REKS::compute_E() {
     if (reks_debug_ >= 2) {
         outfile->Printf("\n  === REKS State-Averaged Energy ===\n");
         outfile->Printf("  E_SA = %20.12f\n", E_SA);
+    }
+
+    // Print SI-SA state energies (always print after SCF)
+    // Note: This runs every iteration, but output is useful for final state
+    if (reks_debug_ >= 1) {
+        print_SI_energies();
     }
 
     return E_SA;
@@ -1144,6 +1083,73 @@ void REKS::print_fon_info() const {
     outfile->Printf("  n_r = %12.8f, n_s = %12.8f\n", n_r, n_s);
     outfile->Printf("  n_r + n_s = %12.8f (should be 2.0)\n", n_r + n_s);
     outfile->Printf("  f(n_r*n_s) = %12.8f\n", f);
+}
+
+void REKS::print_SI_energies() const {
+    // Compute SI-SA state energies after SCF convergence
+    //
+    // This provides:
+    // - 2SI-2SA: Ground state (S0) and first excited singlet (S1) energies
+    // - 3SI-2SA: Also includes doubly excited state (S2)
+    //
+    // Reference: GAMESS reks.src lines 1784-1850
+
+    // Skip if energies are not computed yet
+    if (E_micro_.empty() || std::abs(E_micro_[0]) < 1e-10) {
+        return;
+    }
+
+    outfile->Printf("\n  ============================================================\n");
+    outfile->Printf("                    SI-SA-REKS State Energies\n");
+    outfile->Printf("  ------------------------------------------------------------\n");
+
+    // Compute 2SI-2SA energies
+    auto si2 = active_space_->compute_SI_energies(E_micro_, Wrs_lagr_, 2);
+
+    // Print diagonal elements of SI Hamiltonian
+    outfile->Printf("\n  Diagonal State Energies:\n");
+    outfile->Printf("    E_PPS (Perfectly Paired Singlet)  = %20.12f Ha\n", si2.E_PPS);
+    outfile->Printf("    E_OSS (Open-Shell Singlet)        = %20.12f Ha\n", si2.E_OSS);
+    outfile->Printf("    Triplet                           = %20.12f Ha\n", E_micro_[3]);
+
+    // Print off-diagonal coupling
+    outfile->Printf("\n  Off-diagonal Coupling:\n");
+    outfile->Printf("    Wrs (Lagrange multiplier)         = %20.12f Ha\n", Wrs_lagr_);
+    outfile->Printf("    H_12 = Wrs*(sqrt(n_r)-sqrt(n_s))*sqrt(2) = %20.12f Ha\n", si2.H_12);
+
+    // Print 2SI-2SA eigenvalues
+    outfile->Printf("\n  2SI-2SA-REKS State Energies:\n");
+    outfile->Printf("    %-20s %22s %14s %14s\n", "", "E (Ha)", "C_PPS", "C_OSS");
+    outfile->Printf("    %s\n", std::string(70, '-').c_str());
+    for (int i = 0; i < 2; ++i) {
+        outfile->Printf("    SSR State S%d         %22.12f %14.8f %14.8f\n",
+                        i, si2.energies[i],
+                        si2.coeffs[i * 2 + 0], si2.coeffs[i * 2 + 1]);
+    }
+
+    // Print excitation energy
+    if (si2.energies.size() >= 2) {
+        double excitation_eV = (si2.energies[1] - si2.energies[0]) * 27.211386;  // Ha to eV
+        outfile->Printf("\n  S0 -> S1 Excitation Energy:\n");
+        outfile->Printf("    Delta E = %20.12f Ha = %12.6f eV\n",
+                        si2.energies[1] - si2.energies[0], excitation_eV);
+    }
+
+    // Compute 3SI-2SA energies
+    auto si3 = active_space_->compute_SI_energies(E_micro_, Wrs_lagr_, 3);
+
+    outfile->Printf("\n  3SI-2SA-REKS State Energies:\n");
+    outfile->Printf("    E_DES (Doubly Excited Singlet)    = %20.12f Ha\n", si3.E_DES);
+    outfile->Printf("    H_23 = Wrs*(sqrt(n_r)+sqrt(n_s))*sqrt(2) = %20.12f Ha\n", si3.H_23);
+    outfile->Printf("\n    %-20s %22s %14s %14s %14s\n", "", "E (Ha)", "C_PPS", "C_OSS", "C_DES");
+    outfile->Printf("    %s\n", std::string(84, '-').c_str());
+    for (int i = 0; i < 3; ++i) {
+        outfile->Printf("    SSR State S%d         %22.12f %14.8f %14.8f %14.8f\n",
+                        i, si3.energies[i],
+                        si3.coeffs[i * 3 + 0], si3.coeffs[i * 3 + 1], si3.coeffs[i * 3 + 2]);
+    }
+
+    outfile->Printf("  ============================================================\n\n");
 }
 
 std::shared_ptr<REKS> REKS::c1_deep_copy(std::shared_ptr<BasisSet> basis) {
