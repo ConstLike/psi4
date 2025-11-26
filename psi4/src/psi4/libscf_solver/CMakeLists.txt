@@ -5,6 +5,7 @@ list(APPEND sources
   mom.cc
   multistate_matrix.cc
   reks.cc
+  reks_active_space.cc
   rhf.cc
   rohf.cc
   sad.cc

@@ -30,123 +30,126 @@
 #define REKS_H
 
 #include "rhf.h"
-#include <array>
+#include "reks_active_space.h"
+#include <vector>
+#include <memory>
 
 namespace psi {
 namespace scf {
 
 /**
  * @class REKS
- * @brief Restricted Ensemble Kohn-Sham (REKS) method implementation.
+ * @brief Restricted Ensemble Kohn-Sham (REKS) SCF engine
  *
- * REKS is a multi-configurational DFT method that treats static correlation
- * through ensemble averaging of fractionally occupied Kohn-Sham determinants.
+ * This class implements the REKS SCF procedure using a pluggable
+ * active space definition (REKSActiveSpace). The SCF algorithm is
+ * the same for all REKS variants (2,2), (4,4), etc.
  *
- * Current Implementation: REKS(2,2) - 2 electrons in 2 active orbitals
- * Based on: Filatov, M. "Note on the implementation of SA-REKS, SSR, and CP-REKS" (2024)
+ * Architecture:
+ * - Level 1: reks_math.h - pure math functions (f_interp, etc.)
+ * - Level 2: reks_active_space.h - active space interface + implementations
+ * - Level 3: reks.h/cc - SCF engine (this class)
  *
- * Key features:
- * - 4 unique microstates (from 6 total, using symmetry: L=3=L=4, L=5=L=6)
- * - Fractional occupation numbers (FONs) with constraint: n_r + n_s = 2
- * - Newton-Raphson FON optimization (RexSolver)
- * - Coupling operator technique for orbital optimization
- * - State-averaging (SA-REKS) for ground and excited states
+ * Current Implementation: REKS(2,2) via REKS22Space
+ * Future: REKS(4,4) via REKS44Space
  *
  * References:
+ * - Filatov, M. "Note on SA-REKS, SSR, CP-REKS implementation" (2024)
  * - Filatov, M.; Shaik, S. Chem. Phys. Lett. 1999, 304, 429-437
- * - Filatov, M. WIREs Comput. Mol. Sci. 2015, 5, 146-167
- * - Filatov, M. "Note on SA-REKS, SSR, CP-REKS implementation" 2024
+ * - Filatov, M. et al. J. Chem. Phys. 147, 064104 (2017)
  */
 class REKS : public RHF {
    protected:
-    // --- Active Space Parameters ---
-    int n_active_electrons_ = 2;   ///< Number of active electrons (2 for REKS(2,2))
-    int n_active_orbitals_ = 2;    ///< Number of active orbitals (2 for REKS(2,2))
-    int Ncore_ = -1;               ///< Number of core orbitals (computed from nalpha - 1)
-    int active_r_ = -1;            ///< Index of active orbital r (= Ncore)
-    int active_s_ = -1;            ///< Index of active orbital s (= Ncore + 1)
+    // ========================================================================
+    // Active Space (polymorphic)
+    // ========================================================================
 
-    // --- Fractional Occupation Numbers ---
-    double n_r_ = 1.0;             ///< FON for orbital r, constraint: n_r + n_s = 2
-    double n_s_ = 1.0;             ///< FON for orbital s = 2 - n_r
-    static constexpr double DELTA_ = 0.4;  ///< Filatov interpolation parameter
+    /// Active space definition (REKS22Space, REKS44Space, etc.)
+    std::unique_ptr<reks::REKSActiveSpace> active_space_;
 
-    // --- State Averaging Weights ---
-    double w_PPS_ = 0.5;           ///< Weight for PPS (perfectly paired singlet) state
-    double w_OSS_ = 0.5;           ///< Weight for OSS (open-shell singlet) state
+    // ========================================================================
+    // Core Orbital Information
+    // ========================================================================
 
-    // --- Base Density Matrices ---
+    int Ncore_ = -1;               ///< Number of core (doubly occupied) orbitals
+    int active_r_ = -1;            ///< Index of first active orbital (= Ncore)
+    int active_s_ = -1;            ///< Index of second active orbital (= Ncore + 1)
+
+    // ========================================================================
+    // Base Density Matrices (for efficient construction)
+    // ========================================================================
+
     SharedMatrix D00_;             ///< Core only density
-    SharedMatrix D10_;             ///< Core + r singly occupied
-    SharedMatrix D01_;             ///< Core + s singly occupied
-    SharedMatrix D11_;             ///< Core + r + s singly occupied
+    SharedMatrix D10_;             ///< Core + orbital r singly occupied
+    SharedMatrix D01_;             ///< Core + orbital s singly occupied
+    SharedMatrix D11_;             ///< Core + both r and s singly occupied
 
-    // --- Microstate Data (4 unique microstates) ---
-    static constexpr int N_MICRO_ = 4;  ///< Only 4 needed (L=3=L=4, L=5=L=6 by symmetry)
+    // ========================================================================
+    // Microstate Data (dynamically sized)
+    // ========================================================================
 
-    std::array<SharedMatrix, N_MICRO_> D_alpha_micro_;  ///< D^alpha for L=1,2,3,5
-    std::array<SharedMatrix, N_MICRO_> D_beta_micro_;   ///< D^beta for L=1,2,3,5
-    std::array<SharedMatrix, N_MICRO_> F_alpha_micro_;  ///< F^alpha for L=1,2,3,5
-    std::array<SharedMatrix, N_MICRO_> F_beta_micro_;   ///< F^beta for L=1,2,3,5
-    std::array<double, N_MICRO_> E_micro_;              ///< E_L for L=1,2,3,5
+    std::vector<SharedMatrix> D_alpha_micro_;  ///< Alpha density for each microstate
+    std::vector<SharedMatrix> D_beta_micro_;   ///< Beta density for each microstate
+    std::vector<SharedMatrix> F_alpha_micro_;  ///< Alpha Fock for each microstate
+    std::vector<SharedMatrix> F_beta_micro_;   ///< Beta Fock for each microstate
+    std::vector<double> E_micro_;              ///< Energy for each microstate
+    std::vector<double> C_L_;                  ///< Weighting factors for each microstate
 
-    // --- Coupling Fock Matrix ---
+    // ========================================================================
+    // Coupling Fock Matrix
+    // ========================================================================
+
     SharedMatrix F_reks_;          ///< Assembled coupling Fock matrix (AO basis)
-    SharedMatrix F_reks_MO_;       ///< F_reks in MO basis (for GAMESS-style orbital update)
+    SharedMatrix F_reks_MO_;       ///< F_reks in MO basis
     double Wrs_lagr_ = 0.0;        ///< Off-diagonal Lagrange multiplier for SI
 
-    // --- Pre-allocated Work Matrices (for HPC efficiency) ---
+    // ========================================================================
+    // Pre-allocated Work Matrices (for HPC efficiency)
+    // ========================================================================
+
     SharedMatrix C_D00_;           ///< Work matrix: C columns for D00 (core only)
     SharedMatrix C_D10_;           ///< Work matrix: C columns for D10 (core + r)
     SharedMatrix C_D01_;           ///< Work matrix: C columns for D01 (core + s)
     SharedMatrix C_D11_;           ///< Work matrix: C columns for D11 (core + r + s)
     SharedMatrix J_work_;          ///< Work matrix: temporary for J_total
-    SharedMatrix Temp_work_;       ///< Work matrix: temporary for AO→MO transforms (N×N)
-    std::array<SharedMatrix, N_MICRO_> F_alpha_MO_;  ///< Pre-allocated MO-basis alpha Fock
-    std::array<SharedMatrix, N_MICRO_> F_beta_MO_;   ///< Pre-allocated MO-basis beta Fock
+    SharedMatrix Temp_work_;       ///< Work matrix: temporary for AO→MO transforms
+    std::vector<SharedMatrix> F_alpha_MO_;  ///< Pre-allocated MO-basis alpha Fock
+    std::vector<SharedMatrix> F_beta_MO_;   ///< Pre-allocated MO-basis beta Fock
 
-    // --- Weighting Factors ---
-    std::array<double, N_MICRO_> C_L_;  ///< Weighting factors for SA-REKS
+    // ========================================================================
+    // Debug Level
+    // ========================================================================
 
-    // --- Microstate Occupation Tables ---
-    /// From Filatov 2024 Table 2 (for 4 unique microstates: L=1,2,3,5)
-    static constexpr int nr_alpha_[4] = {1, 0, 1, 1};  ///< n^alpha_r for L=1,2,3,5
-    static constexpr int nr_beta_[4]  = {1, 0, 0, 0};  ///< n^beta_r for L=1,2,3,5
-    static constexpr int ns_alpha_[4] = {0, 1, 0, 1};  ///< n^alpha_s for L=1,2,3,5
-    static constexpr int ns_beta_[4]  = {0, 1, 1, 0};  ///< n^beta_s for L=1,2,3,5
-
-    // --- Debug Level ---
     int reks_debug_ = 0;           ///< 0=none, 1=energies, 2=matrices, 3=all
 
-    // --- Protected Methods ---
+    // ========================================================================
+    // Protected Methods
+    // ========================================================================
+
     /// REKS-specific initialization
     void reks_common_init();
 
     /// Allocate all REKS-specific matrices
     void allocate_reks_matrices();
 
-    /// Interpolating function f(x) - Eq. (4) Filatov 2024
-    double f_interp(double x) const;
-    /// First derivative df/dx
-    double df_interp(double x) const;
-    /// Second derivative d2f/dx2
-    double d2f_interp(double x) const;
-
     /// Build base density matrices D00, D10, D01, D11
     void build_base_densities();
+
     /// Map base densities to microstate alpha/beta densities
     void build_microstate_densities();
 
     /// Build UHF-like Fock matrices for each microstate
     void build_microstate_focks();
+
     /// Compute microstate energies E_L
     void compute_microstate_energies();
 
     /// Newton-Raphson FON optimization
     void rex_solver();
 
-    /// Compute weighting factors C_L for SA/PPS/OSS
+    /// Compute weighting factors C_L (delegates to active_space_)
     void compute_weighting_factors();
+
     /// Add microstate L contribution to coupling Fock matrix
     void fock_micro_to_macro(int L, double Cl, double** Fa, double** Fb);
 
@@ -159,29 +162,30 @@ class REKS : public RHF {
     /// Debug output: FON info
     void print_fon_info() const;
 
-    // --- SCF Method Overrides ---
-    /// Build REKS density matrices (D00, D10, D01, D11 -> microstate densities)
+    // ========================================================================
+    // SCF Method Overrides
+    // ========================================================================
+
     void form_D() override;
-    /// Build microstate Fock matrices and compute microstate energies
     void form_G() override;
-    /// Build REKS coupling Fock matrix from microstate Fock matrices
-    /// NOTE: Also updates orbitals (Ca_, epsilon_a_) GAMESS-style via MO-basis diagonalization
     void form_F() override;
-    /// REKS uses GAMESS-style orbital update in form_F(), so form_C does nothing
     void form_C(double shift = 0.0) override;
-    /// Compute state-averaged REKS energy
     double compute_E() override;
 
    public:
+    // ========================================================================
+    // Constructors
+    // ========================================================================
+
     /**
-     * @brief Construct REKS wavefunction from reference wavefunction and functional.
-     * @param ref_wfn Reference wavefunction (provides basis, molecule, etc.)
+     * @brief Construct REKS with default REKS(2,2) active space
+     * @param ref_wfn Reference wavefunction
      * @param functional DFT functional (or HF if nullptr)
      */
     REKS(SharedWavefunction ref_wfn, std::shared_ptr<SuperFunctional> functional);
 
     /**
-     * @brief Construct REKS wavefunction with explicit options and PSIO.
+     * @brief Construct REKS with explicit options and PSIO
      * @param ref_wfn Reference wavefunction
      * @param functional DFT functional
      * @param options Psi4 options object
@@ -193,28 +197,57 @@ class REKS : public RHF {
     /// Destructor
     ~REKS() override;
 
-    /**
-     * @brief Number of electronic states handled by this method.
-     * @return Number of states (1 for single-state REKS, N for SA-REKS)
-     */
+    // ========================================================================
+    // Public Interface
+    // ========================================================================
+
+    /// Number of electronic states
     int n_states() const override { return 1; }
 
-    /**
-     * @brief Create a C1 symmetry deep copy of this wavefunction.
-     * @param basis Basis set for the new wavefunction
-     * @return New REKS wavefunction in C1 symmetry
-     */
+    /// Create C1 symmetry deep copy
     std::shared_ptr<REKS> c1_deep_copy(std::shared_ptr<BasisSet> basis);
 
-    // --- Accessors for Testing & Analysis ---
-    /// Get FON for orbital r
-    [[nodiscard]] double get_n_r() const { return n_r_; }
-    /// Get FON for orbital s
-    [[nodiscard]] double get_n_s() const { return n_s_; }
-    /// Get microstate energy for index L (0-3)
-    [[nodiscard]] double get_microstate_energy(int L) const { return E_micro_[L]; }
-    /// Get interpolating function value at current FON
-    [[nodiscard]] double get_f_value() const { return f_interp(n_r_ / 2.0); }
+    // ========================================================================
+    // Accessors for Testing & Analysis
+    // ========================================================================
+
+    /// Get active space definition
+    [[nodiscard]] const reks::REKSActiveSpace& active_space() const {
+        return *active_space_;
+    }
+
+    /// Get number of microstates
+    [[nodiscard]] int n_microstates() const {
+        return active_space_->n_microstates();
+    }
+
+    /// Get microstate energy for index L
+    [[nodiscard]] double get_microstate_energy(int L) const {
+        return E_micro_[L];
+    }
+
+    /// Get weighting factor for microstate L
+    [[nodiscard]] double get_C_L(int L) const {
+        return C_L_[L];
+    }
+
+    // --- REKS(2,2) Specific Accessors (backward compatibility) ---
+
+    /// Get FON for orbital r (only valid for REKS(2,2))
+    [[nodiscard]] double get_n_r() const {
+        return active_space_->pair(0).fon_p;
+    }
+
+    /// Get FON for orbital s (only valid for REKS(2,2))
+    [[nodiscard]] double get_n_s() const {
+        return active_space_->pair(0).fon_q;
+    }
+
+    /// Get f_interp value at current FON (only valid for REKS(2,2))
+    [[nodiscard]] double get_f_value() const {
+        const auto& p = active_space_->pair(0);
+        return reks::f_interp(p.fon_p * p.fon_q);
+    }
 };
 
 }  // namespace scf
