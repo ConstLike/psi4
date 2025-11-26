@@ -502,18 +502,15 @@ void REKS::compute_microstate_energies() {
 }
 
 // ---------------------------------------------------------------------------
-// RexSolver - Newton-Raphson FON Optimization (Filatov 2024)
+// RexSolver - Newton-Raphson FON Optimization
 // ---------------------------------------------------------------------------
 
 void REKS::rex_solver() {
     // Optimize n_r to minimize E_SA = sum_L C_L(n_r) * E_L
     // Constraint: n_s = 2 - n_r
     //
-    // For SA-REKS energy (w_PPS, w_OSS weights):
-    //   E_SA = C_0*E_0 + C_1*E_1 + C_2*E_2 + C_3*E_3
-    // where C_L depend on n_r through f(n_r/2)
-    //
-    // Gradient and Hessian w.r.t. n_r are computed analytically.
+    // Uses multi-start optimization to avoid getting stuck at boundaries.
+    // At n_r=2 (n_s=0), the gradient df/dn_r = 0, which can trap the optimizer.
 
     // Skip if E_micro_ not yet computed (first SCF iteration with SAD guess)
     if (std::abs(E_micro_[0]) < 1e-10 && std::abs(E_micro_[1]) < 1e-10) {
@@ -527,128 +524,131 @@ void REKS::rex_solver() {
     const double tol = 1e-10;
     const double max_step = 0.2;
 
-    // Get current FONs and SA weights from active_space_
-    double n_r = get_n_r();
-    double n_s = get_n_s();
     double w_PPS = active_space_->w_PPS();
     double w_OSS = active_space_->w_OSS();
 
+    // Lambda to compute E_SA at given n_r
+    auto compute_E_SA = [&](double nr) -> double {
+        double ns = 2.0 - nr;
+        double x = nr * ns;
+        double f = reks::f_interp(x);
+        double C0 = w_PPS * nr / 2.0;
+        double C1 = w_PPS * ns / 2.0;
+        double C2 = w_OSS - 0.5 * w_PPS * f;
+        double C3 = 0.5 * w_PPS * f - 0.5 * w_OSS;
+        return C0 * E_micro_[0] + C1 * E_micro_[1]
+             + 2.0 * C2 * E_micro_[2] + 2.0 * C3 * E_micro_[3];
+    };
+
+    // Multi-start: try starting from current n_r AND from n_r=1.0 (symmetric point)
+    double n_r_current = get_n_r();
+    std::vector<double> start_points = {n_r_current};
+
+    // If at boundary, also try symmetric point
+    if (n_r_current > 1.9 || n_r_current < 0.1) {
+        start_points.push_back(1.0);  // Symmetric point n_r = n_s = 1
+    }
+
+    double best_n_r = n_r_current;
+    double best_E_SA = compute_E_SA(n_r_current);
+
     if (reks_debug_ >= 1) {
         outfile->Printf("\n  === RexSolver: FON Optimization ===\n");
-        outfile->Printf("  Initial: n_r=%10.6f, n_s=%10.6f\n", n_r, n_s);
         outfile->Printf("  E_micro: [0]=%.8f, [1]=%.8f, [2]=%.8f, [3]=%.8f\n",
                        E_micro_[0], E_micro_[1], E_micro_[2], E_micro_[3]);
-        if (reks_debug_ >= 2) {
-            outfile->Printf("\n  Iter   n_r      n_s      f(x)      C_L[0]    C_L[1]    C_L[2]    C_L[3]   Sum(C_L)    E_SA         dE/dn    d2E/dn2   delta\n");
-            outfile->Printf("  ---- -------- -------- -------- --------- --------- --------- --------- -------- ------------ --------- --------- --------\n");
-        }
     }
 
-    for (int iter = 0; iter < max_iter; ++iter) {
-        n_s = 2.0 - n_r;
-        active_space_->set_pair_fon(0, n_r);  // Updates both fon_p and fon_q
+    for (double n_r_start : start_points) {
+        double n_r = n_r_start;
+        double n_s = 2.0 - n_r;
 
-        // Interpolating function and derivatives at x = n_r*n_s
-        double x = n_r * n_s;  // x = n_r*n_s in [0, 1]
-        double f = reks::f_interp(x);
-        double df_dx = reks::df_interp(x);
-        double d2f_dx2 = reks::d2f_interp(x);
+        if (reks_debug_ >= 1) {
+            outfile->Printf("  Starting from: n_r=%10.6f, n_s=%10.6f\n", n_r, n_s);
+        }
 
-        // Chain rule: df/dn_r = (df/dx) * (dx/dn_r) = (df/dx) * n_s
-        // (since x = n_r*n_s and dx/dn_r = n_s)
-        double df_dnr = df_dx * n_s;
-        // d²f/dn_r² = d/dn_r[df/dx * n_s] = d²f/dx² * n_s * dx/dn_r + df/dx * dn_s/dn_r
-        //           = d²f/dx² * n_s² + df/dx * (-1)  (since n_s = 2-n_r)
-        double d2f_dnr2 = d2f_dx2 * n_s * n_s - df_dx;
+        for (int iter = 0; iter < max_iter; ++iter) {
+            n_s = 2.0 - n_r;
 
-        // Compute C_L at current n_r (before update)
-        double C_L_current[4];
-        C_L_current[0] = w_PPS * n_r / 2.0;
-        C_L_current[1] = w_PPS * n_s / 2.0;
-        C_L_current[2] = w_OSS - 0.5 * w_PPS * f;
-        C_L_current[3] = 0.5 * w_PPS * f - 0.5 * w_OSS;
-        double sum_CL = C_L_current[0] + C_L_current[1] + C_L_current[2] + C_L_current[3];
+            // Interpolating function and derivatives at x = n_r*n_s
+            double x = n_r * n_s;
+            double f = reks::f_interp(x);
+            double df_dx = reks::df_interp(x);
+            double d2f_dx2 = reks::d2f_interp(x);
 
-        // FACT=2 for open-shell microstates (L>=2) due to spin symmetry
-        double E_SA_current = C_L_current[0] * E_micro_[0] + C_L_current[1] * E_micro_[1]
-                            + 2.0 * C_L_current[2] * E_micro_[2] + 2.0 * C_L_current[3] * E_micro_[3];
+            // Chain rule: df/dn_r = (df/dx) * (dx/dn_r) = (df/dx) * (n_s - n_r)
+            // since x = n_r*n_s = n_r*(2-n_r) and dx/dn_r = 2 - 2*n_r = n_s - n_r
+            double dx_dnr = n_s - n_r;  // = 2 - 2*n_r
+            double df_dnr = df_dx * dx_dnr;
+            // d²f/dn_r² = d²f/dx² * (dx/dn_r)² + df/dx * d²x/dn_r²
+            //           = d²f/dx² * (n_s - n_r)² + df/dx * (-2)
+            double d2f_dnr2 = d2f_dx2 * dx_dnr * dx_dnr - 2.0 * df_dx;
 
-        // Energy gradient dE_SA/dn_r
-        // C_L[0] = w_PPS * n_r/2             -> dC_0/dn_r = w_PPS/2
-        // C_L[1] = w_PPS * n_s/2             -> dC_1/dn_r = -w_PPS/2
-        // C_L[2] = w_OSS - 0.5*w_PPS*f       -> dC_2/dn_r = -0.5*w_PPS*df/dn_r
-        // C_L[3] = 0.5*w_PPS*f - 0.5*w_OSS   -> dC_3/dn_r = 0.5*w_PPS*df/dn_r
-        //
-        // dE/dn_r = sum_L FACT * (dC_L/dn_r) * E_L, FACT=2 for L>=2
-        double dE_dnr = (w_PPS / 2.0) * (E_micro_[0] - E_micro_[1])
-                      + 2.0 * 0.5 * w_PPS * df_dnr * (E_micro_[3] - E_micro_[2]);
+            // Compute C_L at current n_r
+            double C0 = w_PPS * n_r / 2.0;
+            double C1 = w_PPS * n_s / 2.0;
+            double C2 = w_OSS - 0.5 * w_PPS * f;
+            double C3 = 0.5 * w_PPS * f - 0.5 * w_OSS;
 
-        // Energy Hessian d2E_SA/dn_r2
-        // Only C_L[2] and C_L[3] have second derivatives (through f)
-        // d2C_2/dn_r2 = -0.5*w_PPS * d2f/dn_r2
-        // d2C_3/dn_r2 = 0.5*w_PPS * d2f/dn_r2
-        // Apply FACT=2 for L>=2
-        double d2E_dnr2 = 2.0 * 0.5 * w_PPS * d2f_dnr2 * (E_micro_[3] - E_micro_[2]);
+            double E_SA_current = C0 * E_micro_[0] + C1 * E_micro_[1]
+                                + 2.0 * C2 * E_micro_[2] + 2.0 * C3 * E_micro_[3];
 
-        // Newton-Raphson step (or gradient descent if Hessian ~ 0)
-        double delta;
-        if (std::abs(d2E_dnr2) < 1e-10) {
-            // Hessian near zero (saddle point at x=0.5) - use gradient descent
-            delta = -std::copysign(max_step, dE_dnr);
+            // Energy gradient dE_SA/dn_r
+            // dC0/dn_r = w_PPS/2, dC1/dn_r = -w_PPS/2
+            // dC2/dn_r = -0.5*w_PPS*df/dn_r, dC3/dn_r = 0.5*w_PPS*df/dn_r
+            double dE_dnr = (w_PPS / 2.0) * (E_micro_[0] - E_micro_[1])
+                          + w_PPS * df_dnr * (E_micro_[3] - E_micro_[2]);
+
+            // Energy Hessian
+            double d2E_dnr2 = w_PPS * d2f_dnr2 * (E_micro_[3] - E_micro_[2]);
+
+            // Newton-Raphson step (or gradient descent if Hessian ~ 0)
+            double delta;
+            if (std::abs(d2E_dnr2) < 1e-10) {
+                delta = -std::copysign(max_step, dE_dnr);
+            } else {
+                delta = -dE_dnr / d2E_dnr2;
+            }
+
+            // Damping
+            if (std::abs(delta) > max_step) {
+                delta = std::copysign(max_step, delta);
+            }
+
+            // Update n_r with bounds [0.0, 2.0]
+            double n_r_new = std::clamp(n_r + delta, 0.0, 2.0);
+            delta = n_r_new - n_r;
+            n_r = n_r_new;
+
             if (reks_debug_ >= 2) {
-                outfile->Printf("    iter %2d: zero Hessian, gradient descent\n", iter);
+                outfile->Printf("    iter %2d: n_r=%.6f E=%.10f dE=%.2e d2E=%.2e delta=%.6f\n",
+                               iter, n_r, E_SA_current, dE_dnr, d2E_dnr2, delta);
             }
-        } else {
-            // Standard Newton-Raphson
-            delta = -dE_dnr / d2E_dnr2;
-        }
 
-        // Damping for large steps
-        if (std::abs(delta) > max_step) {
-            delta = std::copysign(max_step, delta);
-        }
-
-        // Print before update
-        if (reks_debug_ >= 2) {
-            outfile->Printf("  %4d %8.5f %8.5f %8.5f %9.6f %9.6f %9.6f %9.6f %8.5f %12.8f %9.2e %9.2e",
-                           iter, n_r, n_s, f,
-                           C_L_current[0], C_L_current[1], C_L_current[2], C_L_current[3],
-                           sum_CL, E_SA_current, dE_dnr, d2E_dnr2);
-        }
-
-        // Update n_r with bounds [0.0, 2.0]
-        double n_r_new = n_r + delta;
-        n_r_new = std::clamp(n_r_new, 0.0, 2.0);
-        delta = n_r_new - n_r;
-        n_r = n_r_new;
-
-        if (reks_debug_ >= 2) {
-            outfile->Printf(" %8.5f\n", delta);
-        }
-
-        // Convergence check
-        if (std::abs(delta) < tol) {
-            if (reks_debug_ >= 1) {
-                outfile->Printf("  RexSolver converged in %d iterations\n", iter + 1);
+            // Convergence check
+            if (std::abs(delta) < tol) {
+                break;
             }
-            break;
+        }
+
+        // Check if this starting point gave better result
+        double E_SA_final = compute_E_SA(n_r);
+        if (E_SA_final < best_E_SA) {
+            best_E_SA = E_SA_final;
+            best_n_r = n_r;
+        }
+
+        if (reks_debug_ >= 1) {
+            outfile->Printf("  Result: n_r=%.8f, E_SA=%.10f\n", n_r, E_SA_final);
         }
     }
 
-    // Update active_space_ with final FON
-    active_space_->set_pair_fon(0, n_r);
-
-    // Compute SA-REKS energy with optimized FON
-    compute_weighting_factors();  // Update C_L with new n_r
-
-    // FACT=2 for L>=2 (open-shell microstates due to spin symmetry)
-    double E_SA = C_L_[0] * E_micro_[0] + C_L_[1] * E_micro_[1]
-                + 2.0 * C_L_[2] * E_micro_[2] + 2.0 * C_L_[3] * E_micro_[3];
+    // Use the best n_r found
+    active_space_->set_pair_fon(0, best_n_r);
+    compute_weighting_factors();
 
     if (reks_debug_ >= 1) {
-        outfile->Printf("  Final: n_r = %12.8f, n_s = %12.8f, f(x) = %12.8f\n",
-                        get_n_r(), get_n_s(), reks::f_interp(get_n_r() * get_n_s()));
-        outfile->Printf("  E_SA = %20.12f\n", E_SA);
+        outfile->Printf("  Best: n_r = %12.8f, n_s = %12.8f, E_SA = %20.12f\n",
+                        get_n_r(), get_n_s(), best_E_SA);
     }
 }
 
