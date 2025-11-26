@@ -469,6 +469,13 @@ void export_wavefunction(py::module& m) {
         .def("get_microstate_energy", &scf::REKS::get_microstate_energy,
              "Returns the microstate energy for index L (0-3)", "L"_a)
         .def("get_f_value", &scf::REKS::get_f_value, "Returns the interpolating function value at current FON")
+        .def("get_Wrs", &scf::REKS::get_Wrs, "Returns the Wrs Lagrange multiplier (off-diagonal SI coupling)")
+        .def("get_SI_energy", &scf::REKS::get_SI_energy,
+             "Returns SI state energy for state index (0=ground, 1=S1, etc.)", "state"_a, "n_si_states"_a = 2)
+        .def("get_E_PPS", &scf::REKS::get_E_PPS, "Returns PPS (Perfectly Paired Singlet) diagonal energy")
+        .def("get_E_OSS", &scf::REKS::get_E_OSS, "Returns OSS (Open-Shell Singlet) diagonal energy")
+        .def("get_E_DES", &scf::REKS::get_E_DES, "Returns DES (Doubly Excited Singlet) diagonal energy")
+        .def("get_E_triplet", &scf::REKS::get_E_triplet, "Returns Triplet energy from microstate 3")
         .def("mintshelper", &Wavefunction::mintshelper, "The MintsHelper object");
 
     /// EP2 functions

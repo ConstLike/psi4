@@ -247,6 +247,51 @@ class REKS : public RHF {
         const auto& p = active_space_->pair(0);
         return reks::f_interp(p.fon_p * p.fon_q);
     }
+
+    /// Get Wrs Lagrange multiplier (off-diagonal SI coupling)
+    [[nodiscard]] double get_Wrs() const {
+        return Wrs_lagr_;
+    }
+
+    // --- SI-SA-REKS State Energies ---
+
+    /// Get SI state energy for state index (0 = ground, 1 = S1, etc.)
+    /// @param state State index (0 to n_si_states-1)
+    /// @param n_si_states Number of SI states (2 or 3)
+    /// @return State energy in Hartree
+    [[nodiscard]] double get_SI_energy(int state, int n_si_states = 2) const {
+        auto si = active_space_->compute_SI_energies(E_micro_, Wrs_lagr_, n_si_states);
+        if (state >= 0 && state < static_cast<int>(si.energies.size())) {
+            return si.energies[state];
+        }
+        return 0.0;
+    }
+
+    /// Get PPS diagonal energy (H_11)
+    [[nodiscard]] double get_E_PPS() const {
+        auto si = active_space_->compute_SI_energies(E_micro_, Wrs_lagr_, 2);
+        return si.E_PPS;
+    }
+
+    /// Get OSS diagonal energy (H_22)
+    [[nodiscard]] double get_E_OSS() const {
+        auto si = active_space_->compute_SI_energies(E_micro_, Wrs_lagr_, 2);
+        return si.E_OSS;
+    }
+
+    /// Get DES diagonal energy (H_33)
+    [[nodiscard]] double get_E_DES() const {
+        auto si = active_space_->compute_SI_energies(E_micro_, Wrs_lagr_, 3);
+        return si.E_DES;
+    }
+
+    /// Get triplet energy (from microstate 3)
+    [[nodiscard]] double get_E_triplet() const {
+        if (E_micro_.size() > 3) {
+            return E_micro_[3];
+        }
+        return 0.0;
+    }
 };
 
 }  // namespace scf
