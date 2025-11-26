@@ -85,7 +85,7 @@ void REKS::reks_common_init() {
     Ncore_ = nalpha_ - 1;
 
     // Create REKS(2,2) active space with default SA weights
-    // Initial FONs: n_r=2.0, n_s=0.0 (closed-shell limit like GAMESS)
+    // Initial FONs: n_r=2.0, n_s=0.0 (closed-shell limit)
     double w_PPS = 0.5;
     double w_OSS = 0.5;
     active_space_ = reks::REKSActiveSpace::create_2_2(w_PPS, w_OSS);
@@ -178,7 +178,7 @@ void REKS::allocate_reks_matrices() {
     }
     J_work_ = std::make_shared<Matrix>("J_work", nsopi_, nsopi_);
 
-    // Pre-allocate work matrices for AO→MO transforms in form_F() (HPC optimization)
+    // Pre-allocate work matrices for AO-to-MO transforms in form_F()
     Temp_work_ = std::make_shared<Matrix>("Temp_work", nso, nso);
     F_alpha_MO_.resize(n_micro);
     F_beta_MO_.resize(n_micro);
@@ -289,7 +289,7 @@ void REKS::build_microstate_densities() {
 }
 
 void REKS::compute_weighting_factors() {
-    // Delegate to active_space_ (GAMESS REXCM function)
+    // Compute microstate weights from active space
     active_space_->compute_weights(C_L_);
 
     if (reks_debug_ >= 2) {
@@ -549,7 +549,6 @@ void REKS::rex_solver() {
         active_space_->set_pair_fon(0, n_r);  // Updates both fon_p and fon_q
 
         // Interpolating function and derivatives at x = n_r*n_s
-        // GAMESS uses f(n_r*n_s), not f(n_r/2)
         double x = n_r * n_s;  // x = n_r*n_s in [0, 1]
         double f = reks::f_interp(x);
         double df_dx = reks::df_interp(x);
@@ -570,7 +569,7 @@ void REKS::rex_solver() {
         C_L_current[3] = 0.5 * w_PPS * f - 0.5 * w_OSS;
         double sum_CL = C_L_current[0] + C_L_current[1] + C_L_current[2] + C_L_current[3];
 
-        // GAMESS applies FACT=2 for L>=2 in REXEM2EE
+        // FACT=2 for open-shell microstates (L>=2) due to spin symmetry
         double E_SA_current = C_L_current[0] * E_micro_[0] + C_L_current[1] * E_micro_[1]
                             + 2.0 * C_L_current[2] * E_micro_[2] + 2.0 * C_L_current[3] * E_micro_[3];
 
@@ -617,7 +616,7 @@ void REKS::rex_solver() {
                            sum_CL, E_SA_current, dE_dnr, d2E_dnr2);
         }
 
-        // Update n_r with bounds [0.0, 2.0] (same as GAMESS x2 ∈ [0, 1])
+        // Update n_r with bounds [0.0, 2.0]
         double n_r_new = n_r + delta;
         n_r_new = std::clamp(n_r_new, 0.0, 2.0);
         delta = n_r_new - n_r;
@@ -642,7 +641,7 @@ void REKS::rex_solver() {
     // Compute SA-REKS energy with optimized FON
     compute_weighting_factors();  // Update C_L with new n_r
 
-    // GAMESS REXEM2EE multiplies by 2 for L>=3 (1-based), i.e. L>=2 in 0-based
+    // FACT=2 for L>=2 (open-shell microstates due to spin symmetry)
     double E_SA = C_L_[0] * E_micro_[0] + C_L_[1] * E_micro_[1]
                 + 2.0 * C_L_[2] * E_micro_[2] + 2.0 * C_L_[3] * E_micro_[3];
 
@@ -662,7 +661,7 @@ void REKS::fock_micro_to_macro(int L, double Cl, double** Fa, double** Fb) {
     // Different orbital blocks have different effective Fock operators.
     //
     // Block structure:
-    //   - Core-core, virtual-virtual, core-virtual: F_c = 0.5*C_L*(F^α + F^β)
+    //   - Core-core, virtual-virtual, core-virtual: F_c = 0.5*C_L*(F_alpha + F_beta)
     //   - Active r diagonal: weighted by n^σ_r / f_r
     //   - Active s diagonal: weighted by n^σ_s / f_s
     //   - Core-active coupling: weighted by (1-n^σ_q) / (1-f_q)
@@ -853,12 +852,11 @@ void REKS::form_F() {
     }
 
     // Build REKS coupling Fock matrix F_reks_ from microstate Fock matrices.
-    // The REKS coupling formulas (Filatov 2024) are designed for MO basis.
-    // GAMESS procedure:
+    // Procedure:
     //   1. Build F^sigma_L in AO basis
     //   2. Transform to MO: F^sigma_L_MO = C^T * F^sigma_L_AO * C
-    //   3. Apply fock_micro_to_macro in MO basis (active_mo_indices_ are MO indices)
-    //   4. Transform F_reks back to AO: F_reks_AO = C * F_reks_MO * C^T
+    //   3. Apply fock_micro_to_macro in MO basis
+    //   4. Transform F_reks back to AO for DIIS
 
     // Zero F_reks_ and Lagrange multiplier
     F_reks_->zero();
@@ -888,8 +886,8 @@ void REKS::form_F() {
     }
 
     // Step 2: Assemble F_reks_ in MO basis from all 4 microstates
-    // Note: L=2 (open-shell) represents L=3 and L=4 in paper → factor 2 already in C_L_[2]
-    //       L=3 (triplet-like) represents L=5 and L=6 → factor 2 already in C_L_[3]
+    // Note: L=2 (open-shell) represents L=3 and L=4 in paper - factor 2 already in C_L_[2]
+    //       L=3 (triplet-like) represents L=5 and L=6 - factor 2 already in C_L_[3]
     for (int L = 0; L < n_micro; ++L) {
         double** Fa_MO = F_alpha_MO_[L]->pointer(0);
         double** Fb_MO = F_beta_MO_[L]->pointer(0);
@@ -912,15 +910,13 @@ void REKS::form_F() {
     // At this point F_reks_ is in MO basis - save for debug output
     auto F_reks_MO = F_reks_->clone();
 
-    // Store F_reks_MO for GAMESS-style orbital update in form_C()
+    // Store F_reks_MO for MO-basis orbital update in form_C()
     F_reks_MO_ = F_reks_->clone();
     F_reks_MO_->set_name("F_REKS_MO");
 
     // Step 4: Transform F_reks from MO back to AO basis for DIIS
-    // GAMESS formula (reks.src lines 1363-1367): F_AO = S * C * F_MO * C^T * S
-    // The commutator [F,P] = F*D*S - S*D*F goes to zero at convergence
-    // only if F_AO is constructed this way.
-    // temp = S * C, then F_AO = temp * F_MO * temp^T
+    // F_AO = S * C * F_MO * C^T * S
+    // This ensures [F,P] = F*D*S - S*D*F -> 0 at convergence
     auto SC = linalg::doublet(S_, Ca_, false, false);  // S * C
     auto F_reks_AO = linalg::triplet(SC, F_reks_, SC, false, false, true);  // SC * F_MO * SC^T
 
@@ -942,7 +938,7 @@ void REKS::form_F() {
         int active_r = active_mo_indices_[0];
         int active_s = active_mo_indices_[1];
 
-        // Print MO-basis F_reks diagonal - this is what GAMESS prints!
+        // Print MO-basis F_reks diagonal
         double** Fmo = F_reks_MO->pointer(0);
         outfile->Printf("  DEBUG_PSI4_FREKS_MO_DIAG: ");
         for (int i = 0; i < std::min(8, N); ++i) {
@@ -971,30 +967,22 @@ void REKS::form_C(double shift) {
         return;
     }
 
-    // GAMESS-style orbital update with DIIS support (reks.src lines 1380-1420):
-    //
-    // After form_F(), Psi4's DIIS may have extrapolated Fa_ (which was set to F_AO = S*C*F_MO*C^T*S).
-    // GAMESS converts F_AO back to MO basis (lines 1380-1386) before diagonalization.
-    //
-    // The back-transformation is: F_MO = C^T * F_AO * C
-    // This works because C is S-orthonormal: C^T * S * C = I
-    // So: C^T * (S*C*F_MO*C^T*S) * C = (C^T*S*C) * F_MO * (C^T*S*C) = I * F_MO * I = F_MO
-    //
-    // After DIIS extrapolation, F_AO may have changed, so we get:
-    // F_MO_after_DIIS = C^T * Fa_diis * C
+    // MO-basis orbital update with DIIS support:
+    // Convert DIIS-extrapolated Fa_ back to MO basis: F_MO = C^T * Fa_ * C
+    // C is S-orthonormal (C^T*S*C = I), so this correctly recovers F_MO
 
     int N = nsopi_[0];
 
     // Convert Fa_ (possibly DIIS-extrapolated) back to MO basis: F_MO = C^T * Fa_ * C
     auto F_MO_diis = linalg::triplet(Ca_, Fa_, Ca_, true, false, false);
 
-    // Diagonalize F_MO: F_MO * U = U * ε
+    // Diagonalize F_MO: F_MO * U = U * eps
     auto U = std::make_shared<Matrix>("Eigenvectors", N, N);
     auto eps = std::make_shared<Vector>("Eigenvalues", N);
 
     F_MO_diis->diagonalize(U, eps);
 
-    // Fix orbital phase (GAMESS lines 1413-1417): ensure diagonal elements of U are positive
+    // Fix orbital phase: ensure diagonal elements of U are positive
     double** Up = U->pointer(0);
     for (int j = 0; j < N; ++j) {
         if (Up[j][j] < 0.0) {
@@ -1005,7 +993,7 @@ void REKS::form_C(double shift) {
         }
     }
 
-    // Update orbitals: C_new = C_old * U (GAMESS lines 1419-1420)
+    // Update orbitals: C_new = C_old * U
     auto C_old = Ca_->clone();
     auto C_new = linalg::doublet(C_old, U, false, false);
     Ca_->copy(C_new);
@@ -1020,13 +1008,13 @@ void REKS::form_C(double shift) {
     epsilon_b_->copy(*epsilon_a_);
 
     if (reks_debug_ >= 2) {
-        outfile->Printf("\n  === GAMESS-style Orbital Update ===\n");
+        outfile->Printf("\n  === MO-basis Orbital Update ===\n");
         // Get active MO indices for debug output
         int active_r = active_mo_indices_[0];
         int active_s = active_mo_indices_[1];
         outfile->Printf("  Eigenvalues: ");
         for (int i = std::max(0, active_r - 2); i < std::min(N, active_s + 3); ++i) {
-            outfile->Printf("ε(%d)=%10.6f ", i, eps_p[i]);
+            outfile->Printf("eps(%d)=%10.6f ", i, eps_p[i]);
         }
         outfile->Printf("\n");
     }
@@ -1091,8 +1079,6 @@ void REKS::print_SI_energies() const {
     // This provides:
     // - 2SI-2SA: Ground state (S0) and first excited singlet (S1) energies
     // - 3SI-2SA: Also includes doubly excited state (S2)
-    //
-    // Reference: GAMESS reks.src lines 1784-1850
 
     // Skip if energies are not computed yet
     if (E_micro_.empty() || std::abs(E_micro_[0]) < 1e-10) {

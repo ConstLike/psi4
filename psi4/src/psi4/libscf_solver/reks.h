@@ -109,7 +109,7 @@ class REKS : public RHF {
     /// Work matrices for C columns for each base density pattern
     std::vector<SharedMatrix> C_base_;     ///< Generalized from C_D00_, C_D10_, etc.
     SharedMatrix J_work_;                   ///< Work matrix: temporary for J_total
-    SharedMatrix Temp_work_;                ///< Work matrix: temporary for AO→MO transforms
+    SharedMatrix Temp_work_;                ///< Work matrix: temporary for AO-to-MO transforms
     std::vector<SharedMatrix> F_alpha_MO_;  ///< Pre-allocated MO-basis alpha Fock
     std::vector<SharedMatrix> F_beta_MO_;   ///< Pre-allocated MO-basis beta Fock
 

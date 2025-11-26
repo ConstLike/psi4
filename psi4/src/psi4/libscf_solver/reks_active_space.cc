@@ -62,8 +62,7 @@ std::unique_ptr<REKSActiveSpace> REKSActiveSpace::create_4_4(double w_pps) {
 
 REKS22Space::REKS22Space(double w_pps, double w_oss)
     : w_pps_(w_pps), w_oss_(w_oss) {
-    // Initialize GVB pair with closed-shell starting point
-    // n_r = 2.0, n_s = 0.0 (like GAMESS default)
+    // Initialize GVB pair at closed-shell limit: n_r=2.0, n_s=0.0
     pair_ = GVBPair(0, 1, 2.0);
 
     // Initialize microstate occupation patterns
@@ -108,8 +107,7 @@ void REKS22Space::compute_weights(std::vector<double>& C_L) const {
     // Compute f(n_r * n_s) - the interpolating function
     double f = f_interp(n_r * n_s);
 
-    // SA-REKS weight formulas (GAMESS REXCM function, STATAVG branch)
-    //
+    // SA-REKS weight formulas for state-averaged ensemble
     // L=0: C_0 = w_PPS * n_r/2
     C_L[0] = w_pps_ * n_r / 2.0;
 
@@ -265,13 +263,7 @@ std::vector<double> REKS22Space::compute_energy_hessian(
 }
 
 double REKS22Space::get_effective_fon(int orbital_idx) const {
-    // Effective FON for Fock coupling (FR, FS in GAMESS reks.src:1178-1179)
-    // f_i = (n_i/2)*w_PPS + 0.5*w_OSS
-    //
-    // For REKS(2,2):
-    //   orbital_idx=0 (r): f_r = (n_r/2)*w_PPS + 0.5*w_OSS
-    //   orbital_idx=1 (s): f_s = (n_s/2)*w_PPS + 0.5*w_OSS
-
+    // Effective FON for Fock matrix coupling: f_i = (n_i/2)*w_PPS + 0.5*w_OSS
     double n_i = (orbital_idx == 0) ? pair_.fon_p : pair_.fon_q;
     return (n_i / 2.0) * w_pps_ + 0.5 * w_oss_;
 }
@@ -281,11 +273,8 @@ REKSActiveSpace::SIResult REKS22Space::compute_SI_energies(
     double Wrs,
     int n_si_states) const {
 
-    // SI-SA-REKS State Interaction implementation
-    // Reference: GAMESS reks.src lines 1784-1810
-    //
-    // The SI Hamiltonian couples PPS, OSS, and optionally DES states.
-    // Eigenvalues give state energies, eigenvectors give state compositions.
+    // SI-SA-REKS: build and diagonalize state interaction Hamiltonian
+    // Couples PPS, OSS, and optionally DES states
 
     SIResult result;
     result.n_states = n_si_states;
@@ -293,37 +282,27 @@ REKSActiveSpace::SIResult REKS22Space::compute_SI_energies(
     double n_r = pair_.fon_p;
     double n_s = pair_.fon_q;
 
-    // Step 1: Compute diagonal energies (PPS, OSS, DES)
-    //
-    // E_PPS = sum_L C_L^{PPS} * FACT_L * E_L
-    // where C_L^{PPS} are weights computed with (w_PPS=1, w_OSS=0)
-    //
-    // From GAMESS (lines 1759-1761):
-    // CALL REXCM(X(LCM),DNR,DNS,DELTA,1.d0,0.d0,NMIC)  ! pure PPS weights
-    // EPPS = X(LCM)*X(LEM) + X(LCM+1)*X(LEM+1) + 2.d0*X(LCM+2)*X(LEM+2) + 2.d0*X(LCM+3)*X(LEM+3)
-    //
-    // For pure PPS (w_PPS=1, w_OSS=0):
-    //   C_L[0] = n_r/2, C_L[1] = n_s/2, C_L[2] = -f/2, C_L[3] = f/2
+    // Diagonal energies computed with pure PPS weights (w_PPS=1, w_OSS=0)
+    // C_L^{PPS} = {n_r/2, n_s/2, -f/2, f/2}
     double f = f_interp(n_r * n_s);
     double C_pps[4] = {n_r / 2.0, n_s / 2.0, -f / 2.0, f / 2.0};
 
+    // E_PPS = sum_L C_L^{PPS} * FACT_L * E_L
     result.E_PPS = C_pps[0] * E_micro[0] + C_pps[1] * E_micro[1]
                  + 2.0 * C_pps[2] * E_micro[2] + 2.0 * C_pps[3] * E_micro[3];
 
-    // E_OSS = 2*E_L[2] - E_L[3]  (GAMESS line 1765)
+    // E_OSS = 2*E_L[2] - E_L[3]
     result.E_OSS = 2.0 * E_micro[2] - E_micro[3];
 
-    // E_DES = C_L[1]*E_L[0] + C_L[0]*E_L[1] - 2*C_L[2]*E_L[2] - 2*C_L[3]*E_L[3]
-    // (swap C_L[0] and C_L[1], negate open-shell terms)
+    // E_DES: swap n_r/n_s weights and negate open-shell terms
     result.E_DES = C_pps[1] * E_micro[0] + C_pps[0] * E_micro[1]
                  - 2.0 * C_pps[2] * E_micro[2] - 2.0 * C_pps[3] * E_micro[3];
 
-    // Step 2: Compute off-diagonal coupling elements
-    //
-    // H_12 = Wrs * (sqrt(n_r) - sqrt(n_s)) * sqrt(2)  (GAMESS line 1787)
+    // Off-diagonal coupling elements
+    // H_12 = Wrs * (sqrt(n_r) - sqrt(n_s)) * sqrt(2)
     result.H_12 = Wrs * (std::sqrt(n_r) - std::sqrt(n_s)) * std::sqrt(2.0);
 
-    // H_23 = Wrs * (sqrt(n_r) + sqrt(n_s)) * sqrt(2)  (GAMESS line 1808 for 3SI)
+    // H_23 = Wrs * (sqrt(n_r) + sqrt(n_s)) * sqrt(2)
     result.H_23 = Wrs * (std::sqrt(n_r) + std::sqrt(n_s)) * std::sqrt(2.0);
 
     // Step 3: Build and diagonalize SI Hamiltonian
