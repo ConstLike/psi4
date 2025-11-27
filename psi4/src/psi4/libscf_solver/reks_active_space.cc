@@ -182,34 +182,9 @@ void REKS22Space::compute_weight_derivs(
 }
 
 int REKS22Space::get_alpha_base_idx(int L) const {
-    // Convert alpha occupation pattern to bitmask index
-    // Bit 0 = orbital r (index 0), Bit 1 = orbital s (index 1)
-    //
-    // Microstate alpha patterns:
-    //   L=0: alpha={1,0} -> bit pattern = 0b01 = 1 (wait, {r,s}={1,0} means r=1, s=0)
-    //   Actually: alpha[0]=r, alpha[1]=s
-    //   So {1,0} means r occupied, s not -> bit 0 set = 1... but we want r=bit0
-    //
-    // Let me recalculate: if alpha = {occ_r, occ_s}
-    //   bitmask = occ_r * 1 + occ_s * 2 = alpha[0] + 2*alpha[1]
-    //
-    // L=0: alpha={1,0} -> 1 + 0 = 1? No wait pattern is {r_occ, s_occ}
-    //   Pattern 2 = 0b10 means bit 1 set = orbital 1 (s) occupied?
-    //   No, let me use: bit i = orbital i occupied
-    //   So pattern = sum(alpha[i] << i)
-    //   L=0: alpha={1,0} -> 1<<0 + 0<<1 = 1
-    //   L=1: alpha={0,1} -> 0<<0 + 1<<1 = 2
-    //   L=2: alpha={1,0} -> 1
-    //   L=3: alpha={1,1} -> 1 + 2 = 3
-    //
-    // Wait, the base_density_patterns are {0,1,2,3} with:
-    //   0 = 0b00 = none
-    //   1 = 0b01 = orbital 0 (r) only
-    //   2 = 0b10 = orbital 1 (s) only
-    //   3 = 0b11 = both
-    //
-    // So get_alpha_base_idx should return the bitmask directly
-
+    // Convert occupation pattern to base density index using bitmask encoding.
+    // index = sum(alpha[i] * 2^i) where i is orbital index.
+    // Patterns: {0,0}->0, {1,0}->1, {0,1}->2, {1,1}->3
     const auto& micro = microstates_[L];
     return micro.alpha[0] + 2 * micro.alpha[1];
 }
@@ -332,7 +307,7 @@ REKSActiveSpace::SIResult REKS22Space::compute_SI_energies(
         double v0_pps = H12;
         double v0_oss = E0 - H11;
         double norm0 = std::sqrt(v0_pps * v0_pps + v0_oss * v0_oss);
-        if (norm0 > 1e-14) {
+        if (norm0 > constants::NORM_THRESHOLD) {
             v0_pps /= norm0;
             v0_oss /= norm0;
         } else {
@@ -345,7 +320,7 @@ REKSActiveSpace::SIResult REKS22Space::compute_SI_energies(
         double v1_pps = H12;
         double v1_oss = E1 - H11;
         double norm1 = std::sqrt(v1_pps * v1_pps + v1_oss * v1_oss);
-        if (norm1 > 1e-14) {
+        if (norm1 > constants::NORM_THRESHOLD) {
             v1_pps /= norm1;
             v1_oss /= norm1;
         } else {
@@ -381,8 +356,8 @@ REKSActiveSpace::SIResult REKS22Space::compute_SI_energies(
         };
 
         // Jacobi iteration for 3x3 symmetric matrix
-        const int max_iter = 50;
-        const double tol = 1e-14;
+        const int max_iter = constants::FON_MAX_ITER;
+        const double tol = constants::NORM_THRESHOLD;
 
         for (int iter = 0; iter < max_iter; ++iter) {
             // Find largest off-diagonal element

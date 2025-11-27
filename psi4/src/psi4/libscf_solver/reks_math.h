@@ -57,9 +57,20 @@ namespace reks {
 // Constants
 // ============================================================================
 
-/// Filatov interpolation parameter delta - universal for all REKS variants
-/// From: Filatov et al. J. Chem. Phys. 147, 064104 (2017), Eq. 5
+/// Filatov interpolation parameter delta for all REKS variants.
+/// Reference: Filatov et al. J. Chem. Phys. 147, 064104 (2017), Eq. 5
 constexpr double DELTA = 0.4;
+
+/// Numerical thresholds for FON optimization and convergence checks.
+namespace constants {
+    constexpr double ENERGY_THRESHOLD = 1e-10;   ///< Energy comparison threshold
+    constexpr double FON_THRESHOLD = 1e-10;      ///< FON value threshold
+    constexpr double HESSIAN_THRESHOLD = 1e-10;  ///< Hessian singularity threshold
+    constexpr double NORM_THRESHOLD = 1e-14;     ///< Eigenvector normalization threshold
+    constexpr int FON_MAX_ITER = 50;             ///< Maximum FON optimization iterations
+    constexpr double FON_TOL = 1e-10;            ///< FON convergence tolerance
+    constexpr double FON_MAX_STEP = 0.2;         ///< Maximum FON update step size
+}
 
 // ============================================================================
 // Interpolating Function f(x) and Derivatives

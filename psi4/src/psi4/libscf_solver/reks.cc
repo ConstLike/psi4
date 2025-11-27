@@ -553,7 +553,7 @@ void REKS::compute_microstate_energies() {
     double alpha = functional_->x_alpha();
 
     if (reks_debug_ >= 2) {
-        outfile->Printf("\n  === compute_microstate_energies DEBUG ===\n");
+        outfile->Printf("\n  Microstate energy computation:\n");
         outfile->Printf("  E_nuc = %.10f, needs_xc = %d, alpha = %.4f\n", E_nuc, needs_xc, alpha);
     }
 
@@ -600,7 +600,7 @@ void REKS::compute_microstate_energies() {
     }
 
     if (reks_debug_ >= 2) {
-        outfile->Printf("  DEBUG_PSI4_E_MICRO: E[0]=%.10f E[1]=%.10f E[2]=%.10f E[3]=%.10f\n",
+        outfile->Printf("  Microstate energies: E[0]=%.10f E[1]=%.10f E[2]=%.10f E[3]=%.10f\n",
                         E_micro_[0], E_micro_[1], E_micro_[2], E_micro_[3]);
     }
 
@@ -621,16 +621,17 @@ void REKS::rex_solver() {
     // At n_r=2 (n_s=0), the gradient df/dn_r = 0, which can trap the optimizer.
 
     // Skip if E_micro_ not yet computed (first SCF iteration with SAD guess)
-    if (std::abs(E_micro_[0]) < 1e-10 && std::abs(E_micro_[1]) < 1e-10) {
+    if (std::abs(E_micro_[0]) < reks::constants::ENERGY_THRESHOLD &&
+        std::abs(E_micro_[1]) < reks::constants::ENERGY_THRESHOLD) {
         if (reks_debug_ >= 1) {
-            outfile->Printf("\n  === RexSolver: skipping (E_micro not yet computed) ===\n");
+            outfile->Printf("\n  RexSolver: skipping (E_micro not yet computed)\n");
         }
         return;
     }
 
-    const int max_iter = 50;
-    const double tol = 1e-10;
-    const double max_step = 0.2;
+    const int max_iter = reks::constants::FON_MAX_ITER;
+    const double tol = reks::constants::FON_TOL;
+    const double max_step = reks::constants::FON_MAX_STEP;
 
     double w_PPS = active_space_->w_PPS();
     double w_OSS = active_space_->w_OSS();
@@ -709,9 +710,9 @@ void REKS::rex_solver() {
             // Energy Hessian
             double d2E_dnr2 = w_PPS * d2f_dnr2 * (E_micro_[3] - E_micro_[2]);
 
-            // Newton-Raphson step (or gradient descent if Hessian ~ 0)
+            // Newton-Raphson step (or gradient descent if Hessian is near-singular)
             double delta;
-            if (std::abs(d2E_dnr2) < 1e-10) {
+            if (std::abs(d2E_dnr2) < reks::constants::HESSIAN_THRESHOLD) {
                 delta = -std::copysign(max_step, dE_dnr);
             } else {
                 delta = -dE_dnr / d2E_dnr2;
@@ -824,22 +825,19 @@ void REKS::fock_micro_to_macro(int L, double Cl, double** Fa, double** Fb) {
         }
     }
 
-    // Active orbital r diagonal
-    // Weight: 0.5 * C_L * n^sigma_r / f_r
-    double Wr_a = (fr > 1e-10) ? 0.5 * Cl * nra / fr : 0.0;
-    double Wr_b = (fr > 1e-10) ? 0.5 * Cl * nrb / fr : 0.0;
+    // Active orbital r diagonal: weight = 0.5 * C_L * n^sigma_r / f_r
+    double Wr_a = (fr > reks::constants::FON_THRESHOLD) ? 0.5 * Cl * nra / fr : 0.0;
+    double Wr_b = (fr > reks::constants::FON_THRESHOLD) ? 0.5 * Cl * nrb / fr : 0.0;
     Freks[active_r][active_r] += Wr_a * Fa[active_r][active_r] + Wr_b * Fb[active_r][active_r];
 
-    // Active orbital s diagonal
-    // Weight: 0.5 * C_L * n^sigma_s / f_s
-    double Ws_a = (fs > 1e-10) ? 0.5 * Cl * nsa / fs : 0.0;
-    double Ws_b = (fs > 1e-10) ? 0.5 * Cl * nsb / fs : 0.0;
+    // Active orbital s diagonal: weight = 0.5 * C_L * n^sigma_s / f_s
+    double Ws_a = (fs > reks::constants::FON_THRESHOLD) ? 0.5 * Cl * nsa / fs : 0.0;
+    double Ws_b = (fs > reks::constants::FON_THRESHOLD) ? 0.5 * Cl * nsb / fs : 0.0;
     double contrib_ss = Ws_a * Fa[active_s][active_s] + Ws_b * Fb[active_s][active_s];
     Freks[active_s][active_s] += contrib_ss;
 
-    // Debug: Trace F(s,s) contributions in MO basis
     if (reks_debug_ >= 2) {
-        outfile->Printf("  DEBUG_FM2FE_MO L=%d: Cl=%.6f fr=%.6f fs=%.6f nsa=%d nsb=%d\n",
+        outfile->Printf("  Fock coupling L=%d: Cl=%.6f fr=%.6f fs=%.6f nsa=%d nsb=%d\n",
                        L, Cl, fr, fs, nsa, nsb);
         outfile->Printf("    Fa_MO(s,s)=%.6f Fb_MO(s,s)=%.6f Ws_a=%.6f Ws_b=%.6f\n",
                        Fa[active_s][active_s], Fb[active_s][active_s], Ws_a, Ws_b);
@@ -847,16 +845,15 @@ void REKS::fock_micro_to_macro(int L, double Cl, double** Fa, double** Fb) {
                        contrib_ss, Freks[active_s][active_s]);
     }
 
-    // Core-active coupling (core to r)
-    // Weight: 0.5 * C_L * (1 - n^sigma_r) / (1 - f_r)
-    double omfr = 1.0 - fr;  // 1 - f_r
-    double Wcr_a = (omfr > 1e-10) ? 0.5 * Cl * (1 - nra) / omfr : 0.0;
-    double Wcr_b = (omfr > 1e-10) ? 0.5 * Cl * (1 - nrb) / omfr : 0.0;
+    // Core-active coupling (core to r): weight = 0.5 * C_L * (1 - n^sigma_r) / (1 - f_r)
+    double omfr = 1.0 - fr;
+    double Wcr_a = (omfr > reks::constants::FON_THRESHOLD) ? 0.5 * Cl * (1 - nra) / omfr : 0.0;
+    double Wcr_b = (omfr > reks::constants::FON_THRESHOLD) ? 0.5 * Cl * (1 - nrb) / omfr : 0.0;
 
-    // Core-active coupling (core to s)
-    double omfs = 1.0 - fs;  // 1 - f_s
-    double Wcs_a = (omfs > 1e-10) ? 0.5 * Cl * (1 - nsa) / omfs : 0.0;
-    double Wcs_b = (omfs > 1e-10) ? 0.5 * Cl * (1 - nsb) / omfs : 0.0;
+    // Core-active coupling (core to s): weight = 0.5 * C_L * (1 - n^sigma_s) / (1 - f_s)
+    double omfs = 1.0 - fs;
+    double Wcs_a = (omfs > reks::constants::FON_THRESHOLD) ? 0.5 * Cl * (1 - nsa) / omfs : 0.0;
+    double Wcs_b = (omfs > reks::constants::FON_THRESHOLD) ? 0.5 * Cl * (1 - nsb) / omfs : 0.0;
 
     for (int c = 0; c < Ncore_; ++c) {
         Freks[c][active_r] += Wcr_a * Fa[c][active_r] + Wcr_b * Fb[c][active_r];
@@ -1057,12 +1054,12 @@ void REKS::form_F() {
 
         // Print MO-basis F_reks diagonal
         double** Fmo = F_reks_MO->pointer(0);
-        outfile->Printf("  DEBUG_PSI4_FREKS_MO_DIAG: ");
+        outfile->Printf("  REKS Fock diagonal: ");
         for (int i = 0; i < std::min(8, N); ++i) {
             outfile->Printf("F(%d)=%10.6f ", i, Fmo[i][i]);
         }
         outfile->Printf("\n");
-        outfile->Printf("  DEBUG_PSI4_FREKS_MO_ACTIVE: F(r,r)=%10.6f F(s,s)=%10.6f F(r,s)=%10.6f\n",
+        outfile->Printf("  REKS Fock active: F(r,r)=%10.6f F(s,s)=%10.6f F(r,s)=%10.6f\n",
                        Fmo[active_r][active_r], Fmo[active_s][active_s], Fmo[active_r][active_s]);
 
         // Check symmetry of MO-basis F_reks
@@ -1198,7 +1195,7 @@ void REKS::print_SI_energies() const {
     // - 3SI-2SA: Also includes doubly excited state (S2)
 
     // Skip if energies are not computed yet
-    if (E_micro_.empty() || std::abs(E_micro_[0]) < 1e-10) {
+    if (E_micro_.empty() || std::abs(E_micro_[0]) < reks::constants::ENERGY_THRESHOLD) {
         return;
     }
 
