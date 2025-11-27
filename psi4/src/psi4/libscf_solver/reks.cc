@@ -51,6 +51,7 @@
 #include "psi4/libmints/matrix.h"
 #include "psi4/libmints/vector.h"
 #include "psi4/libfock/jk.h"
+#include "psi4/libfock/v.h"  // For VBase (XC potential)
 #include "psi4/libfunctional/superfunctional.h"
 #include "psi4/libqt/qt.h"  // For C_DGEMM, C_DGER (BLAS)
 
@@ -188,6 +189,17 @@ void REKS::allocate_reks_matrices() {
         F_alpha_MO_[L] = std::make_shared<Matrix>("F_alpha_MO" + suffix, nso, nso);
         F_beta_MO_[L] = std::make_shared<Matrix>("F_beta_MO" + suffix, nso, nso);
     }
+
+    // Allocate XC work matrices (for DFT support)
+    D_total_micro_.resize(n_micro);
+    V_xc_micro_.resize(n_micro);
+    E_xc_micro_.assign(n_micro, 0.0);
+
+    for (int L = 0; L < n_micro; ++L) {
+        std::string suffix = " L=" + std::to_string(L);
+        D_total_micro_[L] = std::make_shared<Matrix>("D_total" + suffix, nsopi_, nsopi_);
+        V_xc_micro_[L] = std::make_shared<Matrix>("V_xc" + suffix, nsopi_, nsopi_);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -323,6 +335,10 @@ void REKS::build_microstate_focks() {
     // For REKS(2,2): 4 base densities (patterns 0-3)
     // For REKS(4,4): 16 base densities (patterns 0-15)
 
+    if (reks_debug_ >= 1) {
+        outfile->Printf("\n  build_microstate_focks: starting...\n");
+    }
+
     int nso = nsopi_[0];
     int nmo = Ca_->colspi()[0];
     int n_base = active_space_->n_base_densities();
@@ -399,22 +415,75 @@ void REKS::build_microstate_focks() {
         K[0]->zero();
     }
 
-    double alpha = functional_->is_x_hybrid() ? functional_->x_alpha() : 1.0;
+    // HF exchange fraction: 0.0 for pure DFT, 0.5 for BHHLYP, 1.0 for HF
+    double alpha = functional_->x_alpha();
 
     // Build RHF J_, K_, G_ for DIIS and compute_E() compatibility
-    // RHF convention: G_ = 2*J - alpha*K
+    // RHF convention: G_ = 2*J - alpha*K + V_xc (if DFT)
     J_ = J[n_base];
     K_ = K[n_base];
 
-    G_->zero();
+    // Compute V_xc for RHF density (for G_ and DIIS compatibility)
+    if (functional_->needs_xc() && potential_) {
+        potential_->set_D({Da_});
+        potential_->compute_V({Va_});
+        G_->copy(Va_);
+    } else {
+        G_->zero();
+    }
     G_->axpy(2.0, J_);
     if (functional_->is_x_hybrid()) {
         G_->axpy(-alpha, K_);
     }
 
     // Build Fock matrices for each microstate
-    // F^sigma_L = H + J_total_L - alpha*K^sigma_L
+    // F^sigma_L = H + J_total_L - alpha*K^sigma_L + V_xc_L
     // where J_total = J^alpha + J^beta, K^sigma uses the sigma density
+
+    // XC support: compute V_xc for each microstate if functional needs XC
+    // Each microstate gets its own XC potential based on its total density
+    bool needs_xc = functional_->needs_xc();
+
+    if (needs_xc && potential_) {
+        if (reks_debug_ >= 2) {
+            outfile->Printf("  Computing XC for %d microstates...\n", n_micro);
+        }
+
+        // First, compute V_xc for the RHF density Da_ (for G_ and finalize compatibility)
+        // This ensures RHO_A etc are populated for finalize_energy()
+        potential_->set_D({Da_});
+        potential_->compute_V({Va_});
+
+        // Compute XC for each microstate
+        for (int L = 0; L < n_micro; ++L) {
+            // Build total density for microstate L: D_total = D_alpha + D_beta
+            D_total_micro_[L]->copy(D_alpha_micro_[L]);
+            D_total_micro_[L]->add(D_beta_micro_[L]);
+
+            // Zero V_xc before computing
+            V_xc_micro_[L]->zero();
+
+            // IMPORTANT: RKS grid expects "alpha density" and multiplies by 2 internally
+            // to get total density. So we pass D_total/2 to get the correct XC.
+            auto D_half = std::make_shared<Matrix>("D_half", D_total_micro_[L]->rowspi(), D_total_micro_[L]->colspi());
+            D_half->copy(D_total_micro_[L]);
+            D_half->scale(0.5);
+
+            // Set density for XC computation (RKS-style expects half-density)
+            potential_->set_D({D_half});
+
+            // Compute V_xc
+            potential_->compute_V({V_xc_micro_[L]});
+
+            // Get XC energy from quadrature
+            E_xc_micro_[L] = potential_->quadrature_values()["FUNCTIONAL"];
+
+            if (reks_debug_ >= 2) {
+                outfile->Printf("    L=%d: tr(D)=%.4f, E_xc=%.10f\n",
+                               L, D_total_micro_[L]->trace(), E_xc_micro_[L]);
+            }
+        }
+    }
 
     for (int L = 0; L < n_micro; ++L) {
         int alpha_idx = active_space_->get_alpha_base_idx(L);
@@ -433,6 +502,12 @@ void REKS::build_microstate_focks() {
         F_beta_micro_[L]->copy(H_);
         F_beta_micro_[L]->add(J_work_);
         F_beta_micro_[L]->axpy(-alpha, K[beta_idx]);
+
+        // Add XC potential to both alpha and beta Fock matrices
+        if (needs_xc && potential_) {
+            F_alpha_micro_[L]->add(V_xc_micro_[L]);
+            F_beta_micro_[L]->add(V_xc_micro_[L]);
+        }
     }
 
     if (reks_debug_ >= 2) {
@@ -466,10 +541,21 @@ void REKS::build_microstate_focks() {
 void REKS::compute_microstate_energies() {
     // E_L = tr(D^alpha_L * H) + tr(D^beta_L * H)
     //     + 0.5 * [tr(D^alpha_L * G^alpha_L) + tr(D^beta_L * G^beta_L)]
-    //     + E_nuc
-    // where G^sigma = F^sigma - H = J - alpha*K^sigma
+    //     + E_nuc + E_xc_correction
+    // where G^sigma = F^sigma - H = J - alpha*K^sigma + V_xc
+    //
+    // XC correction: The Fock matrix energy includes 0.5*tr(D*V_xc), but
+    // the actual XC energy is E_xc from quadrature. So we need to correct:
+    // E_xc_correction = E_xc - 0.5*tr(D_total*V_xc)
 
     double E_nuc = energies_["Nuclear"];
+    bool needs_xc = functional_->needs_xc();
+    double alpha = functional_->x_alpha();
+
+    if (reks_debug_ >= 2) {
+        outfile->Printf("\n  === compute_microstate_energies DEBUG ===\n");
+        outfile->Printf("  E_nuc = %.10f, needs_xc = %d, alpha = %.4f\n", E_nuc, needs_xc, alpha);
+    }
 
     int n_micro = n_microstates();
     for (int L = 0; L < n_micro; ++L) {
@@ -489,6 +575,28 @@ void REKS::compute_microstate_energies() {
         double E_2e = 0.5 * (E_Fa + E_Fb - E_1e);
 
         E_micro_[L] = E_1e + E_2e + E_nuc;
+
+        // XC energy correction for DFT
+        // The Fock matrix trick gives: 0.5*tr(D*V_xc) instead of E_xc
+        // Correction = E_xc - 0.5*tr(D_total*V_xc)
+        if (needs_xc && potential_) {
+            double tr_D_Vxc = D_total_micro_[L]->vector_dot(V_xc_micro_[L]);
+            double xc_correction = E_xc_micro_[L] - 0.5 * tr_D_Vxc;
+
+            if (reks_debug_ >= 2) {
+                outfile->Printf("  L=%d: E_1e=%.10f, E_2e=%.10f, E_nuc=%.10f\n", L, E_1e, E_2e, E_nuc);
+                outfile->Printf("        E_micro(before XC)=%.10f\n", E_micro_[L]);
+                outfile->Printf("        E_xc=%.10f, tr(D*Vxc)=%.10f, 0.5*tr=%.10f\n",
+                               E_xc_micro_[L], tr_D_Vxc, 0.5*tr_D_Vxc);
+                outfile->Printf("        xc_correction=%.10f\n", xc_correction);
+            }
+
+            E_micro_[L] += xc_correction;
+
+            if (reks_debug_ >= 2) {
+                outfile->Printf("        E_micro(after XC)=%.10f\n", E_micro_[L]);
+            }
+        }
     }
 
     if (reks_debug_ >= 2) {
@@ -824,7 +932,9 @@ void REKS::form_D() {
 }
 
 void REKS::form_G() {
-    // For SAD guess iteration: Ca_ doesn't exist yet, delegate to RHF
+    // For SAD guess iteration (iteration_ <= 0): delegate to RHF::form_G()
+    // This ensures proper XC initialization (form_V() gets called)
+    // Note: sad_ remains true after SAD completes, so we check iteration_ too
     if (sad_ && iteration_ <= 0) {
         RHF::form_G();
         return;
@@ -847,8 +957,15 @@ void REKS::form_G() {
 void REKS::form_F() {
     // For SAD guess iteration: use standard RHF Fock matrix
     if (sad_ && iteration_ <= 0) {
+        if (reks_debug_ >= 1) {
+            outfile->Printf("\n  form_F: SAD iteration, delegating to RHF\n");
+        }
         RHF::form_F();
         return;
+    }
+
+    if (reks_debug_ >= 1) {
+        outfile->Printf("\n  form_F: REKS iteration %d\n", iteration_);
     }
 
     // Build REKS coupling Fock matrix F_reks_ from microstate Fock matrices.

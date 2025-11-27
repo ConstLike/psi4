@@ -1430,7 +1430,7 @@ def scf_wavefunction_factory(name, ref_wfn, reference, **kwargs):
 
     """
     # Figure out functional and dispersion
-    superfunc, _disp_functor = build_functional_and_disp(name, restricted=(reference in ["RKS", "RHF"]), **kwargs)
+    superfunc, _disp_functor = build_functional_and_disp(name, restricted=(reference in ["RKS", "RHF", "REKS"]), **kwargs)
 
     # Build the wavefunction
     core.prepare_options_for_module("SCF")

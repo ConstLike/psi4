@@ -178,17 +178,6 @@ void forPermutation(int depth, std::vector<int>& array, std::vector<int>& indice
     }
 }
 void RHF::form_V() {
-    // Push the C matrix on
-    // std::vector<SharedMatrix> & C = potential_->C();
-    // C.clear();
-    // C.push_back(Ca_subset("SO", "OCC"));
-
-    // // Run the potential object
-    // potential_->compute();
-
-    // // Pull the V matrices off
-    // const std::vector<SharedMatrix> & V = potential_->V();
-    // Va_ = V[0];
     potential_->set_D({Da_});
     potential_->compute_V({Va_});
     Vb_ = Va_;

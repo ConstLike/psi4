@@ -114,6 +114,14 @@ class REKS : public RHF {
     std::vector<SharedMatrix> F_beta_MO_;   ///< Pre-allocated MO-basis beta Fock
 
     // ========================================================================
+    // XC (Exchange-Correlation) Support
+    // ========================================================================
+
+    std::vector<SharedMatrix> D_total_micro_;  ///< Total density (alpha+beta) for each microstate
+    std::vector<SharedMatrix> V_xc_micro_;     ///< XC potential for each microstate
+    std::vector<double> E_xc_micro_;           ///< XC energy for each microstate
+
+    // ========================================================================
     // Debug Level
     // ========================================================================
 
@@ -167,6 +175,7 @@ class REKS : public RHF {
 
     void form_D() override;
     void form_G() override;
+    // Note: form_V() NOT overridden - use RHF::form_V() directly
     void form_F() override;
     void form_C(double shift = 0.0) override;
     double compute_E() override;
