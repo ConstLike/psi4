@@ -100,7 +100,10 @@ class REKS : public RHF {
 
     SharedMatrix F_reks_;          ///< Assembled coupling Fock matrix (AO basis)
     SharedMatrix F_reks_MO_;       ///< F_reks in MO basis
-    double Wrs_lagr_ = 0.0;        ///< Off-diagonal Lagrange multiplier for SI
+    double Wrs_lagr_ = 0.0;        ///< Off-diagonal Lagrange multiplier for SI (REKS(2,2): r,s; REKS(4,4): a,d)
+    double Wbc_lagr_ = 0.0;        ///< Off-diagonal Lagrange multiplier for (b,c) pair (REKS(4,4) only)
+    double Wac_lagr_ = 0.0;        ///< Off-diagonal Lagrange multiplier for (a,c) inter-pair (REKS(4,4) 9SI only)
+    double Wbd_lagr_ = 0.0;        ///< Off-diagonal Lagrange multiplier for (b,d) inter-pair (REKS(4,4) 9SI only)
 
     // ========================================================================
     // Pre-allocated Work Matrices (for HPC efficiency)
@@ -149,14 +152,26 @@ class REKS : public RHF {
     /// Compute microstate energies E_L
     void compute_microstate_energies();
 
-    /// Newton-Raphson FON optimization
+    /// Newton-Raphson FON optimization (dispatcher)
     void rex_solver();
+
+    /// REKS(2,2) FON optimization: single variable n_r
+    void rex_solver_22();
+
+    /// REKS(4,4) FON optimization: two variables (n_a, n_b)
+    void rex_solver_44();
 
     /// Compute weighting factors C_L (delegates to active_space_)
     void compute_weighting_factors();
 
-    /// Add microstate L contribution to coupling Fock matrix
+    /// Add microstate L contribution to coupling Fock matrix (dispatcher)
     void fock_micro_to_macro(int L, double Cl, double** Fa, double** Fb);
+
+    /// REKS(2,2) version of coupling Fock assembly
+    void fock_micro_to_macro_22(int L, double Cl, double** Fa, double** Fb);
+
+    /// REKS(4,4) version of coupling Fock assembly
+    void fock_micro_to_macro_44(int L, double Cl, double** Fa, double** Fb);
 
     /// Debug output: header
     void print_reks_header() const;
@@ -239,14 +254,18 @@ class REKS : public RHF {
         return C_L_[L];
     }
 
-    // --- REKS(2,2) Specific Accessors (backward compatibility) ---
+    // ========================================================================
+    // FON Accessors
+    // ========================================================================
 
-    /// Get FON for orbital r (only valid for REKS(2,2))
+    // --- REKS(2,2) Accessors (pair 0: r,s) ---
+
+    /// Get FON for orbital r (REKS(2,2), or n_a for REKS(4,4))
     [[nodiscard]] double get_n_r() const {
         return active_space_->pair(0).fon_p;
     }
 
-    /// Get FON for orbital s (only valid for REKS(2,2))
+    /// Get FON for orbital s (REKS(2,2), or n_d for REKS(4,4))
     [[nodiscard]] double get_n_s() const {
         return active_space_->pair(0).fon_q;
     }
@@ -257,18 +276,93 @@ class REKS : public RHF {
         return reks::f_interp(p.fon_p * p.fon_q);
     }
 
-    /// Get Wrs Lagrange multiplier (off-diagonal SI coupling)
+    // --- REKS(4,4) Accessors (pair 0: a,d and pair 1: b,c) ---
+
+    /// Get FON for orbital a (pair 0, REKS(4,4))
+    [[nodiscard]] double get_n_a() const {
+        return active_space_->pair(0).fon_p;
+    }
+
+    /// Get FON for orbital d (pair 0, REKS(4,4))
+    [[nodiscard]] double get_n_d() const {
+        return active_space_->pair(0).fon_q;
+    }
+
+    /// Get FON for orbital b (pair 1, REKS(4,4) only)
+    /// @return n_b if REKS(4,4), 0.0 otherwise
+    [[nodiscard]] double get_n_b() const {
+        if (active_space_->n_pairs() >= 2) {
+            return active_space_->pair(1).fon_p;
+        }
+        return 0.0;
+    }
+
+    /// Get FON for orbital c (pair 1, REKS(4,4) only)
+    /// @return n_c if REKS(4,4), 0.0 otherwise
+    [[nodiscard]] double get_n_c() const {
+        if (active_space_->n_pairs() >= 2) {
+            return active_space_->pair(1).fon_q;
+        }
+        return 0.0;
+    }
+
+    // ========================================================================
+    // Response Lagrangian Accessors
+    // ========================================================================
+
+    /// Get W_ad Lagrange multiplier (off-diagonal SI coupling for a,d pair)
+    /// For REKS(2,2) this is Wrs
     [[nodiscard]] double get_Wrs() const {
         return Wrs_lagr_;
     }
 
-    // --- SI-SA-REKS State Energies ---
+    /// Get W_ad Lagrange multiplier (same as Wrs, alternative name for REKS(4,4))
+    [[nodiscard]] double get_W_ad() const {
+        return Wrs_lagr_;
+    }
+
+    /// Get W_bc Lagrange multiplier (off-diagonal SI coupling for b,c pair)
+    /// Only valid for REKS(4,4)
+    [[nodiscard]] double get_Wbc() const {
+        return Wbc_lagr_;
+    }
+
+    /// Get W_bc Lagrange multiplier (alternative name)
+    [[nodiscard]] double get_W_bc() const {
+        return Wbc_lagr_;
+    }
+
+    /// Get W_ac Lagrange multiplier (inter-pair SI coupling for a,c)
+    /// Only valid for REKS(4,4) 9SI
+    [[nodiscard]] double get_W_ac() const {
+        return Wac_lagr_;
+    }
+
+    /// Get W_bd Lagrange multiplier (inter-pair SI coupling for b,d)
+    /// Only valid for REKS(4,4) 9SI
+    [[nodiscard]] double get_W_bd() const {
+        return Wbd_lagr_;
+    }
+
+    // ========================================================================
+    // SI-SA-REKS State Energies
+    // ========================================================================
 
     /// Get SI state energy for state index (0 = ground, 1 = S1, etc.)
     /// @param state State index (0 to n_si_states-1)
-    /// @param n_si_states Number of SI states (2 or 3)
+    /// @param n_si_states Number of SI states (2 or 3 for 3SI, up to 9 for 9SI)
     /// @return State energy in Hartree
     [[nodiscard]] double get_SI_energy(int state, int n_si_states = 2) const {
+        // For REKS(4,4)+, use compute_SI_energies_44 with both Lagrangians
+        // Check n_pairs() >= 2 to detect REKS(4,4) or higher
+        if (active_space_->n_pairs() >= 2) {
+            auto si = active_space_->compute_SI_energies_44(E_micro_, Wrs_lagr_, Wbc_lagr_, n_si_states);
+            if (state >= 0 && state < static_cast<int>(si.energies.size())) {
+                return si.energies[state];
+            }
+            return 0.0;
+        }
+        // For REKS(2,2), use original method
         auto si = active_space_->compute_SI_energies(E_micro_, Wrs_lagr_, n_si_states);
         if (state >= 0 && state < static_cast<int>(si.energies.size())) {
             return si.energies[state];
@@ -276,28 +370,148 @@ class REKS : public RHF {
         return 0.0;
     }
 
+    /// Get 9SI state energy for REKS(4,4)
+    /// Uses all 4 Lagrangians (W_ad, W_bc, W_ac, W_bd) for full 9x9 Hamiltonian
+    /// @param state State index (0 to n_si_states-1)
+    /// @param n_si_states Number of SI states (up to 9)
+    /// @return State energy in Hartree
+    [[nodiscard]] double get_SI_energy_9x9(int state, int n_si_states = 9) const {
+        if (active_space_->n_pairs() >= 2) {
+            auto si = active_space_->compute_SI_energies_9x9(
+                E_micro_, Wrs_lagr_, Wbc_lagr_, Wac_lagr_, Wbd_lagr_, n_si_states);
+            if (state >= 0 && state < static_cast<int>(si.energies.size())) {
+                return si.energies[state];
+            }
+        }
+        return 0.0;
+    }
+
     /// Get PPS diagonal energy (H_11)
     [[nodiscard]] double get_E_PPS() const {
+        if (active_space_->n_pairs() >= 2) {
+            auto si = active_space_->compute_SI_energies_44(E_micro_, Wrs_lagr_, Wbc_lagr_, 3);
+            return si.E_PPS;
+        }
         auto si = active_space_->compute_SI_energies(E_micro_, Wrs_lagr_, 2);
         return si.E_PPS;
     }
 
     /// Get OSS diagonal energy (H_22)
+    /// For REKS(4,4), returns E_OSS1
     [[nodiscard]] double get_E_OSS() const {
+        if (active_space_->n_pairs() >= 2) {
+            auto si = active_space_->compute_SI_energies_44(E_micro_, Wrs_lagr_, Wbc_lagr_, 3);
+            return si.E_OSS;  // E_OSS1 for REKS(4,4)
+        }
         auto si = active_space_->compute_SI_energies(E_micro_, Wrs_lagr_, 2);
         return si.E_OSS;
     }
 
     /// Get DES diagonal energy (H_33)
+    /// For REKS(4,4), returns E_OSS2
     [[nodiscard]] double get_E_DES() const {
+        if (active_space_->n_pairs() >= 2) {
+            auto si = active_space_->compute_SI_energies_44(E_micro_, Wrs_lagr_, Wbc_lagr_, 3);
+            return si.E_DES;  // E_OSS2 for REKS(4,4)
+        }
         auto si = active_space_->compute_SI_energies(E_micro_, Wrs_lagr_, 3);
         return si.E_DES;
     }
 
-    /// Get triplet energy (from microstate 3)
+    // --- REKS(4,4) Specific State Energy Accessors ---
+
+    /// Get E_OSS1 diagonal energy (REKS(4,4) only)
+    [[nodiscard]] double get_E_OSS1() const {
+        if (active_space_->n_pairs() >= 2) {
+            auto si = active_space_->compute_SI_energies_44(E_micro_, Wrs_lagr_, Wbc_lagr_, 3);
+            return si.E_OSS;
+        }
+        return 0.0;
+    }
+
+    /// Get E_OSS2 diagonal energy (REKS(4,4) only)
+    [[nodiscard]] double get_E_OSS2() const {
+        if (active_space_->n_pairs() >= 2) {
+            auto si = active_space_->compute_SI_energies_44(E_micro_, Wrs_lagr_, Wbc_lagr_, 3);
+            return si.E_DES;
+        }
+        return 0.0;
+    }
+
+    /// Get triplet energy (from microstate 3 for REKS(2,2))
     [[nodiscard]] double get_E_triplet() const {
         if (E_micro_.size() > 3) {
             return E_micro_[3];
+        }
+        return 0.0;
+    }
+
+    // --- REKS(4,4) Additional Configuration Energies ---
+
+    /// Get DOSS (Double Open-Shell Singlet) configuration energy
+    /// Only valid for REKS(4,4). Uses fixed FONs: n'_a=n'_d=n'_b=n'_c=1
+    [[nodiscard]] double get_E_DOSS() const {
+        if (active_space_->n_pairs() >= 2) {
+            // Cast to REKS44Space to access DOSS energy function
+            auto* space44 = dynamic_cast<const reks::REKS44Space*>(active_space_.get());
+            if (space44) {
+                return space44->compute_energy_DOSS(E_micro_);
+            }
+        }
+        return 0.0;
+    }
+
+    /// Get DSPS (Double Single-Pair Singlet) configuration energy
+    /// Only valid for REKS(4,4). Uses fixed FONs: n'_a=n'_d=n'_b=n'_c=1
+    [[nodiscard]] double get_E_DSPS() const {
+        if (active_space_->n_pairs() >= 2) {
+            // Cast to REKS44Space to access DSPS energy function
+            auto* space44 = dynamic_cast<const reks::REKS44Space*>(active_space_.get());
+            if (space44) {
+                return space44->compute_energy_DSPS(E_micro_);
+            }
+        }
+        return 0.0;
+    }
+
+    /// Get OSS3 (Inter-pair Open-Shell Singlet) configuration energy
+    /// Only valid for REKS(4,4). INTER-PAIR pairing: (a,c) OSS, (b,d) GVB
+    [[nodiscard]] double get_E_OSS3() const {
+        if (active_space_->n_pairs() >= 2) {
+            return active_space_->compute_energy_OSS3(E_micro_);
+        }
+        return 0.0;
+    }
+
+    /// Get OSS4 (Inter-pair Open-Shell Singlet) configuration energy
+    /// Only valid for REKS(4,4). INTER-PAIR pairing: (b,d) OSS, (a,c) GVB
+    [[nodiscard]] double get_E_OSS4() const {
+        if (active_space_->n_pairs() >= 2) {
+            return active_space_->compute_energy_OSS4(E_micro_);
+        }
+        return 0.0;
+    }
+
+    /// Get DES1 (Doubly Excited Singlet type 1) configuration energy
+    /// Only valid for REKS(4,4). Standard pairing, doubly excited
+    [[nodiscard]] double get_E_DES1() const {
+        if (active_space_->n_pairs() >= 2) {
+            auto* space44 = dynamic_cast<const reks::REKS44Space*>(active_space_.get());
+            if (space44) {
+                return space44->compute_energy_DES1(E_micro_);
+            }
+        }
+        return 0.0;
+    }
+
+    /// Get DES2 (Doubly Excited Singlet type 2) configuration energy
+    /// Only valid for REKS(4,4). Inter-pair pairing, doubly excited
+    [[nodiscard]] double get_E_DES2() const {
+        if (active_space_->n_pairs() >= 2) {
+            auto* space44 = dynamic_cast<const reks::REKS44Space*>(active_space_.get());
+            if (space44) {
+                return space44->compute_energy_DES2(E_micro_);
+            }
         }
         return 0.0;
     }

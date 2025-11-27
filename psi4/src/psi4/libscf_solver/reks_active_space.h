@@ -343,6 +343,149 @@ public:
         int n_si_states = 2) const = 0;
 
     // ========================================================================
+    // 3SA-REKS Configuration-Specific Methods (REKS(4,4) only)
+    // ========================================================================
+
+    /// Compute energy for PPS configuration only (default: returns 0 for REKS(2,2))
+    [[nodiscard]] virtual double compute_energy_PPS(const std::vector<double>& E_micro) const { return 0.0; }
+
+    /// Compute energy for OSS1 configuration only (default: returns 0 for REKS(2,2))
+    [[nodiscard]] virtual double compute_energy_OSS1(const std::vector<double>& E_micro) const { return 0.0; }
+
+    /// Compute energy for OSS2 configuration only (default: returns 0 for REKS(2,2))
+    [[nodiscard]] virtual double compute_energy_OSS2(const std::vector<double>& E_micro) const { return 0.0; }
+
+    /// Compute gradient for PPS configuration (default: returns empty for REKS(2,2))
+    [[nodiscard]] virtual std::vector<double> compute_gradient_PPS(const std::vector<double>& E_micro) const {
+        return {};
+    }
+
+    /// Compute gradient of OSS1 energy w.r.t. n'_a (default: returns 0 for REKS(2,2))
+    [[nodiscard]] virtual double compute_gradient_OSS1(const std::vector<double>& E_micro) const { return 0.0; }
+
+    /// Compute gradient of OSS2 energy w.r.t. n'_b (default: returns 0 for REKS(2,2))
+    [[nodiscard]] virtual double compute_gradient_OSS2(const std::vector<double>& E_micro) const { return 0.0; }
+
+    /// Compute hessian for PPS configuration (default: returns empty for REKS(2,2))
+    [[nodiscard]] virtual std::vector<double> compute_hessian_PPS(const std::vector<double>& E_micro) const {
+        return {};
+    }
+
+    /// Compute hessian of OSS1 energy (default: returns 0 for REKS(2,2))
+    [[nodiscard]] virtual double compute_hessian_OSS1(const std::vector<double>& E_micro) const { return 0.0; }
+
+    /// Compute hessian of OSS2 energy (default: returns 0 for REKS(2,2))
+    [[nodiscard]] virtual double compute_hessian_OSS2(const std::vector<double>& E_micro) const { return 0.0; }
+
+    /// Get/Set OSS1 FON for (a,d) pair (default: no-op for REKS(2,2))
+    virtual double get_oss1_fon_a() const { return 1.0; }
+    virtual void set_oss1_fon_a(double fon) {}
+
+    /// Get/Set OSS2 FON for (b,c) pair (default: no-op for REKS(2,2))
+    virtual double get_oss2_fon_b() const { return 1.0; }
+    virtual void set_oss2_fon_b(double fon) {}
+
+    // ========================================================================
+    // OSS3/OSS4 FON Management (INTER-PAIR pairing: (a,c) and (b,d))
+    // ========================================================================
+    //
+    // OSS3: (a,c) is OSS pair (fixed n_a=n_c=1), (b,d) is GVB pair (m_b+m_d=2)
+    // OSS4: (b,d) is OSS pair (fixed n_b=n_d=1), (a,c) is GVB pair (m_a+m_c=2)
+
+    /// Get/Set OSS3 FON for (b,d) pair: m_b (default: 1.0)
+    virtual double get_oss3_fon_b() const { return 1.0; }
+    virtual void set_oss3_fon_b(double fon) {}
+
+    /// Get/Set OSS4 FON for (a,c) pair: m_a (default: 1.0)
+    virtual double get_oss4_fon_a() const { return 1.0; }
+    virtual void set_oss4_fon_a(double fon) {}
+
+    /// Compute OSS3 configuration energy (default: returns 0 for REKS(2,2))
+    [[nodiscard]] virtual double compute_energy_OSS3(const std::vector<double>& E_micro) const { return 0.0; }
+
+    /// Compute OSS4 configuration energy (default: returns 0 for REKS(2,2))
+    [[nodiscard]] virtual double compute_energy_OSS4(const std::vector<double>& E_micro) const { return 0.0; }
+
+    /// Compute gradient of OSS3 energy w.r.t. m_b (default: 0 for REKS(2,2))
+    [[nodiscard]] virtual double compute_gradient_OSS3(const std::vector<double>& E_micro) const { return 0.0; }
+
+    /// Compute gradient of OSS4 energy w.r.t. m_a (default: 0 for REKS(2,2))
+    [[nodiscard]] virtual double compute_gradient_OSS4(const std::vector<double>& E_micro) const { return 0.0; }
+
+    /// Compute hessian of OSS3 energy w.r.t. m_b (default: 0 for REKS(2,2))
+    [[nodiscard]] virtual double compute_hessian_OSS3(const std::vector<double>& E_micro) const { return 0.0; }
+
+    /// Compute hessian of OSS4 energy w.r.t. m_a (default: 0 for REKS(2,2))
+    [[nodiscard]] virtual double compute_hessian_OSS4(const std::vector<double>& E_micro) const { return 0.0; }
+
+    /**
+     * @brief Compute 3SI-3SA Hamiltonian for REKS(4,4)
+     *
+     * @param E_micro Microstate energies from SCF
+     * @param W_ad Lagrange multiplier for (a,d) pair coupling
+     * @param W_bc Lagrange multiplier for (b,c) pair coupling
+     * @param n_si_states Number of SI states (3 for 3SI)
+     * @return SIResult with eigenvalues and eigenvectors
+     *
+     * 3SI-3SA Hamiltonian:
+     *   H_11 = E_PPS
+     *   H_22 = E_OSS1
+     *   H_33 = E_OSS2
+     *   H_12 = W_bc * sqrt(2) * (sqrt(nb) - sqrt(nc))  [PPS-OSS1 coupling]
+     *   H_13 = W_ad * sqrt(2) * (sqrt(na) - sqrt(nd))  [PPS-OSS2 coupling]
+     *   H_23 = 0 (simplified; full formula involves 3-index ERIs)
+     */
+    [[nodiscard]] virtual SIResult compute_SI_energies_44(
+        const std::vector<double>& E_micro,
+        double W_ad,
+        double W_bc,
+        int n_si_states = 3) const {
+        // Default: return placeholder (REKS(2,2) doesn't use this)
+        SIResult result;
+        result.n_states = n_si_states;
+        result.energies.resize(n_si_states, 0.0);
+        result.coeffs.resize(n_si_states * n_si_states, 0.0);
+        return result;
+    }
+
+    /**
+     * @brief Compute 9SI-3SA Hamiltonian for REKS(4,4)
+     *
+     * Full 9x9 State Interaction Hamiltonian for all 9 configurations:
+     *   1. PPS   - Perfectly Paired Singlet
+     *   2. OSS1  - (b,c) OSS, (a,d) GVB
+     *   3. OSS2  - (a,d) OSS, (b,c) GVB
+     *   4. OSS3  - (a,c) OSS (inter-pair), (b,d) GVB
+     *   5. OSS4  - (b,d) OSS (inter-pair), (a,c) GVB
+     *   6. DOSS  - Double Open-Shell Singlet
+     *   7. DSPS  - Double Single-Pair Singlet
+     *   8. DES1  - Doubly Excited Singlet type 1
+     *   9. DES2  - Doubly Excited Singlet type 2
+     *
+     * @param E_micro Microstate energies from SCF
+     * @param W_ad Lagrange multiplier for (a,d) pair coupling
+     * @param W_bc Lagrange multiplier for (b,c) pair coupling
+     * @param W_ac Lagrange multiplier for (a,c) inter-pair coupling
+     * @param W_bd Lagrange multiplier for (b,d) inter-pair coupling
+     * @param n_si_states Number of SI states (up to 9)
+     * @return SIResult with eigenvalues and eigenvectors
+     */
+    [[nodiscard]] virtual SIResult compute_SI_energies_9x9(
+        const std::vector<double>& E_micro,
+        double W_ad,
+        double W_bc,
+        double W_ac,
+        double W_bd,
+        int n_si_states = 9) const {
+        // Default: return placeholder (REKS(2,2) doesn't use this)
+        SIResult result;
+        result.n_states = n_si_states;
+        result.energies.resize(n_si_states, 0.0);
+        result.coeffs.resize(n_si_states * n_si_states, 0.0);
+        return result;
+    }
+
+    // ========================================================================
     // Factory Methods
     // ========================================================================
 
@@ -527,6 +670,38 @@ public:
     double w_OSS() const override { return (1.0 - w_pps_) / 2.0; }
     void set_sa_weights(double w_pps, double w_oss) override { w_pps_ = w_pps; }
 
+    // ========================================================================
+    // OSS1/OSS2 FON Management (separate FONs for each configuration)
+    // ========================================================================
+
+    /// Get OSS1 FON for (a,d) pair (n'_a)
+    double get_oss1_fon_a() const override { return oss1_fon_a_; }
+
+    /// Set OSS1 FON for (a,d) pair (n'_a)
+    void set_oss1_fon_a(double fon) override { oss1_fon_a_ = fon; oss1_fon_d_ = 2.0 - fon; }
+
+    /// Get OSS2 FON for (b,c) pair (n'_b)
+    double get_oss2_fon_b() const override { return oss2_fon_b_; }
+
+    /// Set OSS2 FON for (b,c) pair (n'_b)
+    void set_oss2_fon_b(double fon) override { oss2_fon_b_ = fon; oss2_fon_c_ = 2.0 - fon; }
+
+    // ========================================================================
+    // OSS3/OSS4 FON Management (INTER-PAIR pairing: (a,c) and (b,d))
+    // ========================================================================
+
+    /// Get OSS3 FON for (b,d) pair (m_b)
+    double get_oss3_fon_b() const override { return oss3_fon_b_; }
+
+    /// Set OSS3 FON for (b,d) pair (m_b)
+    void set_oss3_fon_b(double fon) override { oss3_fon_b_ = fon; oss3_fon_d_ = 2.0 - fon; }
+
+    /// Get OSS4 FON for (a,c) pair (m_a)
+    double get_oss4_fon_a() const override { return oss4_fon_a_; }
+
+    /// Set OSS4 FON for (a,c) pair (m_a)
+    void set_oss4_fon_a(double fon) override { oss4_fon_a_ = fon; oss4_fon_c_ = 2.0 - fon; }
+
     int alpha_occ(int L, int orbital) const override {
         return microstates_[L].alpha[orbital];
     }
@@ -587,12 +762,305 @@ public:
         double Wrs,
         int n_si_states = 2) const override;
 
+    /// Compute 3SI-3SA state energies for REKS(4,4)
+    /// Uses both W_ad (a,d pair) and W_bc (b,c pair) Lagrangians
+    [[nodiscard]] SIResult compute_SI_energies_44(
+        const std::vector<double>& E_micro,
+        double W_ad,
+        double W_bc,
+        int n_si_states = 3) const override;
+
+    /// Compute 9SI-3SA state energies for REKS(4,4)
+    /// Full 9x9 Hamiltonian with all 4 Lagrangians (W_ad, W_bc, W_ac, W_bd)
+    [[nodiscard]] SIResult compute_SI_energies_9x9(
+        const std::vector<double>& E_micro,
+        double W_ad,
+        double W_bc,
+        double W_ac,
+        double W_bd,
+        int n_si_states = 9) const override;
+
+    // ========================================================================
+    // Additional Configuration Energy Accessors (public for Python bindings)
+    // ========================================================================
+
+    /**
+     * @brief Compute DOSS configuration energy
+     * E_DOSS = sum_L FACT_L * C_DOSS_L * E_micro_L
+     * No FON optimization (all fixed at 1)
+     */
+    [[nodiscard]] double compute_energy_DOSS(const std::vector<double>& E_micro) const;
+
+    /**
+     * @brief Compute DSPS configuration energy
+     * E_DSPS = sum_L FACT_L * C_DSPS_L * E_micro_L
+     * No FON optimization (all fixed at 1)
+     */
+    [[nodiscard]] double compute_energy_DSPS(const std::vector<double>& E_micro) const;
+
+    /**
+     * @brief Compute OSS3 configuration energy (INTER-PAIR pairing)
+     * E_OSS3 = sum_L FACT_L * C_OSS3_L * E_micro_L
+     * (a,c) OSS pair (fixed), (b,d) GVB pair (optimized)
+     */
+    [[nodiscard]] double compute_energy_OSS3(const std::vector<double>& E_micro) const override;
+
+    /**
+     * @brief Compute OSS4 configuration energy (INTER-PAIR pairing)
+     * E_OSS4 = sum_L FACT_L * C_OSS4_L * E_micro_L
+     * (b,d) OSS pair (fixed), (a,c) GVB pair (optimized)
+     */
+    [[nodiscard]] double compute_energy_OSS4(const std::vector<double>& E_micro) const override;
+
+    /**
+     * @brief Compute gradient of OSS3 energy w.r.t. m_b
+     * @return scalar dE_OSS3/dm_b
+     */
+    [[nodiscard]] double compute_gradient_OSS3(const std::vector<double>& E_micro) const override;
+
+    /**
+     * @brief Compute gradient of OSS4 energy w.r.t. m_a
+     * @return scalar dE_OSS4/dm_a
+     */
+    [[nodiscard]] double compute_gradient_OSS4(const std::vector<double>& E_micro) const override;
+
+    /**
+     * @brief Compute hessian of OSS3 energy w.r.t. m_b
+     * @return scalar d²E_OSS3/d(m_b)²
+     */
+    [[nodiscard]] double compute_hessian_OSS3(const std::vector<double>& E_micro) const override;
+
+    /**
+     * @brief Compute hessian of OSS4 energy w.r.t. m_a
+     * @return scalar d²E_OSS4/d(m_a)²
+     */
+    [[nodiscard]] double compute_hessian_OSS4(const std::vector<double>& E_micro) const override;
+
+    /**
+     * @brief Compute DES1 (Doubly Excited Singlet type 1) configuration energy
+     * E_DES1 = sum_L FACT_L * C_DES1_L * E_micro_L
+     * Standard (a,d)/(b,c) pairing, doubly excited: n_a=n_b=0, n_c=n_d=2
+     * From Filatov 2017 Appendix A, Eq. A7
+     */
+    [[nodiscard]] double compute_energy_DES1(const std::vector<double>& E_micro) const;
+
+    /**
+     * @brief Compute DES2 (Doubly Excited Singlet type 2) configuration energy
+     * E_DES2 = sum_L FACT_L * C_DES2_L * E_micro_L
+     * Inter-pair (a,c)/(b,d) pairing, doubly excited: n_a=n_d=0, n_b=n_c=2
+     * From Filatov 2017 Appendix A, Eq. A8
+     */
+    [[nodiscard]] double compute_energy_DES2(const std::vector<double>& E_micro) const;
+
 private:
     std::array<GVBPair, 2> pairs_;       ///< Two GVB pairs: (a,d) and (b,c)
     double w_pps_;
     std::vector<Microstate> microstates_;
 
+    // OSS1 FONs: n'_a and n'_d for (a,d) pair; (b,c) fixed at (1,1)
+    double oss1_fon_a_{2.0};  ///< n'_a for OSS1 (start at closed-shell limit)
+    double oss1_fon_d_{0.0};  ///< n'_d for OSS1 (= 2 - n'_a)
+
+    // OSS2 FONs: (a,d) fixed at (1,1); n'_b and n'_c for (b,c) pair
+    double oss2_fon_b_{2.0};  ///< n'_b for OSS2 (start at closed-shell limit)
+    double oss2_fon_c_{0.0};  ///< n'_c for OSS2 (= 2 - n'_b)
+
+    // OSS3 FONs: (a,c) fixed at (1,1); m_b and m_d for INTER-PAIR (b,d)
+    double oss3_fon_b_{2.0};  ///< m_b for OSS3 (start at closed-shell limit)
+    double oss3_fon_d_{0.0};  ///< m_d for OSS3 (= 2 - m_b)
+
+    // OSS4 FONs: (b,d) fixed at (1,1); m_a and m_c for INTER-PAIR (a,c)
+    double oss4_fon_a_{2.0};  ///< m_a for OSS4 (start at closed-shell limit)
+    double oss4_fon_c_{0.0};  ///< m_c for OSS4 (= 2 - m_a)
+
     void init_microstates();
+
+    // ========================================================================
+    // SA-REKS(4,4) Configuration Weight Computation
+    // ========================================================================
+
+    /**
+     * @brief Compute PPS (Perfectly Paired Singlet) weights
+     * Uses current FONs (n_a, n_b, n_c, n_d)
+     */
+    void compute_weights_PPS(std::vector<double>& C_L) const;
+
+    /**
+     * @brief Compute OSS1 weights (single excitation in (b,c) pair)
+     * Uses n_a, n_d from pair (a,d); fixes n_b=n_c=1 for pair (b,c)
+     * From Filatov 2017 Appendix A, Eq. A1
+     */
+    void compute_weights_OSS1(std::vector<double>& C_L) const;
+
+    /**
+     * @brief Compute OSS2 weights (single excitation in (a,d) pair)
+     * Uses n_b, n_c from pair (b,c); fixes n_a=n_d=1 for pair (a,d)
+     * From Filatov 2017 Appendix A, Eq. A2
+     */
+    void compute_weights_OSS2(std::vector<double>& C_L) const;
+
+    /**
+     * @brief Compute DOSS (Double Open-Shell Singlet) weights
+     * Both pairs in OSS configuration: n'_a=n'_d=n'_b=n'_c=1 (fixed)
+     * From Filatov 2017 Appendix A, Eq. A5
+     * Uses microstates L=8-11 (b,c coupling) and L=16-17 (Ms=±1)
+     */
+    void compute_weights_DOSS(std::vector<double>& C_L) const;
+
+    /**
+     * @brief Compute DSPS (Double Single-Pair Singlet) weights
+     * Both pairs in DSPS configuration: n'_a=n'_d=n'_b=n'_c=1 (fixed)
+     * From Filatov 2017 Appendix A, Eq. A6
+     * Uses microstates L=8-11 (b,c coupling) and L=18-19 (Ms=±2)
+     */
+    void compute_weights_DSPS(std::vector<double>& C_L) const;
+
+    /**
+     * @brief Compute OSS3 weights (INTER-PAIR: (a,c) OSS, (b,d) GVB)
+     * (a,c) OSS pair (fixed n_a=n_c=1), (b,d) GVB pair with m_b+m_d=2
+     * Uses microstates L=0-3, L=20-27
+     * From Filatov 2017 Appendix A, Eq. A3
+     */
+    void compute_weights_OSS3(std::vector<double>& C_L) const;
+
+    /**
+     * @brief Compute OSS4 weights (INTER-PAIR: (b,d) OSS, (a,c) GVB)
+     * (b,d) OSS pair (fixed n_b=n_d=1), (a,c) GVB pair with m_a+m_c=2
+     * Uses microstates L=0-3, L=20-27
+     * From Filatov 2017 Appendix A, Eq. A4
+     */
+    void compute_weights_OSS4(std::vector<double>& C_L) const;
+
+    /**
+     * @brief Compute DES1 (Doubly Excited Singlet type 1) weights
+     * Standard (a,d)/(b,c) pairing with doubly excited character
+     * Fixed FONs: n_a=n_b=0, n_c=n_d=2 (opposite of ground state)
+     * From Filatov 2017 Appendix A, Eq. A7
+     */
+    void compute_weights_DES1(std::vector<double>& C_L) const;
+
+    /**
+     * @brief Compute DES2 (Doubly Excited Singlet type 2) weights
+     * Inter-pair (a,c)/(b,d) pairing with doubly excited character
+     * Fixed FONs: n_a=n_d=0, n_b=n_c=2
+     * From Filatov 2017 Appendix A, Eq. A8
+     */
+    void compute_weights_DES2(std::vector<double>& C_L) const;
+
+    /**
+     * @brief Compute PPS weight derivatives
+     */
+    void compute_weight_derivs_PPS(
+        std::vector<double>& dC_dfon,
+        std::vector<double>& d2C_dfon2,
+        int pair_idx) const;
+
+    /**
+     * @brief Compute OSS1 weight derivatives (only w.r.t. n_a)
+     */
+    void compute_weight_derivs_OSS1(
+        std::vector<double>& dC_dfon,
+        std::vector<double>& d2C_dfon2,
+        int pair_idx) const;
+
+    /**
+     * @brief Compute OSS2 weight derivatives (only w.r.t. n_b)
+     */
+    void compute_weight_derivs_OSS2(
+        std::vector<double>& dC_dfon,
+        std::vector<double>& d2C_dfon2,
+        int pair_idx) const;
+
+    // ========================================================================
+    // Separate Configuration Energy and Gradient Functions (override base class)
+    // For 3SA-REKS, each configuration optimizes its own FONs independently
+    // ========================================================================
+
+    /**
+     * @brief Compute PPS configuration energy
+     * E_PPS = sum_L FACT_L * C_PPS_L * E_micro_L
+     */
+    [[nodiscard]] double compute_energy_PPS(const std::vector<double>& E_micro) const override;
+
+    /**
+     * @brief Compute OSS1 configuration energy
+     * E_OSS1 = sum_L FACT_L * C_OSS1_L * E_micro_L
+     */
+    [[nodiscard]] double compute_energy_OSS1(const std::vector<double>& E_micro) const override;
+
+    /**
+     * @brief Compute OSS2 configuration energy
+     * E_OSS2 = sum_L FACT_L * C_OSS2_L * E_micro_L
+     */
+    [[nodiscard]] double compute_energy_OSS2(const std::vector<double>& E_micro) const override;
+
+    /**
+     * @brief Compute gradient of PPS energy w.r.t. (n_a, n_b)
+     * @return 2-element vector [dE_PPS/dn_a, dE_PPS/dn_b]
+     */
+    [[nodiscard]] std::vector<double> compute_gradient_PPS(const std::vector<double>& E_micro) const override;
+
+    /**
+     * @brief Compute gradient of OSS1 energy w.r.t. n'_a
+     * @return scalar dE_OSS1/dn'_a
+     */
+    [[nodiscard]] double compute_gradient_OSS1(const std::vector<double>& E_micro) const override;
+
+    /**
+     * @brief Compute gradient of OSS2 energy w.r.t. n'_b
+     * @return scalar dE_OSS2/dn'_b
+     */
+    [[nodiscard]] double compute_gradient_OSS2(const std::vector<double>& E_micro) const override;
+
+    /**
+     * @brief Compute hessian of PPS energy w.r.t. (n_a, n_b)
+     * @return 4-element vector [H_aa, H_ab, H_ba, H_bb]
+     */
+    [[nodiscard]] std::vector<double> compute_hessian_PPS(const std::vector<double>& E_micro) const override;
+
+    /**
+     * @brief Compute hessian of OSS1 energy w.r.t. n'_a
+     * @return scalar d²E_OSS1/d(n'_a)²
+     */
+    [[nodiscard]] double compute_hessian_OSS1(const std::vector<double>& E_micro) const override;
+
+    /**
+     * @brief Compute hessian of OSS2 energy w.r.t. n'_b
+     * @return scalar d²E_OSS2/d(n'_b)²
+     */
+    [[nodiscard]] double compute_hessian_OSS2(const std::vector<double>& E_micro) const override;
+
+    /**
+     * @brief Compute OSS1 weight derivatives w.r.t. n'_a
+     * Used internally by compute_gradient_OSS1 and compute_hessian_OSS1
+     */
+    void compute_weight_derivs_OSS1_oss_fon(
+        std::vector<double>& dC_dfon,
+        std::vector<double>& d2C_dfon2) const;
+
+    /**
+     * @brief Compute OSS2 weight derivatives w.r.t. n'_b
+     * Used internally by compute_gradient_OSS2 and compute_hessian_OSS2
+     */
+    void compute_weight_derivs_OSS2_oss_fon(
+        std::vector<double>& dC_dfon,
+        std::vector<double>& d2C_dfon2) const;
+
+    /**
+     * @brief Compute OSS3 weight derivatives w.r.t. m_b
+     * Used internally by compute_gradient_OSS3 and compute_hessian_OSS3
+     */
+    void compute_weight_derivs_OSS3_oss_fon(
+        std::vector<double>& dC_dfon,
+        std::vector<double>& d2C_dfon2) const;
+
+    /**
+     * @brief Compute OSS4 weight derivatives w.r.t. m_a
+     * Used internally by compute_gradient_OSS4 and compute_hessian_OSS4
+     */
+    void compute_weight_derivs_OSS4_oss_fon(
+        std::vector<double>& dC_dfon,
+        std::vector<double>& d2C_dfon2) const;
 };
 
 }  // namespace reks

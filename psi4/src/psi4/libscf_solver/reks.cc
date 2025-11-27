@@ -81,15 +81,31 @@ void REKS::reks_common_init() {
     // Use existing DEBUG option for REKS debug output
     reks_debug_ = options_.get_int("DEBUG");
 
-    // Compute number of core (doubly occupied) orbitals
-    // For REKS(2,2): Ncore = nalpha - 1 (HOMO becomes active)
-    Ncore_ = nalpha_ - 1;
+    // Get REKS active space type from options (default: 2,2)
+    // REKS_PAIRS = 1 -> REKS(2,2), REKS_PAIRS = 2 -> REKS(4,4)
+    int n_pairs = options_.get_int("REKS_PAIRS");
+    if (n_pairs < 1) n_pairs = 1;  // Default to REKS(2,2)
 
-    // Create REKS(2,2) active space with default SA weights
-    // Initial FONs: n_r=2.0, n_s=0.0 (closed-shell limit)
-    double w_PPS = 0.5;
-    double w_OSS = 0.5;
-    active_space_ = reks::REKSActiveSpace::create_2_2(w_PPS, w_OSS);
+    // Compute number of core (doubly occupied) orbitals
+    // For REKS(N,M): Ncore = nalpha - n_pairs
+    Ncore_ = nalpha_ - n_pairs;
+
+    // Create active space based on number of pairs
+    double w_PPS = 0.5;  // Default SA weight for PPS
+    double w_OSS = 0.5;  // Default SA weight for OSS
+
+    if (n_pairs == 1) {
+        // REKS(2,2): 2 electrons in 2 orbitals
+        active_space_ = reks::REKSActiveSpace::create_2_2(w_PPS, w_OSS);
+    } else if (n_pairs == 2) {
+        // REKS(4,4): 4 electrons in 4 orbitals
+        // For REKS(4,4) with 3-state averaging: w_PPS = 1/3
+        w_PPS = 1.0 / 3.0;
+        active_space_ = reks::REKSActiveSpace::create_4_4(w_PPS);
+    } else {
+        throw PSIEXCEPTION("REKS: Unsupported REKS_PAIRS value: " + std::to_string(n_pairs)
+                          + ". Supported values: 1 (REKS(2,2)), 2 (REKS(4,4))");
+    }
 
     // Get active orbital MO indices from active_space_ (generalized)
     active_mo_indices_ = active_space_->get_active_mo_indices(Ncore_);
@@ -119,9 +135,14 @@ void REKS::reks_common_init() {
         }
         outfile->Printf("\n");
         outfile->Printf("  ------------------------------------------------------------\n");
-        outfile->Printf("  Initial FON: n_r = %.6f, n_s = %.6f\n", get_n_r(), get_n_s());
-        outfile->Printf("  SA weights:  w_PPS = %.4f, w_OSS = %.4f\n",
-                        active_space_->w_PPS(), active_space_->w_OSS());
+        if (n_pairs == 1) {
+            outfile->Printf("  Initial FON: n_r = %.6f, n_s = %.6f\n", get_n_r(), get_n_s());
+        } else {
+            outfile->Printf("  Initial FONs: n_a=%.4f, n_d=%.4f, n_b=%.4f, n_c=%.4f\n",
+                            active_space_->pair(0).fon_p, active_space_->pair(0).fon_q,
+                            active_space_->pair(1).fon_p, active_space_->pair(1).fon_q);
+        }
+        outfile->Printf("  SA weight w_PPS = %.4f\n", active_space_->w_PPS());
         outfile->Printf("  Filatov delta parameter: %.4f\n", reks::DELTA);
         outfile->Printf("  ------------------------------------------------------------\n");
         outfile->Printf("  f(0.5) = %.8f  (should be 1.0)\n", reks::f_interp(0.5));
@@ -614,11 +635,12 @@ void REKS::compute_microstate_energies() {
 // ---------------------------------------------------------------------------
 
 void REKS::rex_solver() {
-    // Optimize n_r to minimize E_SA = sum_L C_L(n_r) * E_L
-    // Constraint: n_s = 2 - n_r
+    // Optimize FON variables to minimize E_SA = sum_L FACT_L * C_L(FON) * E_L
     //
-    // Uses multi-start optimization to avoid getting stuck at boundaries.
-    // At n_r=2 (n_s=0), the gradient df/dn_r = 0, which can trap the optimizer.
+    // For REKS(2,2): 1 variable (n_r), constraint n_s = 2 - n_r
+    // For REKS(4,4): 2 variables (n_a, n_b), constraints n_d = 2 - n_a, n_c = 2 - n_b
+    //
+    // Uses Newton-Raphson optimization with gradient and Hessian from active_space_.
 
     // Skip if E_micro_ not yet computed (first SCF iteration with SAD guess)
     if (std::abs(E_micro_[0]) < reks::constants::ENERGY_THRESHOLD &&
@@ -628,6 +650,25 @@ void REKS::rex_solver() {
         }
         return;
     }
+
+    int n_pairs = active_space_->n_pairs();
+
+    if (n_pairs == 1) {
+        // REKS(2,2): single FON variable
+        rex_solver_22();
+    } else if (n_pairs == 2) {
+        // REKS(4,4): two FON variables
+        rex_solver_44();
+    } else {
+        throw PSIEXCEPTION("RexSolver: unsupported number of GVB pairs: " + std::to_string(n_pairs));
+    }
+}
+
+void REKS::rex_solver_22() {
+    // REKS(2,2) FON optimization: single variable n_r
+    //
+    // Uses multi-start optimization to avoid getting stuck at boundaries.
+    // At n_r=2 (n_s=0), the gradient df/dn_r = 0, which can trap the optimizer.
 
     const int max_iter = reks::constants::FON_MAX_ITER;
     const double tol = reks::constants::FON_TOL;
@@ -662,7 +703,7 @@ void REKS::rex_solver() {
     double best_E_SA = compute_E_SA(n_r_current);
 
     if (reks_debug_ >= 1) {
-        outfile->Printf("\n  === RexSolver: FON Optimization ===\n");
+        outfile->Printf("\n  === RexSolver(2,2): FON Optimization ===\n");
         outfile->Printf("  E_micro: [0]=%.8f, [1]=%.8f, [2]=%.8f, [3]=%.8f\n",
                        E_micro_[0], E_micro_[1], E_micro_[2], E_micro_[3]);
     }
@@ -685,11 +726,8 @@ void REKS::rex_solver() {
             double d2f_dx2 = reks::d2f_interp(x);
 
             // Chain rule: df/dn_r = (df/dx) * (dx/dn_r) = (df/dx) * (n_s - n_r)
-            // since x = n_r*n_s = n_r*(2-n_r) and dx/dn_r = 2 - 2*n_r = n_s - n_r
-            double dx_dnr = n_s - n_r;  // = 2 - 2*n_r
+            double dx_dnr = n_s - n_r;
             double df_dnr = df_dx * dx_dnr;
-            // d²f/dn_r² = d²f/dx² * (dx/dn_r)² + df/dx * d²x/dn_r²
-            //           = d²f/dx² * (n_s - n_r)² + df/dx * (-2)
             double d2f_dnr2 = d2f_dx2 * dx_dnr * dx_dnr - 2.0 * df_dx;
 
             // Compute C_L at current n_r
@@ -701,16 +739,12 @@ void REKS::rex_solver() {
             double E_SA_current = C0 * E_micro_[0] + C1 * E_micro_[1]
                                 + 2.0 * C2 * E_micro_[2] + 2.0 * C3 * E_micro_[3];
 
-            // Energy gradient dE_SA/dn_r
-            // dC0/dn_r = w_PPS/2, dC1/dn_r = -w_PPS/2
-            // dC2/dn_r = -0.5*w_PPS*df/dn_r, dC3/dn_r = 0.5*w_PPS*df/dn_r
+            // Energy gradient and Hessian
             double dE_dnr = (w_PPS / 2.0) * (E_micro_[0] - E_micro_[1])
                           + w_PPS * df_dnr * (E_micro_[3] - E_micro_[2]);
-
-            // Energy Hessian
             double d2E_dnr2 = w_PPS * d2f_dnr2 * (E_micro_[3] - E_micro_[2]);
 
-            // Newton-Raphson step (or gradient descent if Hessian is near-singular)
+            // Newton-Raphson step
             double delta;
             if (std::abs(d2E_dnr2) < reks::constants::HESSIAN_THRESHOLD) {
                 delta = -std::copysign(max_step, dE_dnr);
@@ -761,6 +795,282 @@ void REKS::rex_solver() {
     }
 }
 
+void REKS::rex_solver_44() {
+    // REKS(4,4) FON optimization: two variables (n_a, n_b)
+    //
+    // Uses 2D Newton-Raphson with gradient [dE/dn_a, dE/dn_b]
+    // and 2x2 Hessian [d²E/dn_a², d²E/dn_a dn_b; d²E/dn_b dn_a, d²E/dn_b²]
+    //
+    // Constraints: n_d = 2 - n_a, n_c = 2 - n_b
+
+    const int max_iter = reks::constants::FON_MAX_ITER;
+    const double tol = reks::constants::FON_TOL;
+    const double max_step = reks::constants::FON_MAX_STEP;
+
+    // Get current FONs
+    double n_a = active_space_->pair(0).fon_p;
+    double n_b = active_space_->pair(1).fon_p;
+
+    if (reks_debug_ >= 1) {
+        outfile->Printf("\n  === RexSolver(4,4): 2D FON Optimization ===\n");
+        outfile->Printf("  Initial FONs: n_a=%.6f, n_b=%.6f\n", n_a, n_b);
+        outfile->Printf("  E_micro: ");
+        for (int L = 0; L < 12 && L < static_cast<int>(E_micro_.size()); ++L) {
+            outfile->Printf("[%d]=%.8f ", L, E_micro_[L]);
+        }
+        outfile->Printf("\n");
+    }
+
+    // Lambda to compute E_SA at current FON values
+    auto compute_E_SA = [&]() -> double {
+        std::vector<double> C_L;
+        active_space_->compute_weights(C_L);
+        double E_SA = 0.0;
+        int n_micro = active_space_->n_microstates();
+        for (int L = 0; L < n_micro; ++L) {
+            double fact = active_space_->get_symmetry_factor(L);
+            E_SA += fact * C_L[L] * E_micro_[L];
+        }
+        return E_SA;
+    };
+
+    for (int iter = 0; iter < max_iter; ++iter) {
+        // Compute gradient [dE/dn_a, dE/dn_b]
+        std::vector<double> grad = active_space_->compute_energy_gradient(E_micro_, C_L_);
+
+        // --- Boundary-aware convergence check ---
+        // At a boundary, if the gradient points outward, we're at the constrained optimum.
+        // Effective gradient considers only interior-pointing components.
+        double eff_grad_na = grad[0];
+        double eff_grad_nb = grad[1];
+
+        // If at upper bound (n=2) and gradient wants to increase (negative gradient), set to 0
+        if (n_a >= 2.0 - 1e-10 && grad[0] < 0.0) eff_grad_na = 0.0;
+        if (n_b >= 2.0 - 1e-10 && grad[1] < 0.0) eff_grad_nb = 0.0;
+        // If at lower bound (n=0) and gradient wants to decrease (positive gradient), set to 0
+        if (n_a <= 1e-10 && grad[0] > 0.0) eff_grad_na = 0.0;
+        if (n_b <= 1e-10 && grad[1] > 0.0) eff_grad_nb = 0.0;
+
+        // Check convergence using effective gradient
+        double eff_grad_norm = std::sqrt(eff_grad_na*eff_grad_na + eff_grad_nb*eff_grad_nb);
+        if (eff_grad_norm < tol * 10.0) {
+            if (reks_debug_ >= 2) {
+                double E_SA = compute_E_SA();
+                outfile->Printf("    iter %2d: n_a=%.6f n_b=%.6f E=%.10f |eff_grad|=%.2e CONVERGED (boundary)\n",
+                               iter, n_a, n_b, E_SA, eff_grad_norm);
+            }
+            break;
+        }
+
+        // Compute 2x2 Hessian [H_aa, H_ab; H_ba, H_bb]
+        std::vector<double> hess = active_space_->compute_energy_hessian(E_micro_, C_L_);
+
+        double H_aa = hess[0];
+        double H_ab = hess[1];
+        double H_bb = hess[3];
+
+        // Compute determinant for 2x2 matrix inversion
+        double det = H_aa * H_bb - H_ab * H_ab;
+
+        double delta_na, delta_nb;
+
+        if (std::abs(det) < reks::constants::HESSIAN_THRESHOLD || det < 0.0) {
+            // Near-singular or indefinite Hessian: use gradient descent with smaller step
+            double small_step = max_step * 0.5;
+            delta_na = -std::copysign(small_step, eff_grad_na);
+            delta_nb = -std::copysign(small_step, eff_grad_nb);
+            // Use effective gradient to respect boundaries
+            if (std::abs(eff_grad_na) < 1e-10) delta_na = 0.0;
+            if (std::abs(eff_grad_nb) < 1e-10) delta_nb = 0.0;
+        } else {
+            // Newton-Raphson: delta = -H^{-1} * grad
+            // For 2x2: [a b; b d]^{-1} = (1/det) * [d -b; -b a]
+            delta_na = -(H_bb * grad[0] - H_ab * grad[1]) / det;
+            delta_nb = -(-H_ab * grad[0] + H_aa * grad[1]) / det;
+        }
+
+        // Damping: limit step size
+        if (std::abs(delta_na) > max_step) {
+            delta_na = std::copysign(max_step, delta_na);
+        }
+        if (std::abs(delta_nb) > max_step) {
+            delta_nb = std::copysign(max_step, delta_nb);
+        }
+
+        // Update FONs with bounds [0.0, 2.0]
+        double n_a_new = std::clamp(n_a + delta_na, 0.0, 2.0);
+        double n_b_new = std::clamp(n_b + delta_nb, 0.0, 2.0);
+
+        // Actual deltas after bounds enforcement
+        delta_na = n_a_new - n_a;
+        delta_nb = n_b_new - n_b;
+
+        n_a = n_a_new;
+        n_b = n_b_new;
+
+        // Update active space FONs
+        active_space_->set_pair_fon(0, n_a);
+        active_space_->set_pair_fon(1, n_b);
+
+        // Recompute weights
+        compute_weighting_factors();
+
+        if (reks_debug_ >= 2) {
+            double E_SA = compute_E_SA();
+            outfile->Printf("    iter %2d: n_a=%.6f n_b=%.6f E=%.10f |grad|=%.2e |eff_grad|=%.2e det=%.2e\n",
+                           iter, n_a, n_b, E_SA,
+                           std::sqrt(grad[0]*grad[0] + grad[1]*grad[1]), eff_grad_norm, det);
+        }
+
+        // Convergence check on actual step
+        if (std::abs(delta_na) < tol && std::abs(delta_nb) < tol) {
+            break;
+        }
+    }
+
+    // =========================================================================
+    // OSS1 FON Optimization: Optimize n'_a (oss1_fon_a_) for OSS1 configuration
+    // =========================================================================
+    double oss1_fon = active_space_->get_oss1_fon_a();
+
+    if (reks_debug_ >= 1) {
+        outfile->Printf("\n  === RexSolver(4,4): OSS1 FON Optimization ===\n");
+        outfile->Printf("  Initial n'_a=%.6f\n", oss1_fon);
+    }
+
+    for (int iter = 0; iter < max_iter; ++iter) {
+        double grad = active_space_->compute_gradient_OSS1(E_micro_);
+        double hess = active_space_->compute_hessian_OSS1(E_micro_);
+
+        // Boundary-aware convergence check
+        double eff_grad = grad;
+        if (oss1_fon >= 2.0 - 1e-10 && grad < 0.0) eff_grad = 0.0;
+        if (oss1_fon <= 1e-10 && grad > 0.0) eff_grad = 0.0;
+
+        if (std::abs(eff_grad) < tol * 10.0) {
+            if (reks_debug_ >= 2) {
+                outfile->Printf("    OSS1 iter %2d: n'_a=%.6f |eff_grad|=%.2e CONVERGED\n",
+                               iter, oss1_fon, std::abs(eff_grad));
+            }
+            break;
+        }
+
+        double delta;
+        if (std::abs(hess) < reks::constants::HESSIAN_THRESHOLD || hess > 0.0) {
+            // Near-singular or positive (wrong curvature) Hessian: use gradient descent
+            delta = -std::copysign(max_step * 0.5, eff_grad);
+            if (std::abs(eff_grad) < 1e-10) delta = 0.0;
+        } else {
+            // Newton-Raphson: delta = -grad/hess
+            delta = -grad / hess;
+        }
+
+        // Damping
+        if (std::abs(delta) > max_step) {
+            delta = std::copysign(max_step, delta);
+        }
+
+        double oss1_fon_new = std::clamp(oss1_fon + delta, 0.0, 2.0);
+        delta = oss1_fon_new - oss1_fon;
+        oss1_fon = oss1_fon_new;
+
+        active_space_->set_oss1_fon_a(oss1_fon);
+
+        if (reks_debug_ >= 2) {
+            double E_OSS1 = active_space_->compute_energy_OSS1(E_micro_);
+            outfile->Printf("    OSS1 iter %2d: n'_a=%.6f E_OSS1=%.10f |grad|=%.2e hess=%.2e\n",
+                           iter, oss1_fon, E_OSS1, std::abs(grad), hess);
+        }
+
+        if (std::abs(delta) < tol) break;
+    }
+
+    // =========================================================================
+    // OSS2 FON Optimization: Optimize n'_b (oss2_fon_b_) for OSS2 configuration
+    // =========================================================================
+    double oss2_fon = active_space_->get_oss2_fon_b();
+
+    if (reks_debug_ >= 1) {
+        outfile->Printf("\n  === RexSolver(4,4): OSS2 FON Optimization ===\n");
+        outfile->Printf("  Initial n'_b=%.6f\n", oss2_fon);
+    }
+
+    for (int iter = 0; iter < max_iter; ++iter) {
+        double grad = active_space_->compute_gradient_OSS2(E_micro_);
+        double hess = active_space_->compute_hessian_OSS2(E_micro_);
+
+        // Boundary-aware convergence check
+        double eff_grad = grad;
+        if (oss2_fon >= 2.0 - 1e-10 && grad < 0.0) eff_grad = 0.0;
+        if (oss2_fon <= 1e-10 && grad > 0.0) eff_grad = 0.0;
+
+        if (std::abs(eff_grad) < tol * 10.0) {
+            if (reks_debug_ >= 2) {
+                outfile->Printf("    OSS2 iter %2d: n'_b=%.6f |eff_grad|=%.2e CONVERGED\n",
+                               iter, oss2_fon, std::abs(eff_grad));
+            }
+            break;
+        }
+
+        double delta;
+        if (std::abs(hess) < reks::constants::HESSIAN_THRESHOLD || hess > 0.0) {
+            // Near-singular or positive (wrong curvature) Hessian: use gradient descent
+            delta = -std::copysign(max_step * 0.5, eff_grad);
+            if (std::abs(eff_grad) < 1e-10) delta = 0.0;
+        } else {
+            // Newton-Raphson: delta = -grad/hess
+            delta = -grad / hess;
+        }
+
+        // Damping
+        if (std::abs(delta) > max_step) {
+            delta = std::copysign(max_step, delta);
+        }
+
+        double oss2_fon_new = std::clamp(oss2_fon + delta, 0.0, 2.0);
+        delta = oss2_fon_new - oss2_fon;
+        oss2_fon = oss2_fon_new;
+
+        active_space_->set_oss2_fon_b(oss2_fon);
+
+        if (reks_debug_ >= 2) {
+            double E_OSS2 = active_space_->compute_energy_OSS2(E_micro_);
+            outfile->Printf("    OSS2 iter %2d: n'_b=%.6f E_OSS2=%.10f |grad|=%.2e hess=%.2e\n",
+                           iter, oss2_fon, E_OSS2, std::abs(grad), hess);
+        }
+
+        if (std::abs(delta) < tol) break;
+    }
+
+    // =========================================================================
+    // Recompute combined SA weights after all FON optimizations
+    // =========================================================================
+    compute_weighting_factors();
+
+    if (reks_debug_ >= 1) {
+        double E_PPS = active_space_->compute_energy_PPS(E_micro_);
+        double E_OSS1 = active_space_->compute_energy_OSS1(E_micro_);
+        double E_OSS2 = active_space_->compute_energy_OSS2(E_micro_);
+        double w_pps = active_space_->w_PPS();
+        double w_oss = active_space_->w_OSS();
+        double E_SA = w_pps * E_PPS + w_oss * E_OSS1 + w_oss * E_OSS2;
+
+        double n_d = active_space_->pair(0).fon_q;
+        double n_c = active_space_->pair(1).fon_q;
+        outfile->Printf("\n  === 3SA-REKS(4,4) Final Results ===\n");
+        outfile->Printf("  PPS FONs:  n_a=%12.8f, n_d=%12.8f, n_b=%12.8f, n_c=%12.8f\n",
+                        n_a, n_d, n_b, n_c);
+        outfile->Printf("  OSS1 FON:  n'_a=%12.8f (n'_d=%12.8f)\n",
+                        oss1_fon, 2.0 - oss1_fon);
+        outfile->Printf("  OSS2 FON:  n'_b=%12.8f (n'_c=%12.8f)\n",
+                        oss2_fon, 2.0 - oss2_fon);
+        outfile->Printf("  E_PPS  = %20.12f\n", E_PPS);
+        outfile->Printf("  E_OSS1 = %20.12f\n", E_OSS1);
+        outfile->Printf("  E_OSS2 = %20.12f\n", E_OSS2);
+        outfile->Printf("  E_SA   = %20.12f  (w_PPS=%.4f, w_OSS=%.4f)\n", E_SA, w_pps, w_oss);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // FockMicro2Macro - Coupling Operator Assembly (Filatov 2024, Eq.11-15)
 // ---------------------------------------------------------------------------
@@ -771,47 +1081,54 @@ void REKS::fock_micro_to_macro(int L, double Cl, double** Fa, double** Fb) {
     //
     // Block structure:
     //   - Core-core, virtual-virtual, core-virtual: F_c = 0.5*C_L*(F_alpha + F_beta)
-    //   - Active r diagonal: weighted by n^σ_r / f_r
-    //   - Active s diagonal: weighted by n^σ_s / f_s
-    //   - Core-active coupling: weighted by (1-n^σ_q) / (1-f_q)
-    //   - Active-active (r,s): sign(f_r - f_s) weighted
+    //   - Active diagonal: weighted by n^σ_i / f_i
+    //   - Core-active coupling: weighted by (1-n^σ_i) / (1-f_i)
+    //   - Active-active coupling (i,j): sign(f_i - f_j) weighted
     //
-    // NOTE: Currently specialized for REKS(2,2). Generalization for REKS(4,4)+
-    // requires extending to multiple active orbital pairs.
+    // Generalized for REKS(N,M) with N/2 active orbitals.
+
+    int n_active = active_space_->n_orbitals();
+
+    if (n_active == 2) {
+        fock_micro_to_macro_22(L, Cl, Fa, Fb);
+    } else if (n_active == 4) {
+        fock_micro_to_macro_44(L, Cl, Fa, Fb);
+    } else {
+        throw PSIEXCEPTION("fock_micro_to_macro: unsupported number of active orbitals: "
+                          + std::to_string(n_active));
+    }
+}
+
+void REKS::fock_micro_to_macro_22(int L, double Cl, double** Fa, double** Fb) {
+    // REKS(2,2) version: 2 active orbitals (r, s)
+    //
+    // Original specialized implementation for maximum efficiency.
 
     double** Freks = F_reks_->pointer(0);
 
-    // Local variables for active orbital indices (from generalized structure)
-    // For REKS(2,2): active_r = active_mo_indices_[0], active_s = active_mo_indices_[1]
     int active_r = active_mo_indices_[0];
     int active_s = active_mo_indices_[1];
 
-    // Get microstate occupations from active_space_
-    int nra = active_space_->alpha_occ(L, 0);  // n_r^alpha
-    int nrb = active_space_->beta_occ(L, 0);   // n_r^beta
-    int nsa = active_space_->alpha_occ(L, 1);  // n_s^alpha
-    int nsb = active_space_->beta_occ(L, 1);   // n_s^beta
+    // Get microstate occupations
+    int nra = active_space_->alpha_occ(L, 0);
+    int nrb = active_space_->beta_occ(L, 0);
+    int nsa = active_space_->alpha_occ(L, 1);
+    int nsb = active_space_->beta_occ(L, 1);
 
-    // Get current FONs and SA weights from active_space_
-    double n_r = get_n_r();
-    double n_s = get_n_s();
-    double w_PPS = active_space_->w_PPS();
-    double w_OSS = active_space_->w_OSS();
+    // Effective FONs
+    double fr = active_space_->get_effective_fon(0);
+    double fs = active_space_->get_effective_fon(1);
 
-    // Use generalized effective FON (delegates to active_space_)
-    double fr = active_space_->get_effective_fon(0);  // f_r
-    double fs = active_space_->get_effective_fon(1);  // f_s
+    double Wc = 0.5 * Cl;
 
-    double Wc = 0.5 * Cl;  // Core block weight
-
-    // Core-core block (i,j < Ncore)
+    // Core-core block
     for (int i = 0; i < Ncore_; ++i) {
         for (int j = i; j < Ncore_; ++j) {
             Freks[i][j] += Wc * (Fa[i][j] + Fb[i][j]);
         }
     }
 
-    // Virtual-virtual block (i,j > active_s)
+    // Virtual-virtual block
     for (int i = active_s + 1; i < nsopi_[0]; ++i) {
         for (int j = i; j < nsopi_[0]; ++j) {
             Freks[i][j] += Wc * (Fa[i][j] + Fb[i][j]);
@@ -825,32 +1142,20 @@ void REKS::fock_micro_to_macro(int L, double Cl, double** Fa, double** Fb) {
         }
     }
 
-    // Active orbital r diagonal: weight = 0.5 * C_L * n^sigma_r / f_r
+    // Active diagonal
     double Wr_a = (fr > reks::constants::FON_THRESHOLD) ? 0.5 * Cl * nra / fr : 0.0;
     double Wr_b = (fr > reks::constants::FON_THRESHOLD) ? 0.5 * Cl * nrb / fr : 0.0;
     Freks[active_r][active_r] += Wr_a * Fa[active_r][active_r] + Wr_b * Fb[active_r][active_r];
 
-    // Active orbital s diagonal: weight = 0.5 * C_L * n^sigma_s / f_s
     double Ws_a = (fs > reks::constants::FON_THRESHOLD) ? 0.5 * Cl * nsa / fs : 0.0;
     double Ws_b = (fs > reks::constants::FON_THRESHOLD) ? 0.5 * Cl * nsb / fs : 0.0;
-    double contrib_ss = Ws_a * Fa[active_s][active_s] + Ws_b * Fb[active_s][active_s];
-    Freks[active_s][active_s] += contrib_ss;
+    Freks[active_s][active_s] += Ws_a * Fa[active_s][active_s] + Ws_b * Fb[active_s][active_s];
 
-    if (reks_debug_ >= 2) {
-        outfile->Printf("  Fock coupling L=%d: Cl=%.6f fr=%.6f fs=%.6f nsa=%d nsb=%d\n",
-                       L, Cl, fr, fs, nsa, nsb);
-        outfile->Printf("    Fa_MO(s,s)=%.6f Fb_MO(s,s)=%.6f Ws_a=%.6f Ws_b=%.6f\n",
-                       Fa[active_s][active_s], Fb[active_s][active_s], Ws_a, Ws_b);
-        outfile->Printf("    contrib_ss=%.6f cumul_F_MO(s,s)=%.6f\n",
-                       contrib_ss, Freks[active_s][active_s]);
-    }
-
-    // Core-active coupling (core to r): weight = 0.5 * C_L * (1 - n^sigma_r) / (1 - f_r)
+    // Core-active coupling
     double omfr = 1.0 - fr;
     double Wcr_a = (omfr > reks::constants::FON_THRESHOLD) ? 0.5 * Cl * (1 - nra) / omfr : 0.0;
     double Wcr_b = (omfr > reks::constants::FON_THRESHOLD) ? 0.5 * Cl * (1 - nrb) / omfr : 0.0;
 
-    // Core-active coupling (core to s): weight = 0.5 * C_L * (1 - n^sigma_s) / (1 - f_s)
     double omfs = 1.0 - fs;
     double Wcs_a = (omfs > reks::constants::FON_THRESHOLD) ? 0.5 * Cl * (1 - nsa) / omfs : 0.0;
     double Wcs_b = (omfs > reks::constants::FON_THRESHOLD) ? 0.5 * Cl * (1 - nsb) / omfs : 0.0;
@@ -867,16 +1172,147 @@ void REKS::fock_micro_to_macro(int L, double Cl, double** Fa, double** Fb) {
     }
 
     // Active-active coupling (r,s)
-    // Weight: C_L * (n^sigma_r - n^sigma_s) * sign(f_r - f_s)
     int signrs = (fr > fs) ? 1 : ((fr < fs) ? -1 : 0);
     double Wrs_a = Cl * (nra - nsa) * signrs;
     double Wrs_b = Cl * (nrb - nsb) * signrs;
     Freks[active_r][active_s] += Wrs_a * Fa[active_r][active_s] + Wrs_b * Fb[active_r][active_s];
 
-    // Accumulate Lagrange multiplier for SI (state interaction)
+    // Accumulate Lagrange multiplier for SI
     Wrs_lagr_ += Cl * (nra * Fa[active_r][active_s] + nrb * Fb[active_r][active_s]);
+}
 
-    // Note: Symmetrization will be done ONCE in form_F() after all microstates are accumulated
+void REKS::fock_micro_to_macro_44(int L, double Cl, double** Fa, double** Fb) {
+    // REKS(4,4) version: 4 active orbitals (a, b, c, d)
+    //
+    // Generalized from REKS(2,2) to handle 4 active orbitals.
+    // Active orbital indices: a=0, b=1, c=2, d=3
+
+    double** Freks = F_reks_->pointer(0);
+    int n_active = 4;
+
+    // Get MO indices for all active orbitals
+    std::vector<int> act(n_active);
+    std::vector<int> n_alpha(n_active), n_beta(n_active);
+    std::vector<double> f_eff(n_active), W_diag_a(n_active), W_diag_b(n_active);
+
+    int last_active = 0;
+    for (int i = 0; i < n_active; ++i) {
+        act[i] = active_mo_indices_[i];
+        n_alpha[i] = active_space_->alpha_occ(L, i);
+        n_beta[i] = active_space_->beta_occ(L, i);
+        f_eff[i] = active_space_->get_effective_fon(i);
+
+        // Diagonal weight: 0.5 * C_L * n^sigma / f
+        W_diag_a[i] = (f_eff[i] > reks::constants::FON_THRESHOLD) ?
+                      0.5 * Cl * n_alpha[i] / f_eff[i] : 0.0;
+        W_diag_b[i] = (f_eff[i] > reks::constants::FON_THRESHOLD) ?
+                      0.5 * Cl * n_beta[i] / f_eff[i] : 0.0;
+
+        if (act[i] > last_active) last_active = act[i];
+    }
+
+    double Wc = 0.5 * Cl;  // Core block weight
+
+    // Core-core block (i,j < Ncore)
+    for (int i = 0; i < Ncore_; ++i) {
+        for (int j = i; j < Ncore_; ++j) {
+            Freks[i][j] += Wc * (Fa[i][j] + Fb[i][j]);
+        }
+    }
+
+    // Virtual-virtual block (i,j > last_active)
+    for (int i = last_active + 1; i < nsopi_[0]; ++i) {
+        for (int j = i; j < nsopi_[0]; ++j) {
+            Freks[i][j] += Wc * (Fa[i][j] + Fb[i][j]);
+        }
+    }
+
+    // Core-virtual block
+    for (int i = 0; i < Ncore_; ++i) {
+        for (int j = last_active + 1; j < nsopi_[0]; ++j) {
+            Freks[i][j] += Wc * (Fa[i][j] + Fb[i][j]);
+        }
+    }
+
+    // Active diagonal blocks
+    for (int i = 0; i < n_active; ++i) {
+        int ai = act[i];
+        Freks[ai][ai] += W_diag_a[i] * Fa[ai][ai] + W_diag_b[i] * Fb[ai][ai];
+    }
+
+    // Core-active coupling for each active orbital
+    for (int i = 0; i < n_active; ++i) {
+        int ai = act[i];
+        double omf = 1.0 - f_eff[i];
+        double Wca_a = (omf > reks::constants::FON_THRESHOLD) ?
+                       0.5 * Cl * (1 - n_alpha[i]) / omf : 0.0;
+        double Wca_b = (omf > reks::constants::FON_THRESHOLD) ?
+                       0.5 * Cl * (1 - n_beta[i]) / omf : 0.0;
+
+        for (int c = 0; c < Ncore_; ++c) {
+            Freks[c][ai] += Wca_a * Fa[c][ai] + Wca_b * Fb[c][ai];
+        }
+    }
+
+    // Active-virtual coupling for each active orbital
+    for (int i = 0; i < n_active; ++i) {
+        int ai = act[i];
+        for (int v = last_active + 1; v < nsopi_[0]; ++v) {
+            Freks[ai][v] += W_diag_a[i] * Fa[ai][v] + W_diag_b[i] * Fb[ai][v];
+        }
+    }
+
+    // Active-active coupling for all pairs (i,j) with i < j
+    for (int i = 0; i < n_active; ++i) {
+        for (int j = i + 1; j < n_active; ++j) {
+            int ai = act[i];
+            int aj = act[j];
+            int sign_ij = (f_eff[i] > f_eff[j]) ? 1 : ((f_eff[i] < f_eff[j]) ? -1 : 0);
+            double Wij_a = Cl * (n_alpha[i] - n_alpha[j]) * sign_ij;
+            double Wij_b = Cl * (n_beta[i] - n_beta[j]) * sign_ij;
+            Freks[ai][aj] += Wij_a * Fa[ai][aj] + Wij_b * Fb[ai][aj];
+        }
+    }
+
+    // Accumulate Lagrange multipliers for SI (REKS(4,4) has two coupling pairs)
+    //
+    // For REKS(4,4), there are two primary coupling pairs:
+    // - W_ad (stored in Wrs_lagr_): Lagrangian for (a,d) pair
+    // - W_bc (stored in Wbc_lagr_): Lagrangian for (b,c) pair
+    //
+    // The Lagrange multiplier is:
+    //   W_pq = sum_L C_L * (n_alpha_p * F_alpha[p][q] + n_beta_p * F_beta[p][q])
+    //
+    // where p,q are the active orbitals in the coupling pair.
+
+    // (a,d) pair: orbitals 0 and 3
+    int a_idx = act[0];  // orbital a
+    int d_idx = act[3];  // orbital d
+    Wrs_lagr_ += Cl * (n_alpha[0] * Fa[a_idx][d_idx] + n_beta[0] * Fb[a_idx][d_idx]);
+
+    // (b,c) pair: orbitals 1 and 2
+    int b_idx = act[1];  // orbital b
+    int c_idx = act[2];  // orbital c
+    Wbc_lagr_ += Cl * (n_alpha[1] * Fa[b_idx][c_idx] + n_beta[1] * Fb[b_idx][c_idx]);
+
+    // Inter-pair couplings for 9SI:
+    // (a,c) pair: orbitals 0 and 2
+    Wac_lagr_ += Cl * (n_alpha[0] * Fa[a_idx][c_idx] + n_beta[0] * Fb[a_idx][c_idx]);
+
+    // (b,d) pair: orbitals 1 and 3
+    Wbd_lagr_ += Cl * (n_alpha[1] * Fa[b_idx][d_idx] + n_beta[1] * Fb[b_idx][d_idx]);
+
+    if (reks_debug_ >= 3) {
+        outfile->Printf("  fock_micro_to_macro_44: L=%d Cl=%.6f\n", L, Cl);
+        for (int i = 0; i < n_active; ++i) {
+            outfile->Printf("    orb %d: act=%d n_a=%d n_b=%d f=%.6f\n",
+                           i, act[i], n_alpha[i], n_beta[i], f_eff[i]);
+        }
+        outfile->Printf("    W_ad contribution: %.10f\n",
+                       Cl * (n_alpha[0] * Fa[a_idx][d_idx] + n_beta[0] * Fb[a_idx][d_idx]));
+        outfile->Printf("    W_bc contribution: %.10f\n",
+                       Cl * (n_alpha[1] * Fa[b_idx][c_idx] + n_beta[1] * Fb[b_idx][c_idx]));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -972,9 +1408,12 @@ void REKS::form_F() {
     //   3. Apply fock_micro_to_macro in MO basis
     //   4. Transform F_reks back to AO for DIIS
 
-    // Zero F_reks_ and Lagrange multiplier
+    // Zero F_reks_ and Lagrange multipliers
     F_reks_->zero();
-    Wrs_lagr_ = 0.0;
+    Wrs_lagr_ = 0.0;  // W_ad for REKS(4,4), Wrs for REKS(2,2)
+    Wbc_lagr_ = 0.0;  // W_bc for REKS(4,4) only
+    Wac_lagr_ = 0.0;  // W_ac for REKS(4,4) 9SI only
+    Wbd_lagr_ = 0.0;  // W_bd for REKS(4,4) 9SI only
 
     int N = nsopi_[0];
     int nmo = Ca_->colspi()[0];
@@ -1190,63 +1629,117 @@ void REKS::print_fon_info() const {
 void REKS::print_SI_energies() const {
     // Compute SI-SA state energies after SCF convergence
     //
-    // This provides:
+    // REKS(2,2):
     // - 2SI-2SA: Ground state (S0) and first excited singlet (S1) energies
     // - 3SI-2SA: Also includes doubly excited state (S2)
+    //
+    // REKS(4,4):
+    // - 3SI-3SA: S0, S1 (from OSS1), S2 (from OSS2) energies
 
     // Skip if energies are not computed yet
     if (E_micro_.empty() || std::abs(E_micro_[0]) < reks::constants::ENERGY_THRESHOLD) {
         return;
     }
 
+    // Detect REKS(4,4) by checking number of pairs (>= 2 means REKS(4,4) or higher)
+    bool is_reks44 = (active_space_->n_pairs() >= 2);
+
     outfile->Printf("\n  ============================================================\n");
-    outfile->Printf("                    SI-SA-REKS State Energies\n");
+    if (is_reks44) {
+        outfile->Printf("                 3SI-3SA-REKS(4,4) State Energies\n");
+    } else {
+        outfile->Printf("                    SI-SA-REKS State Energies\n");
+    }
     outfile->Printf("  ------------------------------------------------------------\n");
 
-    // Compute 2SI-2SA energies
-    auto si2 = active_space_->compute_SI_energies(E_micro_, Wrs_lagr_, 2);
+    if (is_reks44) {
+        // ================================================================
+        // REKS(4,4): Use compute_SI_energies_44 with both Lagrangians
+        // ================================================================
+        auto si3 = active_space_->compute_SI_energies_44(E_micro_, Wrs_lagr_, Wbc_lagr_, 3);
 
-    // Print diagonal elements of SI Hamiltonian
-    outfile->Printf("\n  Diagonal State Energies:\n");
-    outfile->Printf("    E_PPS (Perfectly Paired Singlet)  = %20.12f Ha\n", si2.E_PPS);
-    outfile->Printf("    E_OSS (Open-Shell Singlet)        = %20.12f Ha\n", si2.E_OSS);
-    outfile->Printf("    Triplet                           = %20.12f Ha\n", E_micro_[3]);
+        // Print diagonal elements of SI Hamiltonian
+        outfile->Printf("\n  Diagonal Configuration Energies:\n");
+        outfile->Printf("    E_PPS  (Perfectly Paired Singlet) = %20.12f Ha\n", si3.E_PPS);
+        outfile->Printf("    E_OSS1 (Open-Shell Singlet 1)     = %20.12f Ha\n", si3.E_OSS);
+        outfile->Printf("    E_OSS2 (Open-Shell Singlet 2)     = %20.12f Ha\n", si3.E_DES);
 
-    // Print off-diagonal coupling
-    outfile->Printf("\n  Off-diagonal Coupling:\n");
-    outfile->Printf("    Wrs (Lagrange multiplier)         = %20.12f Ha\n", Wrs_lagr_);
-    outfile->Printf("    H_12 = Wrs*(sqrt(n_r)-sqrt(n_s))*sqrt(2) = %20.12f Ha\n", si2.H_12);
+        // Print off-diagonal couplings
+        outfile->Printf("\n  Off-diagonal Coupling (Response Lagrangians):\n");
+        outfile->Printf("    W_ad (a,d pair Lagrangian)        = %20.12f Ha\n", Wrs_lagr_);
+        outfile->Printf("    W_bc (b,c pair Lagrangian)        = %20.12f Ha\n", Wbc_lagr_);
+        outfile->Printf("    H_01 (PPS-OSS1)                   = %20.12f Ha\n", si3.H_12);
+        outfile->Printf("    H_02 (PPS-OSS2)                   = %20.12f Ha\n", si3.H_23);
 
-    // Print 2SI-2SA eigenvalues
-    outfile->Printf("\n  2SI-2SA-REKS State Energies:\n");
-    outfile->Printf("    %-20s %22s %14s %14s\n", "", "E (Ha)", "C_PPS", "C_OSS");
-    outfile->Printf("    %s\n", std::string(70, '-').c_str());
-    for (int i = 0; i < 2; ++i) {
-        outfile->Printf("    SSR State S%d         %22.12f %14.8f %14.8f\n",
-                        i, si2.energies[i],
-                        si2.coeffs[i * 2 + 0], si2.coeffs[i * 2 + 1]);
-    }
+        // Print 3SI-3SA eigenvalues
+        outfile->Printf("\n  3SI-3SA-REKS(4,4) Adiabatic State Energies:\n");
+        outfile->Printf("    %-20s %22s %14s %14s %14s\n", "", "E (Ha)", "C_PPS", "C_OSS1", "C_OSS2");
+        outfile->Printf("    %s\n", std::string(84, '-').c_str());
+        for (int i = 0; i < 3; ++i) {
+            outfile->Printf("    SSR State S%d         %22.12f %14.8f %14.8f %14.8f\n",
+                            i, si3.energies[i],
+                            si3.coeffs[i * 3 + 0], si3.coeffs[i * 3 + 1], si3.coeffs[i * 3 + 2]);
+        }
 
-    // Print excitation energy
-    if (si2.energies.size() >= 2) {
-        double excitation_eV = (si2.energies[1] - si2.energies[0]) * 27.211386;  // Ha to eV
-        outfile->Printf("\n  S0 -> S1 Excitation Energy:\n");
-        outfile->Printf("    Delta E = %20.12f Ha = %12.6f eV\n",
-                        si2.energies[1] - si2.energies[0], excitation_eV);
-    }
+        // Print excitation energies
+        if (si3.energies.size() >= 3) {
+            double exc01_eV = (si3.energies[1] - si3.energies[0]) * 27.211386;
+            double exc02_eV = (si3.energies[2] - si3.energies[0]) * 27.211386;
+            outfile->Printf("\n  Excitation Energies:\n");
+            outfile->Printf("    S0 -> S1: Delta E = %12.6f Ha = %12.6f eV\n",
+                            si3.energies[1] - si3.energies[0], exc01_eV);
+            outfile->Printf("    S0 -> S2: Delta E = %12.6f Ha = %12.6f eV\n",
+                            si3.energies[2] - si3.energies[0], exc02_eV);
+        }
+    } else {
+        // ================================================================
+        // REKS(2,2): Use original compute_SI_energies with single Wrs
+        // ================================================================
+        // Compute 2SI-2SA energies
+        auto si2 = active_space_->compute_SI_energies(E_micro_, Wrs_lagr_, 2);
 
-    // Compute 3SI-2SA energies
-    auto si3 = active_space_->compute_SI_energies(E_micro_, Wrs_lagr_, 3);
+        // Print diagonal elements of SI Hamiltonian
+        outfile->Printf("\n  Diagonal State Energies:\n");
+        outfile->Printf("    E_PPS (Perfectly Paired Singlet)  = %20.12f Ha\n", si2.E_PPS);
+        outfile->Printf("    E_OSS (Open-Shell Singlet)        = %20.12f Ha\n", si2.E_OSS);
+        outfile->Printf("    Triplet                           = %20.12f Ha\n", E_micro_[3]);
 
-    outfile->Printf("\n  3SI-2SA-REKS State Energies:\n");
-    outfile->Printf("    E_DES (Doubly Excited Singlet)    = %20.12f Ha\n", si3.E_DES);
-    outfile->Printf("    H_23 = Wrs*(sqrt(n_r)+sqrt(n_s))*sqrt(2) = %20.12f Ha\n", si3.H_23);
-    outfile->Printf("\n    %-20s %22s %14s %14s %14s\n", "", "E (Ha)", "C_PPS", "C_OSS", "C_DES");
-    outfile->Printf("    %s\n", std::string(84, '-').c_str());
-    for (int i = 0; i < 3; ++i) {
-        outfile->Printf("    SSR State S%d         %22.12f %14.8f %14.8f %14.8f\n",
-                        i, si3.energies[i],
-                        si3.coeffs[i * 3 + 0], si3.coeffs[i * 3 + 1], si3.coeffs[i * 3 + 2]);
+        // Print off-diagonal coupling
+        outfile->Printf("\n  Off-diagonal Coupling:\n");
+        outfile->Printf("    Wrs (Lagrange multiplier)         = %20.12f Ha\n", Wrs_lagr_);
+        outfile->Printf("    H_12 = Wrs*(sqrt(n_r)-sqrt(n_s))*sqrt(2) = %20.12f Ha\n", si2.H_12);
+
+        // Print 2SI-2SA eigenvalues
+        outfile->Printf("\n  2SI-2SA-REKS State Energies:\n");
+        outfile->Printf("    %-20s %22s %14s %14s\n", "", "E (Ha)", "C_PPS", "C_OSS");
+        outfile->Printf("    %s\n", std::string(70, '-').c_str());
+        for (int i = 0; i < 2; ++i) {
+            outfile->Printf("    SSR State S%d         %22.12f %14.8f %14.8f\n",
+                            i, si2.energies[i],
+                            si2.coeffs[i * 2 + 0], si2.coeffs[i * 2 + 1]);
+        }
+
+        // Print excitation energy
+        if (si2.energies.size() >= 2) {
+            double excitation_eV = (si2.energies[1] - si2.energies[0]) * 27.211386;  // Ha to eV
+            outfile->Printf("\n  S0 -> S1 Excitation Energy:\n");
+            outfile->Printf("    Delta E = %20.12f Ha = %12.6f eV\n",
+                            si2.energies[1] - si2.energies[0], excitation_eV);
+        }
+
+        // Compute 3SI-2SA energies
+        auto si3 = active_space_->compute_SI_energies(E_micro_, Wrs_lagr_, 3);
+
+        outfile->Printf("\n  3SI-2SA-REKS State Energies:\n");
+        outfile->Printf("    E_DES (Doubly Excited Singlet)    = %20.12f Ha\n", si3.E_DES);
+        outfile->Printf("    H_23 = Wrs*(sqrt(n_r)+sqrt(n_s))*sqrt(2) = %20.12f Ha\n", si3.H_23);
+        outfile->Printf("\n    %-20s %22s %14s %14s %14s\n", "", "E (Ha)", "C_PPS", "C_OSS", "C_DES");
+        outfile->Printf("    %s\n", std::string(84, '-').c_str());
+        for (int i = 0; i < 3; ++i) {
+            outfile->Printf("    SSR State S%d         %22.12f %14.8f %14.8f %14.8f\n",
+                            i, si3.energies[i],
+                            si3.coeffs[i * 3 + 0], si3.coeffs[i * 3 + 1], si3.coeffs[i * 3 + 2]);
+        }
     }
 
     outfile->Printf("  ============================================================\n\n");

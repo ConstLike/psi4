@@ -464,17 +464,40 @@ void export_wavefunction(py::module& m) {
              "Returns a new wavefunction with internal data converted to C_1 symmetry, using pre-c1-constructed "
              "BasisSet *basis*",
              "basis"_a)
-        .def("get_n_r", &scf::REKS::get_n_r, "Returns the fractional occupation number for orbital r")
-        .def("get_n_s", &scf::REKS::get_n_s, "Returns the fractional occupation number for orbital s")
+        // REKS(2,2) FON accessors
+        .def("get_n_r", &scf::REKS::get_n_r, "Returns FON for orbital r (REKS(2,2)) or n_a (REKS(4,4))")
+        .def("get_n_s", &scf::REKS::get_n_s, "Returns FON for orbital s (REKS(2,2)) or n_d (REKS(4,4))")
+        // REKS(4,4) FON accessors
+        .def("get_n_a", &scf::REKS::get_n_a, "Returns FON for orbital a (pair 0, REKS(4,4))")
+        .def("get_n_d", &scf::REKS::get_n_d, "Returns FON for orbital d (pair 0, REKS(4,4))")
+        .def("get_n_b", &scf::REKS::get_n_b, "Returns FON for orbital b (pair 1, REKS(4,4) only)")
+        .def("get_n_c", &scf::REKS::get_n_c, "Returns FON for orbital c (pair 1, REKS(4,4) only)")
         .def("get_microstate_energy", &scf::REKS::get_microstate_energy,
-             "Returns the microstate energy for index L (0-3)", "L"_a)
+             "Returns the microstate energy for index L", "L"_a)
         .def("get_f_value", &scf::REKS::get_f_value, "Returns the interpolating function value at current FON")
-        .def("get_Wrs", &scf::REKS::get_Wrs, "Returns the Wrs Lagrange multiplier (off-diagonal SI coupling)")
+        // Response Lagrangian accessors
+        .def("get_Wrs", &scf::REKS::get_Wrs, "Returns W_ad Lagrange multiplier (a,d pair SI coupling)")
+        .def("get_W_ad", &scf::REKS::get_W_ad, "Returns W_ad Lagrange multiplier (same as get_Wrs)")
+        .def("get_Wbc", &scf::REKS::get_Wbc, "Returns W_bc Lagrange multiplier (b,c pair SI coupling, REKS(4,4) only)")
+        .def("get_W_bc", &scf::REKS::get_W_bc, "Returns W_bc Lagrange multiplier (same as get_Wbc)")
+        .def("get_W_ac", &scf::REKS::get_W_ac, "Returns W_ac Lagrange multiplier (a,c inter-pair SI coupling, REKS(4,4) 9SI only)")
+        .def("get_W_bd", &scf::REKS::get_W_bd, "Returns W_bd Lagrange multiplier (b,d inter-pair SI coupling, REKS(4,4) 9SI only)")
+        // SI state energy accessors
         .def("get_SI_energy", &scf::REKS::get_SI_energy,
              "Returns SI state energy for state index (0=ground, 1=S1, etc.)", "state"_a, "n_si_states"_a = 2)
+        .def("get_SI_energy_9x9", &scf::REKS::get_SI_energy_9x9,
+             "Returns 9SI state energy (REKS(4,4) only, uses all 4 Lagrangians)", "state"_a, "n_si_states"_a = 9)
         .def("get_E_PPS", &scf::REKS::get_E_PPS, "Returns PPS (Perfectly Paired Singlet) diagonal energy")
-        .def("get_E_OSS", &scf::REKS::get_E_OSS, "Returns OSS (Open-Shell Singlet) diagonal energy")
-        .def("get_E_DES", &scf::REKS::get_E_DES, "Returns DES (Doubly Excited Singlet) diagonal energy")
+        .def("get_E_OSS", &scf::REKS::get_E_OSS, "Returns OSS diagonal energy (OSS1 for REKS(4,4))")
+        .def("get_E_DES", &scf::REKS::get_E_DES, "Returns DES diagonal energy (OSS2 for REKS(4,4))")
+        .def("get_E_OSS1", &scf::REKS::get_E_OSS1, "Returns E_OSS1 diagonal energy (REKS(4,4) only)")
+        .def("get_E_OSS2", &scf::REKS::get_E_OSS2, "Returns E_OSS2 diagonal energy (REKS(4,4) only)")
+        .def("get_E_DOSS", &scf::REKS::get_E_DOSS, "Returns DOSS configuration energy (REKS(4,4) only)")
+        .def("get_E_DSPS", &scf::REKS::get_E_DSPS, "Returns DSPS configuration energy (REKS(4,4) only)")
+        .def("get_E_OSS3", &scf::REKS::get_E_OSS3, "Returns OSS3 inter-pair configuration energy (REKS(4,4) only)")
+        .def("get_E_OSS4", &scf::REKS::get_E_OSS4, "Returns OSS4 inter-pair configuration energy (REKS(4,4) only)")
+        .def("get_E_DES1", &scf::REKS::get_E_DES1, "Returns DES1 doubly-excited singlet energy (REKS(4,4) only)")
+        .def("get_E_DES2", &scf::REKS::get_E_DES2, "Returns DES2 doubly-excited singlet energy (REKS(4,4) only)")
         .def("get_E_triplet", &scf::REKS::get_E_triplet, "Returns Triplet energy from microstate 3")
         .def("mintshelper", &Wavefunction::mintshelper, "The MintsHelper object");
 
