@@ -140,6 +140,9 @@ class REKS : public RHF {
     /// Precomputed K matrices for base densities (from multi_scf shared JK)
     std::vector<SharedMatrix> precomputed_K_base_;
 
+    /// Precomputed wK matrices for base densities (from multi_scf shared JK, LRC functionals)
+    std::vector<SharedMatrix> precomputed_wK_base_;
+
     /// Flag: use precomputed J/K instead of calling jk_->compute()
     bool use_precomputed_jk_base_ = false;
 

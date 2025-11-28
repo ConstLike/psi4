@@ -416,7 +416,7 @@ void REKS::build_microstate_focks() {
     // [n_base]: RHF occupied for G_
 
     // Support for multi_scf(): use precomputed J/K if available
-    std::vector<SharedMatrix> J_vec, K_vec;
+    std::vector<SharedMatrix> J_vec, K_vec, wK_vec;
 
     if (use_precomputed_jk_base_ && !precomputed_J_base_.empty()) {
         // Use precomputed J/K from multi_scf shared JK
@@ -425,6 +425,11 @@ void REKS::build_microstate_focks() {
         }
         J_vec = precomputed_J_base_;
         K_vec = precomputed_K_base_;
+
+        // Use precomputed wK for LRC functionals
+        if (functional_->is_x_lrc() && !precomputed_wK_base_.empty()) {
+            wK_vec = precomputed_wK_base_;
+        }
 
         // Reset flag for next iteration
         use_precomputed_jk_base_ = false;
@@ -447,12 +452,19 @@ void REKS::build_microstate_focks() {
         const std::vector<SharedMatrix>& K_ref = jk_->K();
         J_vec.assign(J_ref.begin(), J_ref.end());
         K_vec.assign(K_ref.begin(), K_ref.end());
+
+        // Get wK for LRC (long-range corrected) functionals
+        if (functional_->is_x_lrc()) {
+            const std::vector<SharedMatrix>& wK_ref = jk_->wK();
+            wK_vec.assign(wK_ref.begin(), wK_ref.end());
+        }
     }
 
     // Handle special case: pattern 0 with Ncore=0 may have garbage
     if (Ncore_ == 0) {
         J_vec[0]->zero();
         K_vec[0]->zero();
+        if (!wK_vec.empty()) wK_vec[0]->zero();
     }
 
     // HF exchange fraction: 0.0 for pure DFT, 0.5 for BHHLYP, 1.0 for HF
@@ -472,8 +484,23 @@ void REKS::build_microstate_focks() {
         G_->zero();
     }
     G_->axpy(2.0, J_);
-    if (functional_->is_x_hybrid()) {
+
+    // Exchange contribution - match RHF logic exactly (rhf.cc:243-257)
+    // When LRC + wcombine, JK combines alpha*K + beta*wK into wK, don't add K separately
+    if (functional_->is_x_hybrid() && !(functional_->is_x_lrc() && jk_->get_wcombine())) {
         G_->axpy(-alpha, K_);
+    }
+
+    // Long-range exchange contribution for range-separated functionals
+    if (functional_->is_x_lrc() && !wK_vec.empty()) {
+        double beta = functional_->x_beta();
+        if (jk_->get_wcombine()) {
+            // wK contains combined alpha*K + beta*wK
+            G_->axpy(-1.0, wK_vec[n_base]);
+        } else {
+            // Add LR exchange separately
+            G_->axpy(-beta, wK_vec[n_base]);
+        }
     }
 
     // Build Fock matrices for each microstate
@@ -533,15 +560,34 @@ void REKS::build_microstate_focks() {
         J_work_->copy(J_vec[alpha_idx]);
         J_work_->add(J_vec[beta_idx]);
 
-        // F^alpha = H + J_total - alpha*K^alpha
+        // F^sigma = H + J_total
         F_alpha_micro_[L]->copy(H_);
         F_alpha_micro_[L]->add(J_work_);
-        F_alpha_micro_[L]->axpy(-alpha, K_vec[alpha_idx]);
-
-        // F^beta = H + J_total - alpha*K^beta
         F_beta_micro_[L]->copy(H_);
         F_beta_micro_[L]->add(J_work_);
-        F_beta_micro_[L]->axpy(-alpha, K_vec[beta_idx]);
+
+        // Exchange contribution - must match RHF logic (rhf.cc:243-257)
+        // When LRC + wcombine, K is already combined into wK, don't add K separately
+        if (functional_->is_x_hybrid()) {
+            if (!(functional_->is_x_lrc() && jk_->get_wcombine())) {
+                F_alpha_micro_[L]->axpy(-alpha, K_vec[alpha_idx]);
+                F_beta_micro_[L]->axpy(-alpha, K_vec[beta_idx]);
+            }
+        }
+
+        // Long-range exchange contribution for range-separated functionals
+        if (functional_->is_x_lrc() && !wK_vec.empty()) {
+            double beta = functional_->x_beta();
+            if (jk_->get_wcombine()) {
+                // wK contains combined alpha*K + beta*wK
+                F_alpha_micro_[L]->axpy(-1.0, wK_vec[alpha_idx]);
+                F_beta_micro_[L]->axpy(-1.0, wK_vec[beta_idx]);
+            } else {
+                // Add LR exchange separately
+                F_alpha_micro_[L]->axpy(-beta, wK_vec[alpha_idx]);
+                F_beta_micro_[L]->axpy(-beta, wK_vec[beta_idx]);
+            }
+        }
 
         // Add XC potential to both alpha and beta Fock matrices
         if (needs_xc && potential_) {
@@ -588,7 +634,9 @@ void REKS::compute_microstate_energies() {
     // the actual XC energy is E_xc from quadrature. So we need to correct:
     // E_xc_correction = E_xc - 0.5*tr(D_total*V_xc)
 
-    double E_nuc = energies_["Nuclear"];
+    // Use nuclearrep_ directly - energies_["Nuclear"] is not set in REKS
+    // (unlike RHF::compute_E() which sets it)
+    double E_nuc = nuclearrep_;
     bool needs_xc = functional_->needs_xc();
     double alpha = functional_->x_alpha();
 
@@ -1533,8 +1581,10 @@ void REKS::form_F() {
 }
 
 void REKS::form_C(double shift) {
-    // For SAD guess iteration: use standard RHF diagonalization
-    if (sad_ && iteration_ <= 0) {
+    // For initial guess (iteration_ <= 0): use standard RHF diagonalization
+    // This handles both SAD (iteration_ = -1) and HUCKEL/CORE/GWH (iteration_ = 0) guesses
+    // where Ca_ is either not yet set or needs to be built from Fa_ via AO-basis diagonalization
+    if (iteration_ <= 0) {
         RHF::form_C(shift);
         return;
     }
@@ -1873,11 +1923,16 @@ void REKS::set_jk_matrices(const std::vector<SharedMatrix>& J_list,
     precomputed_K_base_ = K_list;
     use_precomputed_jk_base_ = true;
 
+    // Store wK for base densities (LRC functionals)
+    precomputed_wK_base_ = wK_list;
+
     // Also set base class precomputed matrices for RHF parts
     // (last entry is RHF density)
     precomputed_J_ = {J_list[n_base]};
     precomputed_K_ = {K_list[n_base]};
-    precomputed_wK_ = wK_list;
+    if (!wK_list.empty() && n_base < static_cast<int>(wK_list.size())) {
+        precomputed_wK_ = {wK_list[n_base]};
+    }
     use_precomputed_jk_ = true;
 
     if (reks_debug_ >= 1) {

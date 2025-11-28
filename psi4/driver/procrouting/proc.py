@@ -1429,6 +1429,9 @@ def scf_wavefunction_factory(name, ref_wfn, reference, **kwargs):
     and prepares any empirical dispersion.
 
     """
+    # Normalize reference to uppercase for case-insensitive matching
+    reference = reference.upper()
+
     # Figure out functional and dispersion
     superfunc, _disp_functor = build_functional_and_disp(name, restricted=(reference in ["RKS", "RHF", "REKS"]), **kwargs)
 
