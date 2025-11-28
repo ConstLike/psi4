@@ -1521,31 +1521,19 @@ int REKS44Space::get_beta_base_idx(int L) const {
 double REKS44Space::get_symmetry_factor(int L) const {
     // Symmetry factors for REKS(4,4) microstates.
     //
-    // Accounts for spin symmetry in the ensemble:
-    //   L=0-3: Closed-shell determinants (Ms=0), FACT=1.0
-    //   L=4-27: Open-shell determinants with spin partners, FACT=2.0
+    // IMPORTANT: For REKS(4,4), the weighting factors C_L are already defined
+    // such that sum(C_L) = 1.0, with spin symmetry already incorporated in the
+    // weight formulas (Filatov 2017, Eq. 3 and Appendix A).
     //
-    // The factor of 2 for open-shell arises because:
-    //   - L=4,5: spin partner pair for (a,d) singlet coupling
-    //   - L=6,7: spin partner pair for (a,d) triplet coupling
-    //   - L=8,9: spin partner pair for (b,c) singlet coupling
-    //   - L=10,11: spin partner pair for (b,c) triplet coupling
-    //   - L=12,13: spin partner pair for OSS1 (d doubly, b,c open)
-    //   - L=14,15: spin partner pair for OSS2 (c doubly, a,d open)
-    //   - L=16,17: Ms=+1/-1 spin partner pair (DOSS/DSPS triplet component)
-    //   - L=18,19: Ms=+2/-2 spin partner pair (DSPS quintet component)
-    //   - L=20,21: spin partner pair for (a,c) singlet coupling (OSS3/OSS4)
-    //   - L=22,23: Ms=+1/-1 spin partner pair for (a,c) triplet (OSS3/OSS4)
-    //   - L=24,25: spin partner pair for (b,d) singlet coupling (OSS3/OSS4)
-    //   - L=26,27: Ms=+1/-1 spin partner pair for (b,d) triplet (OSS3/OSS4)
+    // Unlike REKS(2,2) where FACT=2.0 is needed for open-shell states to get
+    // sum(FACT*C_L) = 1.0, the REKS(4,4) weights explicitly list both spin
+    // partners with their own weights.
+    //
+    // Therefore, FACT = 1.0 for ALL REKS(4,4) microstates.
+    //
+    // This ensures: E_SA = sum_L C_L * E_L with sum(C_L) = 1.0
 
-    if (L >= 0 && L <= 3) {
-        return 1.0;  // Closed-shell Ms=0
-    } else if (L >= 4 && L <= 27) {
-        return 2.0;  // Open-shell with spin partner (Ms=0, ±1, ±2)
-    } else {
-        return 1.0;  // Default for future microstates
-    }
+    return 1.0;  // All microstates have FACT=1.0
 }
 
 std::vector<double> REKS44Space::compute_energy_gradient(

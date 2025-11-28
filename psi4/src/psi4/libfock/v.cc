@@ -1301,40 +1301,23 @@ void RV::compute_V(std::vector<SharedMatrix> ret) {
 
     // What local XC ansatz are we in?
     int ansatz = functional_->ansatz();
-    outfile->Printf("    ansatz=%d\n", ansatz);
-    outfile->Flush();
 
     // How many functions are there (for lda in Vtemp, T)
     int max_functions = grid_->max_functions();
     int max_points = grid_->max_points();
-    outfile->Printf("    max_functions=%d, max_points=%d\n", max_functions, max_points);
-    outfile->Flush();
 
     // Setup the pointers
-    outfile->Printf("    Setting up point_workers_ pointers...\n");
-    outfile->Flush();
     for (size_t i = 0; i < num_threads_; i++) {
-        outfile->Printf("      point_workers_[%zu]=%p, D_AO_[0]=%p\n",
-                       i, (void*)point_workers_[i].get(), (void*)D_AO_[0].get());
-        outfile->Flush();
         point_workers_[i]->set_pointers(D_AO_[0]);
-        outfile->Printf("      set_pointers completed for worker %zu\n", i);
-        outfile->Flush();
     }
 
     // Per thread temporaries
-    outfile->Printf("    Allocating V_local temporaries...\n");
-    outfile->Flush();
     std::vector<SharedMatrix> V_local;
     for (size_t i = 0; i < num_threads_; i++) {
         V_local.push_back(std::make_shared<Matrix>("V Temp", max_functions, max_functions));
     }
 
-    outfile->Printf("    Allocating V_AO temp matrix...\n");
-    outfile->Flush();
     auto V_AO = std::make_shared<Matrix>("V AO Temp", nbf_, nbf_);
-    outfile->Printf("    Starting grid loop (blocks=%zu)...\n", grid_->blocks().size());
-    outfile->Flush();
     auto Vp = V_AO->pointer();
 
     std::vector<double> functionalq(num_threads_);
@@ -1347,8 +1330,6 @@ void RV::compute_V(std::vector<SharedMatrix> ret) {
 
     // => Compute V <=
 // Traverse the blocks of points
-    outfile->Printf("    functional_workers_.size()=%zu\n", functional_workers_.size());
-    outfile->Flush();
 #pragma omp parallel for private(rank) schedule(guided) num_threads(num_threads_)
     for (size_t Q = 0; Q < grid_->blocks().size(); Q++) {
         // ==> Define block/thread-specific variables <==
@@ -1356,58 +1337,17 @@ void RV::compute_V(std::vector<SharedMatrix> ret) {
         rank = omp_get_thread_num();
 #endif
 
-        // DEBUG: Print first few blocks only
-        if (Q < 3) {
-            #pragma omp critical
-            {
-                outfile->Printf("    Block Q=%zu, rank=%d\n", Q, rank);
-                outfile->Flush();
-            }
-        }
-
         // Get per-rank workers
         auto block = grid_->blocks()[Q];
         auto fworker = functional_workers_[rank];
         auto pworker = point_workers_[rank];
 
-        if (Q == 0) {
-            #pragma omp critical
-            {
-                outfile->Printf("      block=%p, fworker=%p, pworker=%p\n",
-                               (void*)block.get(), (void*)fworker.get(), (void*)pworker.get());
-                outfile->Flush();
-            }
-        }
-
         // ==> Compute rho, gamma, etc. for block <==
-        if (Q == 0) { outfile->Printf("      Calling compute_points...\n"); outfile->Flush(); }
         parallel_timer_on("Properties", rank);
         pworker->compute_points(block, false);
         parallel_timer_off("Properties", rank);
-        if (Q == 0) { outfile->Printf("      compute_points done\n"); outfile->Flush(); }
 
         // ==> Compute functional values for block <==
-        if (Q == 0) {
-            outfile->Printf("      Calling compute_functional...\n");
-            outfile->Printf("        point_values keys: ");
-            for (const auto& kv : pworker->point_values()) {
-                outfile->Printf("%s(%d) ", kv.first.c_str(), kv.second ? kv.second->dim(0) : 0);
-            }
-            outfile->Printf("\n");
-            // Check RHO_A specifically
-            auto& pv = pworker->point_values();
-            if (pv.count("RHO_A") && pv.at("RHO_A")) {
-                auto rho_a = pv.at("RHO_A");
-                outfile->Printf("        RHO_A: dim=%d, [0]=%.6e, [1]=%.6e, [2]=%.6e\n",
-                               rho_a->dim(0),
-                               rho_a->get(0), rho_a->get(1), rho_a->get(2));
-            }
-            outfile->Printf("        fworker: x_funcs=%zu, c_funcs=%zu, max_points=%d\n",
-                           fworker->x_functionals().size(),
-                           fworker->c_functionals().size(),
-                           fworker->max_points());
-            outfile->Flush();
-        }
         parallel_timer_on("Functional", rank);
         fworker->compute_functional(pworker->point_values());
         parallel_timer_off("Functional", rank);

@@ -131,6 +131,19 @@ class REKS : public RHF {
     int reks_debug_ = 0;           ///< 0=none, 1=energies, 2=matrices, 3=all
 
     // ========================================================================
+    // multi_scf() Support: Precomputed J/K Matrices
+    // ========================================================================
+
+    /// Precomputed J matrices for base densities (from multi_scf shared JK)
+    std::vector<SharedMatrix> precomputed_J_base_;
+
+    /// Precomputed K matrices for base densities (from multi_scf shared JK)
+    std::vector<SharedMatrix> precomputed_K_base_;
+
+    /// Flag: use precomputed J/K instead of calling jk_->compute()
+    bool use_precomputed_jk_base_ = false;
+
+    // ========================================================================
     // Protected Methods
     // ========================================================================
 
@@ -224,8 +237,25 @@ class REKS : public RHF {
     // Public Interface
     // ========================================================================
 
-    /// Number of electronic states
-    int n_states() const override { return 1; }
+    // ========================================================================
+    // multi_scf() Interface Overrides
+    // ========================================================================
+
+    /// Number of electronic states for multi_scf JK batching
+    /// REKS requires n_base + 1 J/K matrices (all base densities + RHF density)
+    int n_states() const override;
+
+    /// Returns orbital matrices for multi_scf shared JK computation
+    /// Returns all C_base_ matrices + C_occ (RHF occupied orbitals)
+    std::vector<SharedMatrix> get_orbital_matrices() const override;
+
+    /// Sets precomputed J/K matrices from multi_scf shared JK
+    /// @param J_list: J matrices for each base density + RHF
+    /// @param K_list: K matrices for each base density + RHF
+    /// @param wK_list: long-range K matrices (empty for HF)
+    void set_jk_matrices(const std::vector<SharedMatrix>& J_list,
+                         const std::vector<SharedMatrix>& K_list,
+                         const std::vector<SharedMatrix>& wK_list) override;
 
     /// Create C1 symmetry deep copy
     std::shared_ptr<REKS> c1_deep_copy(std::shared_ptr<BasisSet> basis);
