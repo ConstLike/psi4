@@ -131,6 +131,34 @@ class REKS : public RHF {
     int reks_debug_ = 0;           ///< 0=none, 1=energies, 2=matrices, 3=all
 
     // ========================================================================
+    // FON Optimization Control (Two-Phase SCF)
+    // ========================================================================
+    //
+    // Phase 1: Freeze FON for initial iterations to let orbitals converge.
+    //          DIIS works correctly with consistent C_L weights.
+    // Phase 2: Enable FON optimization with step limiting.
+    //
+    // This is the standard approach for multi-configurational SCF methods
+    // (CASSCF, RASSCF) and ensures proper DIIS convergence.
+
+    /// Number of SCF iterations to freeze FON at initial value (Phase 1)
+    /// At n_r = 1.0 (symmetric), all weights are non-negative, so no freeze is needed.
+    /// GAMESS optimizes FON from iteration 1, so we match that behavior.
+    int fon_freeze_iters_ = 0;
+
+    /// Maximum FON change per SCF iteration (Phase 2 damping)
+    /// Smaller steps ensure smoother DIIS convergence
+    double fon_max_delta_ = 0.1;
+
+    /// Previous FON values for delta limiting
+    double prev_n_r_ = 1.0;        ///< REKS(2,2): previous n_r (starts symmetric like GAMESS)
+    double prev_n_a_ = 2.0;        ///< REKS(4,4): previous n_a
+    double prev_n_b_ = 2.0;        ///< REKS(4,4): previous n_b
+
+    /// Flag: reset DIIS when transitioning from Phase 1 to Phase 2
+    bool fon_phase_transition_ = false;
+
+    // ========================================================================
     // multi_scf() Support: Precomputed J/K Matrices
     // ========================================================================
 

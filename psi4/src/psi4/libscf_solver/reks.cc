@@ -734,8 +734,48 @@ void REKS::rex_solver() {
 void REKS::rex_solver_22() {
     // REKS(2,2) FON optimization: single variable n_r
     //
-    // Uses multi-start optimization to avoid getting stuck at boundaries.
-    // At n_r=2 (n_s=0), the gradient df/dn_r = 0, which can trap the optimizer.
+    // TWO-PHASE SCF FOR STABLE CONVERGENCE:
+    //
+    // Phase 1 (iter < fon_freeze_iters_):
+    //   - Freeze FON at initial value (e.g., n_r = 1.0)
+    //   - Let orbitals converge to this fixed electronic state
+    //   - DIIS works correctly with consistent C_L weights
+    //
+    // Phase 2 (iter >= fon_freeze_iters_):
+    //   - Enable FON optimization
+    //   - Limit FON change per SCF iteration (fon_max_delta_)
+    //   - Ensures Fock matrix continuity for DIIS
+    //
+    // This approach is used in CASSCF and other multi-configurational methods.
+
+    double n_r_current = get_n_r();
+
+    // =========================================================================
+    // Phase 1: Freeze FON for initial iterations
+    // =========================================================================
+    if (iteration_ < fon_freeze_iters_) {
+        if (reks_debug_ >= 1) {
+            outfile->Printf("\n  === RexSolver(2,2): Phase 1 (FON frozen) ===\n");
+            outfile->Printf("  Iteration %d < %d: keeping n_r = %.6f (frozen)\n",
+                           iteration_, fon_freeze_iters_, n_r_current);
+        }
+        // Update previous FON for Phase 2 tracking
+        prev_n_r_ = n_r_current;
+        compute_weighting_factors();
+        return;
+    }
+
+    // Mark phase transition (for potential DIIS reset)
+    if (iteration_ == fon_freeze_iters_) {
+        fon_phase_transition_ = true;
+        if (reks_debug_ >= 1) {
+            outfile->Printf("\n  === Phase transition: enabling FON optimization ===\n");
+        }
+    }
+
+    // =========================================================================
+    // Phase 2: Optimize FON with step limiting
+    // =========================================================================
 
     const int max_iter = reks::constants::FON_MAX_ITER;
     const double tol = reks::constants::FON_TOL;
@@ -757,22 +797,20 @@ void REKS::rex_solver_22() {
              + 2.0 * C2 * E_micro_[2] + 2.0 * C3 * E_micro_[3];
     };
 
-    // Multi-start: try starting from current n_r AND from n_r=1.0 (symmetric point)
-    double n_r_current = get_n_r();
-    std::vector<double> start_points = {n_r_current};
-
-    // If at boundary, also try symmetric point
-    if (n_r_current > 1.9 || n_r_current < 0.1) {
-        start_points.push_back(1.0);  // Symmetric point n_r = n_s = 1
-    }
+    // Multi-start optimization to find the global minimum
+    // Try multiple starting points to avoid getting stuck in local minima.
+    // This is essential for finding correct multi-configurational solutions.
+    std::vector<double> start_points = {n_r_current, 0.5, 1.0, 1.5};
 
     double best_n_r = n_r_current;
     double best_E_SA = compute_E_SA(n_r_current);
 
     if (reks_debug_ >= 1) {
-        outfile->Printf("\n  === RexSolver(2,2): FON Optimization ===\n");
+        outfile->Printf("\n  === RexSolver(2,2): Phase 2 (FON optimization) ===\n");
         outfile->Printf("  E_micro: [0]=%.8f, [1]=%.8f, [2]=%.8f, [3]=%.8f\n",
                        E_micro_[0], E_micro_[1], E_micro_[2], E_micro_[3]);
+        outfile->Printf("  prev_n_r = %.6f, fon_max_delta = %.4f\n",
+                       prev_n_r_, fon_max_delta_);
     }
 
     for (double n_r_start : start_points) {
@@ -852,12 +890,36 @@ void REKS::rex_solver_22() {
         }
     }
 
-    // Use the best n_r found
+    // =========================================================================
+    // Apply FON change limiting for DIIS stability
+    // =========================================================================
+    // Limit the change from previous SCF iteration to fon_max_delta_
+    // This ensures Fock matrices remain similar between DIIS iterations
+
+    double delta_from_prev = best_n_r - prev_n_r_;
+
+    if (std::abs(delta_from_prev) > fon_max_delta_) {
+        double limited_n_r = prev_n_r_ + std::copysign(fon_max_delta_, delta_from_prev);
+        limited_n_r = std::clamp(limited_n_r, 0.0, 2.0);
+
+        if (reks_debug_ >= 1) {
+            outfile->Printf("  FON change limited: %.6f -> %.6f (delta %.4f -> %.4f)\n",
+                           best_n_r, limited_n_r, delta_from_prev, limited_n_r - prev_n_r_);
+        }
+
+        best_n_r = limited_n_r;
+        best_E_SA = compute_E_SA(best_n_r);
+    }
+
+    // Update FON and weights
     active_space_->set_pair_fon(0, best_n_r);
     compute_weighting_factors();
 
+    // Store current n_r for next iteration's delta limiting
+    prev_n_r_ = best_n_r;
+
     if (reks_debug_ >= 1) {
-        outfile->Printf("  Best: n_r = %12.8f, n_s = %12.8f, E_SA = %20.12f\n",
+        outfile->Printf("  Final: n_r = %12.8f, n_s = %12.8f, E_SA = %20.12f\n",
                         get_n_r(), get_n_s(), best_E_SA);
     }
 }
@@ -865,22 +927,57 @@ void REKS::rex_solver_22() {
 void REKS::rex_solver_44() {
     // REKS(4,4) FON optimization: two variables (n_a, n_b)
     //
+    // TWO-PHASE SCF FOR STABLE CONVERGENCE (same as REKS(2,2)):
+    //
+    // Phase 1: Freeze FON for initial iterations
+    // Phase 2: Enable FON optimization with step limiting
+    //
     // Uses 2D Newton-Raphson with gradient [dE/dn_a, dE/dn_b]
     // and 2x2 Hessian [d²E/dn_a², d²E/dn_a dn_b; d²E/dn_b dn_a, d²E/dn_b²]
     //
     // Constraints: n_d = 2 - n_a, n_c = 2 - n_b
 
-    const int max_iter = reks::constants::FON_MAX_ITER;
-    const double tol = reks::constants::FON_TOL;
-    const double max_step = reks::constants::FON_MAX_STEP;
-
     // Get current FONs
     double n_a = active_space_->pair(0).fon_p;
     double n_b = active_space_->pair(1).fon_p;
 
+    // =========================================================================
+    // Phase 1: Freeze FON for initial iterations
+    // =========================================================================
+    if (iteration_ < fon_freeze_iters_) {
+        if (reks_debug_ >= 1) {
+            outfile->Printf("\n  === RexSolver(4,4): Phase 1 (FON frozen) ===\n");
+            outfile->Printf("  Iteration %d < %d: keeping n_a=%.6f, n_b=%.6f (frozen)\n",
+                           iteration_, fon_freeze_iters_, n_a, n_b);
+        }
+        // Update previous FONs for Phase 2 tracking
+        prev_n_a_ = n_a;
+        prev_n_b_ = n_b;
+        compute_weighting_factors();
+        return;
+    }
+
+    // Mark phase transition (for potential DIIS reset)
+    if (iteration_ == fon_freeze_iters_) {
+        fon_phase_transition_ = true;
+        if (reks_debug_ >= 1) {
+            outfile->Printf("\n  === Phase transition: enabling FON optimization ===\n");
+        }
+    }
+
+    // =========================================================================
+    // Phase 2: Optimize FON with step limiting
+    // =========================================================================
+
+    const int max_iter = reks::constants::FON_MAX_ITER;
+    const double tol = reks::constants::FON_TOL;
+    double max_step = reks::constants::FON_MAX_STEP;
+
     if (reks_debug_ >= 1) {
-        outfile->Printf("\n  === RexSolver(4,4): 2D FON Optimization ===\n");
+        outfile->Printf("\n  === RexSolver(4,4): Phase 2 (2D FON Optimization) ===\n");
         outfile->Printf("  Initial FONs: n_a=%.6f, n_b=%.6f\n", n_a, n_b);
+        outfile->Printf("  prev_n_a=%.6f, prev_n_b=%.6f, fon_max_delta=%.4f\n",
+                       prev_n_a_, prev_n_b_, fon_max_delta_);
         outfile->Printf("  E_micro: ");
         for (int L = 0; L < 12 && L < static_cast<int>(E_micro_.size()); ++L) {
             outfile->Printf("[%d]=%.8f ", L, E_micro_[L]);
@@ -900,6 +997,11 @@ void REKS::rex_solver_44() {
         }
         return E_SA;
     };
+
+    // Oscillation detection: track last two FON values
+    double prev_n_a = n_a, prev_n_b = n_b;
+    double prev2_n_a = -1.0, prev2_n_b = -1.0;
+    int oscillation_count = 0;
 
     for (int iter = 0; iter < max_iter; ++iter) {
         // Compute gradient [dE/dn_a, dE/dn_b]
@@ -941,14 +1043,56 @@ void REKS::rex_solver_44() {
 
         double delta_na, delta_nb;
 
-        if (std::abs(det) < reks::constants::HESSIAN_THRESHOLD || det < 0.0) {
-            // Near-singular or indefinite Hessian: use gradient descent with smaller step
-            double small_step = max_step * 0.5;
-            delta_na = -std::copysign(small_step, eff_grad_na);
-            delta_nb = -std::copysign(small_step, eff_grad_nb);
-            // Use effective gradient to respect boundaries
-            if (std::abs(eff_grad_na) < 1e-10) delta_na = 0.0;
-            if (std::abs(eff_grad_nb) < 1e-10) delta_nb = 0.0;
+        // Check if at boundary where Hessian becomes singular.
+        // At n_a=2 or n_a=0, x = n_a*n_d = 0, so df/dx = 0 and H_aa = 0.
+        // In this case, we should do 1D optimization in the other direction.
+        //
+        // However, we only "stay at boundary" if the gradient points INTO the boundary.
+        // If gradient points AWAY from boundary (wants to leave), we should allow that step.
+        bool at_upper_a = (n_a >= 2.0 - 1e-8);
+        bool at_lower_a = (n_a <= 1e-8);
+        bool at_upper_b = (n_b >= 2.0 - 1e-8);
+        bool at_lower_b = (n_b <= 1e-8);
+
+        // Check if constrained at boundary (can't move in that direction)
+        // At upper bound: constrained if gradient is negative (wants to increase)
+        // At lower bound: constrained if gradient is positive (wants to decrease)
+        bool constrained_a = (at_upper_a && grad[0] < 0.0) || (at_lower_a && grad[0] > 0.0);
+        bool constrained_b = (at_upper_b && grad[1] < 0.0) || (at_lower_b && grad[1] > 0.0);
+
+        // Check if Hessian is singular in a direction (happens at boundary with x=0)
+        bool singular_a = std::abs(H_aa) < reks::constants::HESSIAN_THRESHOLD;
+        bool singular_b = std::abs(H_bb) < reks::constants::HESSIAN_THRESHOLD;
+
+        if ((constrained_a || singular_a) && !singular_b && std::abs(H_bb) > reks::constants::HESSIAN_THRESHOLD) {
+            // n_a direction blocked or singular: do 1D Newton-Raphson in n_b direction only
+            delta_na = 0.0;
+            delta_nb = -grad[1] / H_bb;  // 1D Newton step
+            if (reks_debug_ >= 2) {
+                outfile->Printf("    [1D Newton in n_b: H_bb=%.4e, grad_b=%.4e, constrained_a=%d, singular_a=%d]\n",
+                               H_bb, grad[1], constrained_a, singular_a);
+            }
+        } else if ((constrained_b || singular_b) && !singular_a && std::abs(H_aa) > reks::constants::HESSIAN_THRESHOLD) {
+            // n_b direction blocked or singular: do 1D Newton-Raphson in n_a direction only
+            delta_na = -grad[0] / H_aa;  // 1D Newton step
+            delta_nb = 0.0;
+            if (reks_debug_ >= 2) {
+                outfile->Printf("    [1D Newton in n_a: H_aa=%.4e, grad_a=%.4e, constrained_b=%d, singular_b=%d]\n",
+                               H_aa, grad[0], constrained_b, singular_b);
+            }
+        } else if (std::abs(det) < reks::constants::HESSIAN_THRESHOLD || det < 0.0) {
+            // Both at boundary or indefinite Hessian: use gradient descent
+            // But use adaptive step based on gradient magnitude
+            double grad_norm = std::sqrt(grad[0]*grad[0] + grad[1]*grad[1]);
+            double step_scale = (grad_norm > 0.1) ? max_step : max_step * 0.5;
+
+            // Scale by inverse gradient to approximate Newton behavior
+            delta_na = (std::abs(eff_grad_na) > 1e-10) ? -step_scale * std::copysign(1.0, eff_grad_na) : 0.0;
+            delta_nb = (std::abs(eff_grad_nb) > 1e-10) ? -step_scale * std::copysign(1.0, eff_grad_nb) : 0.0;
+
+            if (reks_debug_ >= 2) {
+                outfile->Printf("    [Gradient descent: det=%.4e, grad_norm=%.4e]\n", det, grad_norm);
+            }
         } else {
             // Newton-Raphson: delta = -H^{-1} * grad
             // For 2x2: [a b; b d]^{-1} = (1/det) * [d -b; -b a]
@@ -972,6 +1116,41 @@ void REKS::rex_solver_44() {
         delta_na = n_a_new - n_a;
         delta_nb = n_b_new - n_b;
 
+        // Check for oscillation ONLY when using gradient descent (not Newton)
+        // Newton methods naturally converge quadratically and shouldn't trigger oscillation detection
+        // We identify gradient descent when det < 0 and both directions are being updated
+        bool using_gradient_descent = (std::abs(det) < reks::constants::HESSIAN_THRESHOLD || det < 0.0) &&
+                                       std::abs(delta_na) > tol && std::abs(delta_nb) > tol;
+
+        if (using_gradient_descent && prev2_n_a >= 0.0) {
+            double diff_a = std::abs(n_a_new - prev2_n_a);
+            double diff_b = std::abs(n_b_new - prev2_n_b);
+            // Very tight threshold: only trigger when bouncing in small region
+            if (diff_a < 0.02 && diff_b < 0.02) {
+                oscillation_count++;
+                if (oscillation_count >= 3) {  // Require 3 oscillations before intervening
+                    // Oscillation detected! Take midpoint of oscillating values
+                    n_a_new = (n_a_new + prev_n_a) / 2.0;
+                    n_b_new = (n_b_new + prev_n_b) / 2.0;
+                    if (reks_debug_ >= 1) {
+                        outfile->Printf("    Oscillation detected (count=%d)! Using midpoint: n_a=%.6f n_b=%.6f\n",
+                                       oscillation_count, n_a_new, n_b_new);
+                    }
+                    // Also reduce step size for future iterations
+                    max_step *= 0.5;
+                    oscillation_count = 0;
+                }
+            } else {
+                oscillation_count = 0;
+            }
+        }
+
+        // Update history
+        prev2_n_a = prev_n_a;
+        prev2_n_b = prev_n_b;
+        prev_n_a = n_a;
+        prev_n_b = n_b;
+
         n_a = n_a_new;
         n_b = n_b_new;
 
@@ -994,6 +1173,43 @@ void REKS::rex_solver_44() {
             break;
         }
     }
+
+    // =========================================================================
+    // Apply FON change limiting for DIIS stability
+    // =========================================================================
+    // Limit the change from previous SCF iteration to fon_max_delta_
+    // This ensures Fock matrices remain similar between DIIS iterations
+
+    double delta_a_from_prev = n_a - prev_n_a_;
+    double delta_b_from_prev = n_b - prev_n_b_;
+
+    bool limited = false;
+    if (std::abs(delta_a_from_prev) > fon_max_delta_) {
+        n_a = prev_n_a_ + std::copysign(fon_max_delta_, delta_a_from_prev);
+        n_a = std::clamp(n_a, 0.0, 2.0);
+        limited = true;
+    }
+    if (std::abs(delta_b_from_prev) > fon_max_delta_) {
+        n_b = prev_n_b_ + std::copysign(fon_max_delta_, delta_b_from_prev);
+        n_b = std::clamp(n_b, 0.0, 2.0);
+        limited = true;
+    }
+
+    if (limited) {
+        // Update active space with limited FONs
+        active_space_->set_pair_fon(0, n_a);
+        active_space_->set_pair_fon(1, n_b);
+        compute_weighting_factors();
+
+        if (reks_debug_ >= 1) {
+            outfile->Printf("  FON change limited: n_a: %.6f->%.6f (delta %.4f), n_b: %.6f->%.6f (delta %.4f)\n",
+                           prev_n_a_, n_a, n_a - prev_n_a_, prev_n_b_, n_b, n_b - prev_n_b_);
+        }
+    }
+
+    // Store current FONs for next iteration's delta limiting
+    prev_n_a_ = n_a;
+    prev_n_b_ = n_b;
 
     // =========================================================================
     // OSS1 FON Optimization: Optimize n'_a (oss1_fon_a_) for OSS1 configuration

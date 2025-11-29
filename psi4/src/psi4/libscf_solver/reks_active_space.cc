@@ -62,8 +62,14 @@ std::unique_ptr<REKSActiveSpace> REKSActiveSpace::create_4_4(double w_pps) {
 
 REKS22Space::REKS22Space(double w_pps, double w_oss)
     : w_pps_(w_pps), w_oss_(w_oss) {
-    // Initialize GVB pair at closed-shell limit: n_r=2.0, n_s=0.0
-    pair_ = GVBPair(0, 1, 2.0);
+    // Initialize GVB pair at symmetric occupation: n_r=1.0, n_s=1.0
+    // This is consistent with GAMESS and allows the FON optimizer to
+    // find the global minimum (which may be at n_r != 2.0 for some systems).
+    //
+    // At n_r=1.0: C_0=0.25, C_1=0.25, C_2=0.5, C_3=0.0
+    // All weights are non-negative, ensuring stable DIIS convergence.
+    // The FON optimizer will find the correct minimum during Phase 2.
+    pair_ = GVBPair(0, 1, 1.0);
 
     // Initialize microstate occupation patterns
     init_microstates();
@@ -613,14 +619,21 @@ void REKS44Space::compute_weights(std::vector<double>& C_L) const {
     //
     // Reference: Filatov et al. J. Chem. Phys. 147, 064104 (2017)
     //
-    // Note: Currently using 20 microstates (L=0-19)
+    // Note: SA energy uses microstates L=0-19 (20 microstates)
     // Microstates L=16-19 are for DOSS/DSPS and have zero weight in 3SA
+    // Microstates L=20-27 are for OSS3/OSS4 and have zero weight in 3SA
+    //
+    // CRITICAL: C_L must be sized to n_microstates() to prevent out-of-bounds
+    // access in compute_E_SA() and other functions that iterate over all microstates.
 
-    const int n_micro = 20;
-    C_L.resize(n_micro);
+    const int n_micro_sa = 20;  // Microstates used in SA energy
+    const int n_micro_total = n_microstates();  // Total microstates (28)
 
-    // Compute weights for each configuration
-    std::vector<double> C_PPS(n_micro), C_OSS1(n_micro), C_OSS2(n_micro);
+    // Resize to total number of microstates, initialize all to zero
+    C_L.assign(n_micro_total, 0.0);
+
+    // Compute weights for each configuration (only L=0-19 are non-zero for 3SA)
+    std::vector<double> C_PPS(n_micro_sa), C_OSS1(n_micro_sa), C_OSS2(n_micro_sa);
 
     compute_weights_PPS(C_PPS);
     compute_weights_OSS1(C_OSS1);
@@ -630,9 +643,10 @@ void REKS44Space::compute_weights(std::vector<double>& C_L) const {
     // where w_OSS1 = w_OSS2 = (1 - w_PPS)/2
     double w_oss = (1.0 - w_pps_) / 2.0;
 
-    for (int L = 0; L < n_micro; ++L) {
+    for (int L = 0; L < n_micro_sa; ++L) {
         C_L[L] = w_pps_ * C_PPS[L] + w_oss * C_OSS1[L] + w_oss * C_OSS2[L];
     }
+    // L=20-27 remain zero (already initialized by assign)
 }
 
 void REKS44Space::compute_weights_PPS(std::vector<double>& C_L) const {
