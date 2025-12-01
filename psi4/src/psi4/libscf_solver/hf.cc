@@ -1065,7 +1065,7 @@ void HF::guess() {
         if (print_) outfile->Printf("  SCF Guess: Orbitals guess was supplied from a previous computation.\n\n");
 
         std::string reference = options_.get_str("REFERENCE");
-        bool single_orb = (reference == "RHF");
+        bool single_orb = (reference == "RHF") || (reference == "REKS");
 
         if (single_orb) {
             guess_Cb_ = guess_Ca_;

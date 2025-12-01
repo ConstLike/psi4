@@ -151,9 +151,9 @@ class REKS : public RHF {
     double fon_max_delta_ = 0.1;
 
     /// Previous FON values for delta limiting
-    double prev_n_r_ = 1.0;        ///< REKS(2,2): previous n_r (starts symmetric like GAMESS)
-    double prev_n_a_ = 2.0;        ///< REKS(4,4): previous n_a
-    double prev_n_b_ = 2.0;        ///< REKS(4,4): previous n_b
+    double prev_n_r_ = 1.0;        ///< REKS(2,2): previous n_r (starts symmetric)
+    double prev_n_a_ = 1.0;        ///< REKS(4,4): previous n_a (starts symmetric)
+    double prev_n_b_ = 1.0;        ///< REKS(4,4): previous n_b (starts symmetric)
 
     /// Flag: reset DIIS when transitioning from Phase 1 to Phase 2
     bool fon_phase_transition_ = false;
