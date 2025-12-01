@@ -131,6 +131,19 @@ class REKS : public RHF {
     int reks_debug_ = 0;           ///< 0=none, 1=energies, 2=matrices, 3=all
 
     // ========================================================================
+    // Orbital Localization for Active Space
+    // ========================================================================
+
+    std::string localization_type_;    ///< "NONE" or "BOYS"
+    bool localization_done_ = false;   ///< Track if localization has been applied
+
+    /// Apply Boys localization to active space orbitals
+    void localize_active_space();
+
+    /// Reorder active orbitals for REKS(4,4) GVB pairs based on centroids
+    void reorder_active_orbitals_for_gvb_pairs();
+
+    // ========================================================================
     // FON Optimization Control (Two-Phase SCF)
     // ========================================================================
     //
@@ -147,8 +160,8 @@ class REKS : public RHF {
     int fon_freeze_iters_ = 0;
 
     /// Maximum FON change per SCF iteration (Phase 2 damping)
-    /// Smaller steps ensure smoother DIIS convergence
-    double fon_max_delta_ = 0.1;
+    /// Set to 2.0 to effectively disable (pure Newton-Raphson as in papers)
+    double fon_max_delta_ = 2.0;
 
     /// Previous FON values for delta limiting
     double prev_n_r_ = 1.0;        ///< REKS(2,2): previous n_r (starts symmetric)

@@ -1446,6 +1446,10 @@ int read_options(const std::string &name, Options &options, bool suppress_printi
         options.add_str("REFERENCE", "RHF", "RHF ROHF UHF CUHF RKS UKS REKS");
         /*- Number of GVB pairs for REKS. 1 = REKS(2,2), 2 = REKS(4,4) -*/
         options.add_int("REKS_PAIRS", 1);
+        /*- Orbital localization for REKS active space.
+            NONE = use canonical orbitals (default),
+            BOYS = Boys localization to make GVB pairs symmetric. -*/
+        options.add_str("REKS_LOCALIZATION", "NONE", "NONE BOYS");
         /*- Primary basis set -*/
         options.add_str("BASIS", "");
         /*- Auxiliary basis set for SCF density fitting computations.

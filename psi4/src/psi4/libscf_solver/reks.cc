@@ -54,6 +54,8 @@
 #include "psi4/libfock/v.h"  // For VBase (XC potential)
 #include "psi4/libfunctional/superfunctional.h"
 #include "psi4/libqt/qt.h"  // For C_DGEMM, C_DGER (BLAS)
+#include "psi4/libmints/local.h"  // For Boys localization
+#include "psi4/libmints/mintshelper.h"  // For dipole integrals
 
 #include <cmath>
 #include <algorithm>
@@ -80,6 +82,10 @@ void REKS::reks_common_init() {
 
     // Use existing DEBUG option for REKS debug output
     reks_debug_ = options_.get_int("DEBUG");
+
+    // Get localization type for active space orbitals
+    localization_type_ = options_.get_str("REKS_LOCALIZATION");
+    localization_done_ = false;
 
     // Get REKS active space type from options (default: 2,2)
     // REKS_PAIRS = 1 -> REKS(2,2), REKS_PAIRS = 2 -> REKS(4,4)
@@ -1606,6 +1612,12 @@ void REKS::form_D() {
     // 1. Build standard RHF density Da_ (needed for DIIS, convergence checks)
     RHF::form_D();
 
+    // 1.5. Apply orbital localization on every REKS iteration (after first)
+    //      This keeps active orbitals localized despite SCF rotations
+    if (iteration_ >= 1 && localization_type_ != "NONE") {
+        localize_active_space();
+    }
+
     // 2. Build REKS-specific base densities from current Ca_
     build_base_densities();
 
@@ -2188,6 +2200,266 @@ std::shared_ptr<REKS> REKS::c1_deep_copy(std::shared_ptr<BasisSet> basis) {
     if (X_) reks_wfn->X_->remove_symmetry(X_, SO2AO);
 
     return reks_wfn;
+}
+
+// ============================================================================
+// Orbital Localization for Active Space
+// ============================================================================
+
+void REKS::localize_active_space() {
+    if (localization_type_ == "NONE") return;
+    // Note: We re-localize every iteration to maintain locality after SCF rotations
+
+    int n_active = active_space_->n_orbitals();
+    int nso = Ca_->rowspi()[0];
+
+    // Only print header on first call
+    static bool first_call = true;
+    if (first_call) {
+        outfile->Printf("\n  === REKS Active Space Localization ===\n");
+        outfile->Printf("  Method: %s\n", localization_type_.c_str());
+        outfile->Printf("  Active orbitals: %d (indices:", n_active);
+        for (int i = 0; i < n_active; i++) {
+            outfile->Printf(" %d", active_mo_indices_[i]);
+        }
+        outfile->Printf(")\n");
+        first_call = false;
+    }
+
+    // Extract active orbitals into separate matrix
+    auto C_active = std::make_shared<Matrix>("C_active", nso, n_active);
+    double** Cp = Ca_->pointer();
+    double** Cap = C_active->pointer();
+    for (int i = 0; i < n_active; i++) {
+        int mo_idx = active_mo_indices_[i];
+        for (int mu = 0; mu < nso; mu++) {
+            Cap[mu][i] = Cp[mu][mo_idx];
+        }
+    }
+
+    // Build localizer (suppress output)
+    auto localizer = Localizer::build(localization_type_, basisset_, C_active);
+    localizer->set_convergence(1e-8);
+    localizer->set_maxiter(50);
+    localizer->set_print(0);  // Suppress Boys localizer output
+
+    // Localize
+    localizer->localize();
+
+    auto L_active = localizer->L();
+    double** Lp = L_active->pointer();
+
+    // For REKS(4,4): Localize occupied (first 2) and virtual (last 2) SEPARATELY
+    // Then pair by spatial overlap to get bond orbitals
+    if (n_active == 4) {
+        // Compute dipole integrals
+        auto mints = std::make_shared<MintsHelper>(basisset_);
+        std::vector<SharedMatrix> dipole = mints->ao_dipole();
+        SharedMatrix dipole_z = dipole[2];  // Z-component
+
+        // Separate localization for occupied and virtual
+        // Extract first 2 columns (occupied) and last 2 (virtual)
+        auto C_occ = std::make_shared<Matrix>("C_occ", nso, 2);
+        auto C_vir = std::make_shared<Matrix>("C_vir", nso, 2);
+        double** Cocc = C_occ->pointer();
+        double** Cvir = C_vir->pointer();
+        double** Ctmp = C_active->pointer();
+
+        for (int mu = 0; mu < nso; mu++) {
+            Cocc[mu][0] = Ctmp[mu][0];
+            Cocc[mu][1] = Ctmp[mu][1];
+            Cvir[mu][0] = Ctmp[mu][2];
+            Cvir[mu][1] = Ctmp[mu][3];
+        }
+
+        // Localize occupied
+        auto loc_occ = Localizer::build("BOYS", basisset_, C_occ);
+        loc_occ->set_convergence(1e-8);
+        loc_occ->set_maxiter(50);
+        loc_occ->set_print(0);
+        loc_occ->localize();
+        auto L_occ = loc_occ->L();
+        double** Locc = L_occ->pointer();
+
+        // Localize virtual
+        auto loc_vir = Localizer::build("BOYS", basisset_, C_vir);
+        loc_vir->set_convergence(1e-8);
+        loc_vir->set_maxiter(50);
+        loc_vir->set_print(0);
+        loc_vir->localize();
+        auto L_vir = loc_vir->L();
+        double** Lvir = L_vir->pointer();
+
+        // Compute z-centroid for each localized orbital
+        std::vector<std::pair<double, int>> occ_cents(2), vir_cents(2);
+        for (int i = 0; i < 2; i++) {
+            double z_occ = 0.0, z_vir = 0.0;
+            for (int mu = 0; mu < nso; mu++) {
+                for (int nu = 0; nu < nso; nu++) {
+                    double dz = dipole_z->get(mu, nu);
+                    z_occ += Locc[mu][i] * dz * Locc[nu][i];
+                    z_vir += Lvir[mu][i] * dz * Lvir[nu][i];
+                }
+            }
+            occ_cents[i] = {z_occ, i};
+            vir_cents[i] = {z_vir, i};
+        }
+
+        // Sort by z-coordinate
+        std::sort(occ_cents.begin(), occ_cents.end());
+        std::sort(vir_cents.begin(), vir_cents.end());
+
+        if (reks_debug_ >= 1) {
+            outfile->Printf("  REKS(4,4) localization centroids:\n");
+            outfile->Printf("    Occ left  z=%.4f (idx %d) -> MO a\n", occ_cents[0].first, occ_cents[0].second);
+            outfile->Printf("    Occ right z=%.4f (idx %d) -> MO b\n", occ_cents[1].first, occ_cents[1].second);
+            outfile->Printf("    Vir left  z=%.4f (idx %d) -> MO d\n", vir_cents[0].first, vir_cents[0].second);
+            outfile->Printf("    Vir right z=%.4f (idx %d) -> MO c\n", vir_cents[1].first, vir_cents[1].second);
+        }
+
+        // Now we have:
+        // occ_cents[0] = left bond (σ12 at z ~ H1-H2 midpoint)
+        // occ_cents[1] = right bond (σ34 at z ~ H3-H4 midpoint)
+        // vir_cents[0] = left antibond (σ*12)
+        // vir_cents[1] = right antibond (σ*34)
+        //
+        // REKS(4,4) ordering: a, b, c, d
+        // Pair 0 (a,d): left bond (σ12) and left antibond (σ*12)
+        // Pair 1 (b,c): right bond (σ34) and right antibond (σ*34)
+        //
+        // Assignment:
+        // MO 0 (a) = occ left (σ12)
+        // MO 1 (b) = occ right (σ34)
+        // MO 2 (c) = vir right (σ*34) - pairs with b
+        // MO 3 (d) = vir left (σ*12) - pairs with a
+
+        // Insert into Ca_
+        int mo_a = active_mo_indices_[0];
+        int mo_b = active_mo_indices_[1];
+        int mo_c = active_mo_indices_[2];
+        int mo_d = active_mo_indices_[3];
+
+        for (int mu = 0; mu < nso; mu++) {
+            Cp[mu][mo_a] = Locc[mu][occ_cents[0].second];  // a = left bond
+            Cp[mu][mo_b] = Locc[mu][occ_cents[1].second];  // b = right bond
+            Cp[mu][mo_c] = Lvir[mu][vir_cents[1].second];  // c = right antibond
+            Cp[mu][mo_d] = Lvir[mu][vir_cents[0].second];  // d = left antibond
+        }
+    } else {
+        // For REKS(2,2) or other: just insert directly
+        for (int i = 0; i < n_active; i++) {
+            int mo_idx = active_mo_indices_[i];
+            for (int mu = 0; mu < nso; mu++) {
+                Cp[mu][mo_idx] = Lp[mu][i];
+            }
+        }
+    }
+
+    localization_done_ = true;
+}
+
+void REKS::reorder_active_orbitals_for_gvb_pairs() {
+    // Compute orbital centroids using dipole integrals
+    // For linear H4 along z-axis, sort by z-centroid
+
+    auto mints = std::make_shared<MintsHelper>(basisset_);
+    std::vector<SharedMatrix> dipole = mints->ao_dipole();
+    SharedMatrix dipole_z = dipole[2];  // Z-component
+
+    int n_active = 4;
+    int nso = Ca_->rowspi()[0];
+    double** Cp = Ca_->pointer();
+
+    // Compute z-centroid for each active orbital
+    std::vector<std::pair<double, int>> centroids(n_active);
+    for (int i = 0; i < n_active; i++) {
+        int mo_idx = active_mo_indices_[i];
+        double z_cent = 0.0;
+        for (int mu = 0; mu < nso; mu++) {
+            for (int nu = 0; nu < nso; nu++) {
+                z_cent += Cp[mu][mo_idx] * dipole_z->get(mu, nu) * Cp[nu][mo_idx];
+            }
+        }
+        centroids[i] = {z_cent, i};
+        if (reks_debug_ >= 1) {
+            outfile->Printf("  Orbital %d (MO %d): z-centroid = %.4f\n",
+                            i, mo_idx, z_cent);
+        }
+    }
+
+    // Sort by z-coordinate
+    std::sort(centroids.begin(), centroids.end());
+
+    // REKS(4,4) orbital ordering: a, b, c, d in positions 0, 1, 2, 3
+    // GVB pair 0: (a, d) - positions 0 and 3
+    // GVB pair 1: (b, c) - positions 1 and 2
+    //
+    // For linear H4 with Boys localization, we get 4 atom-centered orbitals.
+    // After sorting by z-centroid:
+    // centroids[0] = H1 (leftmost)
+    // centroids[1] = H2
+    // centroids[2] = H3
+    // centroids[3] = H4 (rightmost)
+    //
+    // For symmetric GVB pairs, we need:
+    // - GVB pair 0: H1 + H2 (adjacent atoms, left bond)
+    // - GVB pair 1: H3 + H4 (adjacent atoms, right bond)
+    //
+    // Correct assignment:
+    // a = H1 (centroids[0]) - position 0
+    // d = H2 (centroids[1]) - position 3 (pair with a)
+    // b = H3 (centroids[2]) - position 1
+    // c = H4 (centroids[3]) - position 2 (pair with b)
+    //
+    // Final order: [H1, H3, H4, H2] for positions [a, b, c, d]
+
+    std::vector<int> new_order = {
+        centroids[0].second,  // a = H1 (leftmost)
+        centroids[2].second,  // b = H3 (right-left)
+        centroids[3].second,  // c = H4 (rightmost)
+        centroids[1].second   // d = H2 (left-right, pairs with a)
+    };
+
+    if (reks_debug_ >= 1) {
+        outfile->Printf("  Reordering: old -> new mapping:\n");
+        for (int i = 0; i < n_active; i++) {
+            outfile->Printf("    position %d: orbital %d (z=%.4f)\n",
+                            i, new_order[i], centroids[i].first);
+        }
+    }
+
+    // Check if reordering is needed
+    bool needs_reorder = false;
+    for (int i = 0; i < n_active; i++) {
+        if (new_order[i] != i) {
+            needs_reorder = true;
+            break;
+        }
+    }
+
+    if (!needs_reorder) {
+        outfile->Printf("  Orbitals already in correct order.\n");
+        return;
+    }
+
+    // Create temporary storage for columns
+    std::vector<std::vector<double>> temp_cols(n_active, std::vector<double>(nso));
+    for (int i = 0; i < n_active; i++) {
+        int mo_idx = active_mo_indices_[new_order[i]];
+        for (int mu = 0; mu < nso; mu++) {
+            temp_cols[i][mu] = Cp[mu][mo_idx];
+        }
+    }
+
+    // Write back in new order
+    for (int i = 0; i < n_active; i++) {
+        int mo_idx = active_mo_indices_[i];
+        for (int mu = 0; mu < nso; mu++) {
+            Cp[mu][mo_idx] = temp_cols[i][mu];
+        }
+    }
+
+    outfile->Printf("  Orbitals reordered for GVB pairs: (a,d)=(0,3), (b,c)=(1,2)\n");
 }
 
 }  // namespace scf
