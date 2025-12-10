@@ -37,6 +37,13 @@
 namespace psi {
 namespace scf {
 
+/// FON optimization phase for adaptive solver (FON_SOLVER=4)
+enum class FONPhase {
+    STABLE,         ///< Hessian positive definite, well away from transition
+    PRE_TRANSITION, ///< Hessian still positive but eigenvalues decreasing (approaching transition)
+    TRANSITION      ///< Hessian indefinite (at or past saddle point)
+};
+
 /**
  * @class REKS
  * @brief Restricted Ensemble Kohn-Sham (REKS) SCF engine
@@ -136,6 +143,7 @@ class REKS : public RHF {
 
     std::string localization_type_;    ///< "NONE" or "BOYS"
     bool localization_done_ = false;   ///< Track if localization has been applied
+    int localization_freeze_iter_ = 0; ///< Freeze localization after this iteration (0=never freeze)
 
     /// Apply Boys localization to active space orbitals
     void localize_active_space();
@@ -160,7 +168,8 @@ class REKS : public RHF {
     int fon_freeze_iters_ = 0;
 
     /// Maximum FON change per SCF iteration (Phase 2 damping)
-    /// Set to 2.0 to effectively disable (pure Newton-Raphson as in papers)
+    /// Set to 2.0 to effectively disable (was 0.3)
+    /// This allows FON to quickly escape from saddle point n=1.0
     double fon_max_delta_ = 2.0;
 
     /// Previous FON values for delta limiting
@@ -170,6 +179,87 @@ class REKS : public RHF {
 
     /// Flag: reset DIIS when transitioning from Phase 1 to Phase 2
     bool fon_phase_transition_ = false;
+
+    /// Enable line search with golden ratio for REKS(4,4) FON optimization.
+    /// Prevents oscillations when Newton-Raphson step increases energy.
+    bool reks_line_search_ = true;
+
+    /// Threshold for "shake it up" - if FON is within this of 1.0, reset to 0.5.
+    /// Prevents FON locking at the degenerate point n=1.0. Set to 0.0 to disable.
+    double reks_shake_threshold_ = 1e-6;
+
+    /// Coupling threshold for REKS(4,4). If coupling element is below this,
+    /// fix corresponding FON at boundary (2.0). Set to 0.0 to disable (default).
+    double reks_coupling_threshold_ = 0.0;
+
+    /// Initial FON value for n_a (REKS(4,4) geometry scan continuation).
+    /// Set to -1.0 to use HAM-DIAG initialization (default).
+    /// For geometry scans, set to previous geometry's FON for smooth PES.
+    double reks_initial_na_ = -1.0;
+
+    /// Initial FON value for n_b (REKS(4,4) geometry scan continuation).
+    /// Set to -1.0 to use HAM-DIAG initialization (default).
+    double reks_initial_nb_ = -1.0;
+
+    /// FON history for oscillation detection (last 3 values)
+    double prev_prev_n_a_ = 1.0;   ///< n_a from 2 iterations ago
+    double prev_prev_n_b_ = 1.0;   ///< n_b from 2 iterations ago
+
+    /// Counter for consecutive oscillations
+    int fon_oscillation_count_ = 0;
+
+    /// Flag: FONs are frozen due to oscillation detection
+    bool fon_oscillation_frozen_ = false;
+
+    /// Flag: REKS(4,4) FONs have been initialized from Hamiltonian diagonalization
+    bool fon_initialized_44_ = false;
+
+    // ========================================================================
+    // Trust-Region FON Optimization (REKS(4,4))
+    // ========================================================================
+    //
+    // Trust-Region Augmented Hessian (TRAH) method for robust FON optimization.
+    // Handles indefinite Hessian at saddle points and near boundaries.
+    //
+    // Reference: J. Chem. Phys. 156, 204104 (2022)
+
+    /// Flag: use Trust-Region method instead of Newton-Raphson for REKS(4,4)
+    bool use_trust_region_44_ = false;
+
+    /// Current trust region radius (persistent across SCF iterations)
+    double trust_radius_44_ = reks::constants::TR_DELTA_INIT;
+
+    // ========================================================================
+    // Multi-Start FON Optimization
+    // ========================================================================
+
+    /// Flag: enable multi-start FON optimization
+    bool reks_multi_start_ = false;
+
+    /// Branch selection criterion: "ENERGY", "DIABATIC", or "AUTO"
+    std::string reks_branch_criterion_ = "AUTO";
+
+    /// Energy tolerance for AUTO branch selection (Ha)
+    double reks_energy_tolerance_ = 0.01;
+
+    /// Report all solutions (debug)
+    bool reks_report_all_solutions_ = false;
+
+    /// FON solver level: 1=Fast(NR), 2=Balanced(TR), 3=Robust(TR+MS), 4=Adaptive
+    int fon_solver_level_ = 2;
+
+    // ========================================================================
+    // Adaptive FON Solver (FON_SOLVER=4)
+    // ========================================================================
+
+    /// Previous Hessian determinant for trend detection
+    double det_H_prev_ = 1.0;
+
+    /// Flag: FON values should be symmetric (n_a = n_b) based on molecular symmetry
+    bool is_symmetric_fon_ = true;
+
+    /// Flag: enforce FON symmetry from user option
+    bool reks_enforce_symmetry_ = false;
 
     // ========================================================================
     // multi_scf() Support: Precomputed J/K Matrices
@@ -217,6 +307,66 @@ class REKS : public RHF {
 
     /// REKS(4,4) FON optimization: two variables (n_a, n_b)
     void rex_solver_44();
+
+    /// Trust-Region FON optimization for REKS(4,4)
+    /// Handles indefinite Hessian robustly via secular equation
+    void trust_region_fon_optimizer_44();
+
+    /// Adaptive Trust-Region + Multi-Start for REKS(4,4) (FON_SOLVER=3)
+    /// Uses Trust-Region by default, triggers Multi-Start only when needed
+    /// (indefinite Hessian, first iteration, or large FON change)
+    void trust_region_fon_optimizer_44_adaptive();
+
+    /// Adaptive FON solver for REKS(4,4) (FON_SOLVER=4)
+    /// Continuation-first approach with early transition detection.
+    /// Auto-probes for diradical solutions when Hessian indicates transition.
+    void adaptive_fon_solver_44();
+
+    /// Detect current FON optimization phase based on Hessian analysis
+    /// @param grad Gradient vector [dE/dn_a, dE/dn_b]
+    /// @param hess Hessian matrix (2x2 as flat vector [H_aa, H_ab, H_ba, H_bb])
+    /// @return Current phase: STABLE, PRE_TRANSITION, or TRANSITION
+    FONPhase detect_fon_phase(const std::vector<double>& grad, const std::vector<double>& hess);
+
+    /// Multi-start FON optimization for REKS(4,4)
+    /// Tries multiple starting points and selects best based on criterion
+    void rex_solver_44_multi_start();
+
+    /// Optimize FON from a single starting point using Trust-Region
+    /// @param start Starting point (n_a, n_b)
+    /// @param start_id ID of this starting point (for tracking)
+    /// @return Converged FON solution
+    reks::FONSolution optimize_from_start_44(const reks::FONStartPoint& start, int start_id);
+
+    /// Select best solution from list based on criterion
+    reks::FONSolution select_solution(
+        const std::vector<reks::FONSolution>& solutions,
+        double prev_na, double prev_nb,
+        const std::string& criterion,
+        double energy_tol);
+
+    /// Solve Trust-Region subproblem: min g·p + ½p·H·p s.t. ||p|| ≤ Δ
+    /// @param g Gradient vector [g_a, g_b]
+    /// @param H Hessian matrix (2x2)
+    /// @param Delta Trust region radius
+    /// @return Step vector [δn_a, δn_b]
+    std::vector<double> solve_trust_region_subproblem_2d(
+        const std::vector<double>& g, const std::vector<std::vector<double>>& H, double Delta);
+
+    /// Solve secular equation for boundary-constrained step
+    /// When Newton step is outside trust region or Hessian is indefinite
+    /// @param g1, g2 Gradient in eigenspace
+    /// @param lam1, lam2 Hessian eigenvalues
+    /// @param v1, v2 Hessian eigenvectors (2-element each)
+    /// @param Delta Trust region radius
+    /// @return Step vector in original space [δn_a, δn_b]
+    std::vector<double> solve_boundary_constrained_2d(
+        double g1, double g2, double lam1, double lam2,
+        const std::vector<double>& v1, const std::vector<double>& v2, double Delta);
+
+    /// Initialize FON from 4×4 CI Hamiltonian diagonalization (REKS(4,4) only)
+    /// This provides a physically motivated initial guess instead of saddle point n=1.0
+    void initialize_fon_from_hamiltonian_44();
 
     /// Compute weighting factors C_L (delegates to active_space_)
     void compute_weighting_factors();

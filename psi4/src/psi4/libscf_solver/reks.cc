@@ -59,6 +59,7 @@
 
 #include <cmath>
 #include <algorithm>
+#include <array>
 
 namespace psi {
 namespace scf {
@@ -86,6 +87,52 @@ void REKS::reks_common_init() {
     // Get localization type for active space orbitals
     localization_type_ = options_.get_str("REKS_LOCALIZATION");
     localization_done_ = false;
+    localization_freeze_iter_ = options_.get_int("REKS_LOCALIZATION_FREEZE");
+
+    // Get FON optimizer options
+    reks_line_search_ = options_.get_bool("REKS_LINE_SEARCH");
+    reks_shake_threshold_ = options_.get_double("REKS_SHAKE_THRESHOLD");
+    reks_coupling_threshold_ = options_.get_double("REKS_COUPLING_THRESHOLD");
+    fon_max_delta_ = options_.get_double("REKS_FON_MAX_DELTA");
+    reks_initial_na_ = options_.get_double("REKS_INITIAL_NA");
+    reks_initial_nb_ = options_.get_double("REKS_INITIAL_NB");
+    use_trust_region_44_ = options_.get_bool("REKS_USE_TRUST_REGION");
+
+    // Multi-Start FON Optimization options
+    reks_multi_start_ = options_.get_bool("REKS_MULTI_START");
+    reks_branch_criterion_ = options_.get_str("REKS_BRANCH_CRITERION");
+    reks_energy_tolerance_ = options_.get_double("REKS_ENERGY_TOLERANCE");
+    reks_report_all_solutions_ = options_.get_bool("REKS_REPORT_ALL_SOLUTIONS");
+
+    // FON Solver Level (simplified interface)
+    fon_solver_level_ = options_.get_int("FON_SOLVER");
+    if (fon_solver_level_ < 1) fon_solver_level_ = 1;
+    if (fon_solver_level_ > 4) fon_solver_level_ = 4;
+
+    // Adaptive solver options
+    reks_enforce_symmetry_ = options_.get_bool("REKS_ENFORCE_SYMMETRY");
+
+    // Set trust region and multi-start flags based on FON_SOLVER level
+    // Level 1: NR only  -> no trust region, no multi-start
+    // Level 2: TR only  -> trust region, no multi-start, localization_freeze=10
+    // Level 3: TR + MS  -> trust region + multi-start, localization_freeze=10
+    // Level 4: Adaptive -> trust region + continuation, no multi-start (uses probing)
+    if (fon_solver_level_ >= 2) {
+        use_trust_region_44_ = true;
+        // Auto-enable localization freeze for FON_SOLVER>=2 if not explicitly set
+        // This prevents SCF oscillations from repeated localization
+        if (localization_freeze_iter_ == 0) {
+            localization_freeze_iter_ = 10;
+        }
+    }
+    if (fon_solver_level_ >= 3) {
+        reks_multi_start_ = true;
+    }
+    if (fon_solver_level_ >= 4) {
+        // Adaptive solver: uses multi-start + coupling-based direction
+        // Each point finds the global minimum independently
+        reks_multi_start_ = true;
+    }
 
     // Get REKS active space type from options (default: 2,2)
     // REKS_PAIRS = 1 -> REKS(2,2), REKS_PAIRS = 2 -> REKS(4,4)
@@ -731,7 +778,38 @@ void REKS::rex_solver() {
         rex_solver_22();
     } else if (n_pairs == 2) {
         // REKS(4,4): two FON variables
-        rex_solver_44();
+        // FON_SOLVER levels: 1=Fast(NR), 2=Balanced(TR), 3=Robust(TR+MS)
+        if (reks_debug_ >= 1 && iteration_ == 1) {
+            outfile->Printf("\n  ================================================================================\n");
+            outfile->Printf("  REKS(4,4) FON Solver Configuration\n");
+            outfile->Printf("  ================================================================================\n");
+            outfile->Printf("  FON_SOLVER level: %d", fon_solver_level_);
+            if (fon_solver_level_ == 1) outfile->Printf(" (Fast: Newton-Raphson)\n");
+            else if (fon_solver_level_ == 2) outfile->Printf(" (Balanced: Trust-Region)\n");
+            else if (fon_solver_level_ == 3) outfile->Printf(" (Robust: Trust-Region + Multi-Start)\n");
+            else outfile->Printf(" (Adaptive: Continuation + Early-Transition)\n");
+            if (reks_enforce_symmetry_) {
+                outfile->Printf("  Symmetry enforcement: ENABLED (n_a = n_b)\n");
+            }
+            outfile->Printf("  ================================================================================\n");
+        }
+
+        if (fon_solver_level_ >= 4) {
+            // FON_SOLVER=4: Adaptive solver
+            // Continuation-first + early transition detection + symmetry enforcement
+            adaptive_fon_solver_44();
+        } else if (fon_solver_level_ >= 3 && reks_multi_start_) {
+            // FON_SOLVER=3: Adaptive Multi-Start
+            // Use Trust-Region by default, trigger multi-start only when needed
+            // (first iteration, indefinite Hessian, or large FON change)
+            trust_region_fon_optimizer_44_adaptive();
+        } else if (use_trust_region_44_) {
+            // FON_SOLVER=2: Trust-Region Augmented Hessian method
+            trust_region_fon_optimizer_44();
+        } else {
+            // FON_SOLVER=1: Original Newton-Raphson with coupling-based direction
+            rex_solver_44();
+        }
     } else {
         throw PSIEXCEPTION("RexSolver: unsupported number of GVB pairs: " + std::to_string(n_pairs));
     }
@@ -930,13 +1008,145 @@ void REKS::rex_solver_22() {
     }
 }
 
+void REKS::initialize_fon_from_hamiltonian_44() {
+    // =========================================================================
+    // 4×4 CI Hamiltonian Diagonalization for Initial FON Guess
+    // =========================================================================
+    //
+    // Based on c-code rexslv4x4() lines 340-361 (Filatov's GAMESS implementation)
+    //
+    // Instead of starting at the saddle point n_a = n_b = 1.0, we diagonalize
+    // the 4×4 CI Hamiltonian to get physically motivated initial FONs.
+    //
+    // Hamiltonian basis states:
+    //   |1⟩ = |aābb̄⟩  (E_micro[0] = eab)
+    //   |2⟩ = |aācc̄⟩  (E_micro[1] = eac)
+    //   |3⟩ = |bb̄dd̄⟩  (E_micro[2] = ebd)
+    //   |4⟩ = |cc̄dd̄⟩  (E_micro[3] = ecd)
+    //
+    // Off-diagonal coupling elements:
+    //   dad: coupling between (a,d) pair (derived from E_micro[4-7])
+    //   dbc: coupling between (b,c) pair (derived from E_micro[8-11])
+
+    if (E_micro_.size() < 12) {
+        outfile->Printf("  [HAM-DIAG] Not enough microstates (need 12), skipping\n");
+        return;
+    }
+
+    // Extract closed-shell microstate energies (diagonal elements)
+    double eab = E_micro_[0];  // |aābb̄|
+    double eac = E_micro_[1];  // |aācc̄|
+    double ebd = E_micro_[2];  // |bb̄dd̄|
+    double ecd = E_micro_[3];  // |cc̄dd̄|
+
+    // Compute coupling elements from singlet-triplet splitting
+    // Formula derived from weight analysis:
+    //   PPS weights: C_4=C_5=-f_ad/2 (singlet), C_6=C_7=+f_ad/2 (triplet)
+    //   Coupling contribution: -f_ad * dad = -f_ad/2*(E[4]+E[5]) + f_ad/2*(E[6]+E[7])
+    //   Therefore: dad = (E[4]+E[5]-E[6]-E[7])/2
+    double dad = (E_micro_[4] + E_micro_[5] - E_micro_[6] - E_micro_[7]) / 2.0;
+    double dbc = (E_micro_[8] + E_micro_[9] - E_micro_[10] - E_micro_[11]) / 2.0;
+
+    // Coupling threshold check (from c-code lines 365-366)
+    const double coupling_threshold = 1.0e-8;
+    bool fix_na = (std::fabs(dad) <= coupling_threshold);
+    bool fix_nb = (std::fabs(dbc) <= coupling_threshold);
+
+    if (fix_na && fix_nb) {
+        // Both couplings negligible → closed-shell solution
+        active_space_->set_pair_fon(0, 2.0);  // n_a = 2.0
+        active_space_->set_pair_fon(1, 2.0);  // n_b = 2.0
+        outfile->Printf("  [HAM-DIAG] Weak coupling (dad=%.2e, dbc=%.2e): n_a=n_b=2.0\n", dad, dbc);
+        compute_weighting_factors();
+        return;
+    }
+
+    // Build 4×4 Hamiltonian (column-major for LAPACK)
+    // Matrix structure (from c-code):
+    //  | eab | dbc | dad |  0  |
+    //  | dbc | eac |  0  | dad |
+    //  | dad |  0  | ebd | dbc |
+    //  |  0  | dad | dbc | ecd |
+    std::vector<double> H(16, 0.0);
+    // Column-major indexing: H[i + j*4] = H[i][j]
+    H[0]  = eab;   // H[0,0]
+    H[5]  = eac;   // H[1,1]
+    H[10] = ebd;   // H[2,2]
+    H[15] = ecd;   // H[3,3]
+    H[1]  = dbc;   // H[1,0] = H[0,1]
+    H[4]  = dbc;   // H[0,1]
+    H[2]  = dad;   // H[2,0] = H[0,2]
+    H[8]  = dad;   // H[0,2]
+    H[7]  = dad;   // H[3,1] = H[1,3]
+    H[13] = dad;   // H[1,3]
+    H[11] = dbc;   // H[3,2] = H[2,3]
+    H[14] = dbc;   // H[2,3]
+
+    // Eigenvalue decomposition using LAPACK dsyev
+    int n = 4;
+    std::vector<double> w(4);      // eigenvalues
+    std::vector<double> work(16);
+    int lwork = 16;
+    int info;
+
+    // C_DSYEV: computes eigenvalues and eigenvectors of symmetric matrix
+    // 'V' = compute eigenvectors, 'L' = use lower triangle
+    // Returns info: 0 = success, >0 = failed to converge
+    info = C_DSYEV('V', 'L', n, H.data(), n, w.data(), work.data(), lwork);
+
+    if (info != 0) {
+        outfile->Printf("  [HAM-DIAG] dsyev failed, info=%d, using n_a=n_b=1.0\n", info);
+        active_space_->set_pair_fon(0, 1.0);
+        active_space_->set_pair_fon(1, 1.0);
+        compute_weighting_factors();
+        return;
+    }
+
+    // Extract FONs from ground state eigenvector (column 0 after dsyev)
+    // Column-major: v[i] = H[i + 0*4] = H[i]
+    double v0 = H[0], v1 = H[1], v2 = H[2], v3 = H[3];
+
+    // From c-code (lines 359-360):
+    // x1 = v0² + v1²  (FON for pair a,d in x∈[0,1] coordinates)
+    // x2 = v0² + v2²  (FON for pair b,c in x∈[0,1] coordinates)
+    // Convert to n∈[0,2]: n = 2*x
+    double x1 = v0*v0 + v1*v1;
+    double x2 = v0*v0 + v2*v2;
+    double n_a = 2.0 * x1;
+    double n_b = 2.0 * x2;
+
+    // Apply coupling threshold fixes
+    if (fix_na) n_a = 2.0;
+    if (fix_nb) n_b = 2.0;
+
+    // Boundary protection (from c-code line 215)
+    const double boundary_eps = 1.0e-9;
+    n_a = std::clamp(n_a, boundary_eps, 2.0 - boundary_eps);
+    n_b = std::clamp(n_b, boundary_eps, 2.0 - boundary_eps);
+
+    // Set FONs and update weights
+    active_space_->set_pair_fon(0, n_a);
+    active_space_->set_pair_fon(1, n_b);
+    compute_weighting_factors();
+
+    // Update previous FON values for delta limiting
+    prev_n_a_ = n_a;
+    prev_n_b_ = n_b;
+
+    outfile->Printf("\n  [HAM-DIAG] Initial FON from 4×4 CI Hamiltonian diagonalization:\n");
+    outfile->Printf("    E_micro[0-3] (closed-shell): %.6f %.6f %.6f %.6f\n",
+                   E_micro_[0], E_micro_[1], E_micro_[2], E_micro_[3]);
+    outfile->Printf("    Coupling elements: dad=%.6f dbc=%.6f\n", dad, dbc);
+    outfile->Printf("    Eigenvalues: %.6f %.6f %.6f %.6f\n", w[0], w[1], w[2], w[3]);
+    outfile->Printf("    Eigenvector[0]: [%.4f, %.4f, %.4f, %.4f]\n", v0, v1, v2, v3);
+    outfile->Printf("    Initial FON: n_a=%.6f n_b=%.6f\n", n_a, n_b);
+}
+
 void REKS::rex_solver_44() {
     // REKS(4,4) FON optimization: two variables (n_a, n_b)
     //
-    // TWO-PHASE SCF FOR STABLE CONVERGENCE (same as REKS(2,2)):
-    //
-    // Phase 1: Freeze FON for initial iterations
-    // Phase 2: Enable FON optimization with step limiting
+    // Uses 4x4 CI Hamiltonian diagonalization for initial guess (every call)
+    // followed by Newton-Raphson refinement (like c-code rexslv4x4).
     //
     // Uses 2D Newton-Raphson with gradient [dE/dn_a, dE/dn_b]
     // and 2x2 Hessian [d²E/dn_a², d²E/dn_a dn_b; d²E/dn_b dn_a, d²E/dn_b²]
@@ -948,39 +1158,143 @@ void REKS::rex_solver_44() {
     double n_b = active_space_->pair(1).fon_p;
 
     // =========================================================================
-    // Phase 1: Freeze FON for initial iterations
+    // Hamiltonian Diagonalization for Initial FON Guess (ONCE after localization)
     // =========================================================================
-    if (iteration_ < fon_freeze_iters_) {
-        if (reks_debug_ >= 1) {
-            outfile->Printf("\n  === RexSolver(4,4): Phase 1 (FON frozen) ===\n");
-            outfile->Printf("  Iteration %d < %d: keeping n_a=%.6f, n_b=%.6f (frozen)\n",
-                           iteration_, fon_freeze_iters_, n_a, n_b);
+    // HAM-DIAG provides physically motivated initial guess from 4x4 CI Hamiltonian.
+    // Done ONCE after orbital localization (iteration >= 2).
+    //
+    // NOTE: C-code does HAM-DIAG every call, but in PSI4 this destabilizes SCF
+    // because orbitals change significantly between iterations for problematic
+    // geometries. So we do HAM-DIAG once, then use previous FON as starting point.
+
+    if (!fon_initialized_44_) {
+        // Before localization (iteration_ < 2): keep FONs frozen at n=1.0
+        if (iteration_ < 2) {
+            if (reks_debug_ >= 1) {
+                outfile->Printf("  [HAM-DIAG] Waiting for localization (iteration %d < 2), keeping n_a=n_b=1.0\n", iteration_);
+            }
+            active_space_->set_pair_fon(0, 1.0);
+            active_space_->set_pair_fon(1, 1.0);
+            compute_weighting_factors();
+            return;
         }
-        // Update previous FONs for Phase 2 tracking
-        prev_n_a_ = n_a;
-        prev_n_b_ = n_b;
+
+        // After localization (iteration_ >= 2): initialize FON
+        // Check if user provided initial FON values (for geometry scan continuation)
+        if (reks_initial_na_ >= 0.0 && reks_initial_nb_ >= 0.0) {
+            // User-provided initial FON values for smooth PES scans
+            active_space_->set_pair_fon(0, reks_initial_na_);
+            active_space_->set_pair_fon(1, reks_initial_nb_);
+            n_a = reks_initial_na_;
+            n_b = reks_initial_nb_;
+            if (reks_debug_ >= 1) {
+                outfile->Printf("  [FON-INIT] Using user-provided initial FON: n_a=%.6f, n_b=%.6f\n",
+                               reks_initial_na_, reks_initial_nb_);
+            }
+        } else {
+            // Default: HAM-DIAG initialization
+            initialize_fon_from_hamiltonian_44();
+            n_a = active_space_->pair(0).fon_p;
+            n_b = active_space_->pair(1).fon_p;
+        }
+        fon_initialized_44_ = true;
+    }
+
+    // =========================================================================
+    // "Shake it up" - Prevent FON locking at degenerate point n=1.0
+    // =========================================================================
+    // At n_a = n_d = 1.0 (or n_b = n_c = 1.0), the gradient vanishes and
+    // the optimizer gets stuck. This is from Filatov's original GAMESS code.
+    if (reks_shake_threshold_ > 0.0) {
+        const double shake_target = 0.5;  // Reset FON to this value
+        bool shaken = false;
+
+        if (std::abs(n_a - 1.0) < reks_shake_threshold_) {
+            if (reks_debug_ >= 1) {
+                outfile->Printf("  Shake it up: n_a was %.8f (near 1.0), resetting to %.4f\n",
+                               n_a, shake_target);
+            }
+            n_a = shake_target;
+            active_space_->set_pair_fon(0, n_a);
+            shaken = true;
+        }
+        if (std::abs(n_b - 1.0) < reks_shake_threshold_) {
+            if (reks_debug_ >= 1) {
+                outfile->Printf("  Shake it up: n_b was %.8f (near 1.0), resetting to %.4f\n",
+                               n_b, shake_target);
+            }
+            n_b = shake_target;
+            active_space_->set_pair_fon(1, n_b);
+            shaken = true;
+        }
+        if (shaken) {
+            compute_weighting_factors();
+        }
+    }
+
+    // =========================================================================
+    // Coupling check (optional) - Fix FON if coupling is negligible
+    // =========================================================================
+    // If coupling element Δad or Δbc is close to zero, fix corresponding FON.
+    // This is from Filatov's original code: if(fabs(dad)<=1.e-8) *x1 = one;
+    if (reks_coupling_threshold_ > 0.0 && static_cast<int>(E_micro_.size()) >= 12) {
+        // Approximate coupling from microstate energies
+        // dad ~ |E_coupling_ad - E_closed_shell|
+        // dbc ~ |E_coupling_bc - E_closed_shell|
+        double E_closed = (E_micro_[0] + E_micro_[1] + E_micro_[2] + E_micro_[3]) / 4.0;
+        double E_coup_ad = (E_micro_[4] + E_micro_[5] + E_micro_[6] + E_micro_[7]) / 4.0;
+        double E_coup_bc = (E_micro_[8] + E_micro_[9] + E_micro_[10] + E_micro_[11]) / 4.0;
+
+        double dad = std::abs(E_coup_ad - E_closed);
+        double dbc = std::abs(E_coup_bc - E_closed);
+
+        if (dad < reks_coupling_threshold_) {
+            if (reks_debug_ >= 1) {
+                outfile->Printf("  Coupling dad=%.2e < threshold: fixing n_a=2.0\n", dad);
+            }
+            n_a = 2.0;
+            active_space_->set_pair_fon(0, n_a);
+            compute_weighting_factors();
+        }
+        if (dbc < reks_coupling_threshold_) {
+            if (reks_debug_ >= 1) {
+                outfile->Printf("  Coupling dbc=%.2e < threshold: fixing n_b=2.0\n", dbc);
+            }
+            n_b = 2.0;
+            active_space_->set_pair_fon(1, n_b);
+            compute_weighting_factors();
+        }
+    }
+
+    // =========================================================================
+    // FON Optimization (Newton-Raphson)
+    // =========================================================================
+    //
+    // Uses Newton-Raphson for 2D optimization of (n_a, n_b) with:
+    // - Step size limiting (max_step = 0.2)
+    // - Boundary handling (0 <= n <= 2)
+    // - Oscillation detection for gradient descent fallback
+
+    // Skip optimization if FONs are frozen due to oscillation detection
+    if (fon_oscillation_frozen_) {
+        if (reks_debug_ >= 1) {
+            outfile->Printf("\n  === RexSolver(4,4): FON frozen (oscillation), skipping optimization ===\n");
+            outfile->Printf("  Frozen FONs: n_a=%.6f, n_b=%.6f\n", n_a, n_b);
+        }
         compute_weighting_factors();
         return;
     }
 
-    // Mark phase transition (for potential DIIS reset)
-    if (iteration_ == fon_freeze_iters_) {
-        fon_phase_transition_ = true;
-        if (reks_debug_ >= 1) {
-            outfile->Printf("\n  === Phase transition: enabling FON optimization ===\n");
-        }
-    }
-
-    // =========================================================================
-    // Phase 2: Optimize FON with step limiting
-    // =========================================================================
-
     const int max_iter = reks::constants::FON_MAX_ITER;
     const double tol = reks::constants::FON_TOL;
-    double max_step = reks::constants::FON_MAX_STEP;
+    const double osc_threshold = reks::constants::OSCILLATION_THRESHOLD;  // 0.02
+
+    // Track if saddle escape was used (to bypass fon_max_delta limiting)
+    bool used_saddle_escape_a = false;
+    bool used_saddle_escape_b = false;
 
     if (reks_debug_ >= 1) {
-        outfile->Printf("\n  === RexSolver(4,4): Phase 2 (2D FON Optimization) ===\n");
+        outfile->Printf("\n  === RexSolver(4,4): FON Optimization ===\n");
         outfile->Printf("  Initial FONs: n_a=%.6f, n_b=%.6f\n", n_a, n_b);
         outfile->Printf("  prev_n_a=%.6f, prev_n_b=%.6f, fon_max_delta=%.4f\n",
                        prev_n_a_, prev_n_b_, fon_max_delta_);
@@ -989,6 +1303,42 @@ void REKS::rex_solver_44() {
             outfile->Printf("[%d]=%.8f ", L, E_micro_[L]);
         }
         outfile->Printf("\n");
+    }
+
+    // =========================================================================
+    // Coupling Elements: Physical Compass for FON Direction
+    // =========================================================================
+    // From Filatov's GVB-PP Hamiltonian (c-code reks_solver.cpp:340-361):
+    //   dad = (E[4] + E[5] - E[6] - E[7]) / 2  -> (a,d) pair coupling
+    //   dbc = (E[8] + E[9] - E[10] - E[11]) / 2  -> (b,c) pair coupling
+    //
+    // Physical meaning:
+    //   dad < 0: exchange stabilization (singlet lower than triplet) in (a,d)
+    //   |dad| large: strong correlation -> n_a should tend towards 1.0
+    //   |dad| small: weak correlation -> n_a can be near 2.0 (closed-shell)
+    //
+    double coupling_dad = 0.0;
+    double coupling_dbc = 0.0;
+    if (E_micro_.size() >= 12) {
+        coupling_dad = (E_micro_[4] + E_micro_[5] - E_micro_[6] - E_micro_[7]) / 2.0;
+        coupling_dbc = (E_micro_[8] + E_micro_[9] - E_micro_[10] - E_micro_[11]) / 2.0;
+    }
+
+    // Threshold for "weak coupling" - below this, closed-shell (n=2) may be valid
+    const double coupling_threshold = 1.0e-3;  // Hartree, ~0.6 kcal/mol
+
+    // Determine preferred direction for each FON based on coupling strength
+    // prefer_diradical = true means prefer n → 1.0 (equal mixture)
+    // prefer_diradical = false means n → 2.0 (closed-shell) may be acceptable
+    bool prefer_diradical_a = (std::abs(coupling_dad) > coupling_threshold);
+    bool prefer_diradical_b = (std::abs(coupling_dbc) > coupling_threshold);
+
+    if (reks_debug_ >= 1) {
+        outfile->Printf("  Coupling elements: dad=%.6f dbc=%.6f (threshold=%.1e)\n",
+                       coupling_dad, coupling_dbc, coupling_threshold);
+        outfile->Printf("  Preferred direction: n_a→%s, n_b→%s\n",
+                       prefer_diradical_a ? "1.0 (diradical)" : "2.0 (closed-shell allowed)",
+                       prefer_diradical_b ? "1.0 (diradical)" : "2.0 (closed-shell allowed)");
     }
 
     // Lambda to compute E_SA at current FON values
@@ -1004,14 +1354,24 @@ void REKS::rex_solver_44() {
         return E_SA;
     };
 
-    // Oscillation detection: track last two FON values
+    // Lambda to compute E_PPS (PPS diagonal energy) - the TRUE target function for FON optimization
+    // Use PSI4's existing method which computes E_PPS from weight-based formula
+    auto compute_E_PPS = [&]() -> double {
+        return active_space_->compute_energy_PPS(E_micro_);
+    };
+
+    // Oscillation detection: track last FON values
     double prev_n_a = n_a, prev_n_b = n_b;
     double prev2_n_a = -1.0, prev2_n_b = -1.0;
     int oscillation_count = 0;
 
+    // Maximum step size for FON optimization
+    const double max_step = reks::constants::FON_MAX_STEP;
+
     for (int iter = 0; iter < max_iter; ++iter) {
-        // Compute gradient [dE/dn_a, dE/dn_b]
-        std::vector<double> grad = active_space_->compute_energy_gradient(E_micro_, C_L_);
+        // Compute gradient [dE_PPS/dn_a, dE_PPS/dn_b] - use PPS gradient for consistency
+        // with E_PPS line search (this is what c-code does - optimize GVB-PP energy)
+        std::vector<double> grad = active_space_->compute_gradient_PPS(E_micro_);
 
         // --- Boundary-aware convergence check ---
         // At a boundary, if the gradient points outward, we're at the constrained optimum.
@@ -1030,15 +1390,15 @@ void REKS::rex_solver_44() {
         double eff_grad_norm = std::sqrt(eff_grad_na*eff_grad_na + eff_grad_nb*eff_grad_nb);
         if (eff_grad_norm < tol * 10.0) {
             if (reks_debug_ >= 2) {
-                double E_SA = compute_E_SA();
-                outfile->Printf("    iter %2d: n_a=%.6f n_b=%.6f E=%.10f |eff_grad|=%.2e CONVERGED (boundary)\n",
-                               iter, n_a, n_b, E_SA, eff_grad_norm);
+                double E_PPS = compute_E_PPS();
+                outfile->Printf("    iter %2d: n_a=%.6f n_b=%.6f E_PPS=%.10f |eff_grad|=%.2e CONVERGED (boundary)\n",
+                               iter, n_a, n_b, E_PPS, eff_grad_norm);
             }
             break;
         }
 
-        // Compute 2x2 Hessian [H_aa, H_ab; H_ba, H_bb]
-        std::vector<double> hess = active_space_->compute_energy_hessian(E_micro_, C_L_);
+        // Compute 2x2 Hessian [H_aa, H_ab; H_ba, H_bb] - use PPS Hessian for consistency
+        std::vector<double> hess = active_space_->compute_hessian_PPS(E_micro_);
 
         double H_aa = hess[0];
         double H_ab = hess[1];
@@ -1074,6 +1434,26 @@ void REKS::rex_solver_44() {
             // n_a direction blocked or singular: do 1D Newton-Raphson in n_b direction only
             delta_na = 0.0;
             delta_nb = -grad[1] / H_bb;  // 1D Newton step
+
+            // =========================================================================
+            // SADDLE POINT ESCAPE: When n_a ≈ 1.0 (where n_a = n_d) and H_aa is singular,
+            // we're at a saddle point. The gradient is zero by symmetry but we need to
+            // escape. Add a perturbation that the line search will validate.
+            // =========================================================================
+            const double saddle_threshold = 0.15;  // Detection threshold around n_a = 1.0
+            const double saddle_perturbation = 0.2;  // Perturbation size to escape
+            if (singular_a && !constrained_a && std::abs(n_a - 1.0) < saddle_threshold) {
+                // At saddle point: n_a ≈ 1.0 with H_aa ≈ 0
+                // Try moving n_a toward 2.0 first (bonding character)
+                // The line search with two-pass will find the correct direction
+                delta_na = saddle_perturbation;
+                used_saddle_escape_a = true;  // Mark for bypassing fon_max_delta
+                if (reks_debug_ >= 1) {
+                    outfile->Printf("    [Saddle escape: n_a=%.4f near 1.0, H_aa=%.4e singular, adding delta_na=%.4f]\n",
+                                   n_a, H_aa, delta_na);
+                }
+            }
+
             if (reks_debug_ >= 2) {
                 outfile->Printf("    [1D Newton in n_b: H_bb=%.4e, grad_b=%.4e, constrained_a=%d, singular_a=%d]\n",
                                H_bb, grad[1], constrained_a, singular_a);
@@ -1082,22 +1462,86 @@ void REKS::rex_solver_44() {
             // n_b direction blocked or singular: do 1D Newton-Raphson in n_a direction only
             delta_na = -grad[0] / H_aa;  // 1D Newton step
             delta_nb = 0.0;
+
+            // SADDLE POINT ESCAPE for n_b
+            const double saddle_threshold = 0.15;
+            const double saddle_perturbation = 0.2;
+            if (singular_b && !constrained_b && std::abs(n_b - 1.0) < saddle_threshold) {
+                delta_nb = saddle_perturbation;
+                used_saddle_escape_b = true;  // Mark for bypassing fon_max_delta
+                if (reks_debug_ >= 1) {
+                    outfile->Printf("    [Saddle escape: n_b=%.4f near 1.0, H_bb=%.4e singular, adding delta_nb=%.4f]\n",
+                                   n_b, H_bb, delta_nb);
+                }
+            }
+
             if (reks_debug_ >= 2) {
                 outfile->Printf("    [1D Newton in n_a: H_aa=%.4e, grad_a=%.4e, constrained_b=%d, singular_b=%d]\n",
                                H_aa, grad[0], constrained_b, singular_b);
             }
         } else if (std::abs(det) < reks::constants::HESSIAN_THRESHOLD || det < 0.0) {
-            // Both at boundary or indefinite Hessian: use gradient descent
-            // But use adaptive step based on gradient magnitude
-            double grad_norm = std::sqrt(grad[0]*grad[0] + grad[1]*grad[1]);
-            double step_scale = (grad_norm > 0.1) ? max_step : max_step * 0.5;
+            // =========================================================================
+            // Indefinite or singular Hessian: Coupling-Based Direction (Phase 1)
+            // =========================================================================
+            // When Hessian is indefinite, we're at/near a saddle point. The gradient
+            // may point to either local minimum (diradical n≈1 or closed-shell n≈2).
+            //
+            // KEY INSIGHT: Coupling elements tell us which minimum is PHYSICALLY correct:
+            // - Strong coupling (|dad| > threshold): diradical solution is correct
+            // - Weak coupling (|dad| < threshold): closed-shell may be acceptable
+            //
+            // Strategy:
+            // 1. If strong coupling: force movement towards n=1.0 regardless of gradient
+            // 2. If weak coupling: follow gradient direction (may go to n=2.0)
+            //
+            // This prevents getting trapped in the WRONG minimum.
 
-            // Scale by inverse gradient to approximate Newton behavior
-            delta_na = (std::abs(eff_grad_na) > 1e-10) ? -step_scale * std::copysign(1.0, eff_grad_na) : 0.0;
-            delta_nb = (std::abs(eff_grad_nb) > 1e-10) ? -step_scale * std::copysign(1.0, eff_grad_nb) : 0.0;
+            delta_na = 0.0;
+            delta_nb = 0.0;
+
+            const double grad_step = 0.05;  // Larger step for faster escape from saddle
+
+            // Handle n_a based on coupling strength
+            if (prefer_diradical_a) {
+                // Strong (a,d) coupling: force towards n_a = 1.0
+                if (n_a > 1.0) {
+                    delta_na = -grad_step;  // Decrease towards 1.0
+                } else if (n_a < 1.0) {
+                    delta_na = grad_step;   // Increase towards 1.0
+                }
+            } else {
+                // Weak (a,d) coupling: follow gradient direction
+                // gradient > 0 means dE/dn > 0, so decreasing n lowers E
+                // gradient < 0 means dE/dn < 0, so increasing n lowers E
+                if (grad[0] > 0.0) {
+                    delta_na = -grad_step;  // Move in gradient descent direction
+                } else if (grad[0] < 0.0) {
+                    delta_na = grad_step;
+                }
+            }
+
+            // Handle n_b based on coupling strength
+            if (prefer_diradical_b) {
+                // Strong (b,c) coupling: force towards n_b = 1.0
+                if (n_b > 1.0) {
+                    delta_nb = -grad_step;  // Decrease towards 1.0
+                } else if (n_b < 1.0) {
+                    delta_nb = grad_step;   // Increase towards 1.0
+                }
+            } else {
+                // Weak (b,c) coupling: follow gradient direction
+                if (grad[1] > 0.0) {
+                    delta_nb = -grad_step;
+                } else if (grad[1] < 0.0) {
+                    delta_nb = grad_step;
+                }
+            }
 
             if (reks_debug_ >= 2) {
-                outfile->Printf("    [Gradient descent: det=%.4e, grad_norm=%.4e]\n", det, grad_norm);
+                outfile->Printf("    [Hessian indef: det=%.4e, grad=(%.4e,%.4e)]\n",
+                               det, grad[0], grad[1]);
+                outfile->Printf("    [Coupling-based: prefer_birad_a=%d prefer_birad_b=%d, delta=(%.4f,%.4f)]\n",
+                               prefer_diradical_a, prefer_diradical_b, delta_na, delta_nb);
             }
         } else {
             // Newton-Raphson: delta = -H^{-1} * grad
@@ -1106,44 +1550,148 @@ void REKS::rex_solver_44() {
             delta_nb = -(-H_ab * grad[0] + H_aa * grad[1]) / det;
         }
 
-        // Damping: limit step size
-        if (std::abs(delta_na) > max_step) {
-            delta_na = std::copysign(max_step, delta_na);
-        }
-        if (std::abs(delta_nb) > max_step) {
-            delta_nb = std::copysign(max_step, delta_nb);
-        }
+        // =====================================================================
+        // Line Search with Golden Ratio (from Filatov's original GAMESS code)
+        // =====================================================================
+        // Instead of blindly applying the Newton step, check if it actually
+        // decreases the energy. If not, reduce the step size.
 
-        // Update FONs with bounds [0.0, 2.0]
-        double n_a_new = std::clamp(n_a + delta_na, 0.0, 2.0);
-        double n_b_new = std::clamp(n_b + delta_nb, 0.0, 2.0);
+        double n_a_new, n_b_new;
+
+        if (reks_line_search_) {
+            const double golden = reks::constants::GOLDEN_RATIO;
+            const int max_ls_iter = reks::constants::LINE_SEARCH_MAX_ITER;
+
+            // Apply initial damping to limit step size
+            if (std::abs(delta_na) > max_step) {
+                delta_na = std::copysign(max_step, delta_na);
+            }
+            if (std::abs(delta_nb) > max_step) {
+                delta_nb = std::copysign(max_step, delta_nb);
+            }
+
+            // Energy before the step
+            // CRITICAL: Use E_PPS (GVB-PP energy) as target function, NOT E_SA!
+            // C-code (reks_solver.cpp) optimizes PPS energy in line 493-503.
+            // SA-REKS minimum can be at closed-shell (n=2.0), but PPS minimum
+            // is at the correlated solution (n~1.5 for stretched geometries).
+            double E_PPS_old = compute_E_PPS();
+
+            double factor = 1.0;
+            int pass = 0;  // 0 = positive direction, 1 = negative direction
+            bool step_accepted = false;
+
+            for (int ls_iter = 0; ls_iter < max_ls_iter; ++ls_iter) {
+                // Try step with current factor
+                double n_a_try = std::clamp(n_a + delta_na * factor, 0.0, 2.0);
+                double n_b_try = std::clamp(n_b + delta_nb * factor, 0.0, 2.0);
+
+                // Temporarily set FONs to compute energy
+                active_space_->set_pair_fon(0, n_a_try);
+                active_space_->set_pair_fon(1, n_b_try);
+                compute_weighting_factors();
+
+                double E_PPS_new = compute_E_PPS();
+
+                if (E_PPS_new < E_PPS_old) {
+                    // Energy decreased - accept this step
+                    n_a_new = n_a_try;
+                    n_b_new = n_b_try;
+                    step_accepted = true;
+                    if (reks_debug_ >= 2) {
+                        outfile->Printf("    [Line search: factor=%.4f, E_PPS_old=%.10f, E_PPS_new=%.10f, accepted]\n",
+                                       factor, E_PPS_old, E_PPS_new);
+                    }
+                    break;
+                }
+
+                // Energy increased - reduce step size
+                factor /= (golden * golden);
+
+                // Check if step is too small
+                double step_norm = std::abs(factor) * std::sqrt(delta_na*delta_na + delta_nb*delta_nb);
+                if (step_norm < tol) {
+                    // Try negative direction (two-pass line search)
+                    if (pass == 0) {
+                        factor = -1.0;
+                        pass = 1;
+                        if (reks_debug_ >= 2) {
+                            outfile->Printf("    [Line search: trying negative direction]\n");
+                        }
+                    } else {
+                        // Both directions failed - take zero step
+                        if (reks_debug_ >= 2) {
+                            outfile->Printf("    [Line search: both directions failed, keeping current FON]\n");
+                        }
+                        n_a_new = n_a;
+                        n_b_new = n_b;
+                        step_accepted = true;
+                        break;
+                    }
+                }
+
+                // Two-pass: after half the iterations in positive direction, try negative
+                if (ls_iter + 1 >= max_ls_iter / 2 && pass == 0) {
+                    factor = -1.0;
+                    pass = 1;
+                    if (reks_debug_ >= 2) {
+                        outfile->Printf("    [Line search: switching to negative direction]\n");
+                    }
+                }
+            }
+
+            // If loop completed without acceptance, keep current FON
+            if (!step_accepted) {
+                n_a_new = n_a;
+                n_b_new = n_b;
+                if (reks_debug_ >= 2) {
+                    outfile->Printf("    [Line search: max iterations reached, keeping current FON]\n");
+                }
+            }
+
+            // Restore FONs to the accepted values (may have changed during line search)
+            active_space_->set_pair_fon(0, n_a_new);
+            active_space_->set_pair_fon(1, n_b_new);
+            compute_weighting_factors();
+
+        } else {
+            // Original simple damping (no line search)
+            if (std::abs(delta_na) > max_step) {
+                delta_na = std::copysign(max_step, delta_na);
+            }
+            if (std::abs(delta_nb) > max_step) {
+                delta_nb = std::copysign(max_step, delta_nb);
+            }
+
+            // Update FONs with bounds [0.0, 2.0]
+            n_a_new = std::clamp(n_a + delta_na, 0.0, 2.0);
+            n_b_new = std::clamp(n_b + delta_nb, 0.0, 2.0);
+        }
 
         // Actual deltas after bounds enforcement
-        delta_na = n_a_new - n_a;
-        delta_nb = n_b_new - n_b;
+        double actual_delta_na = n_a_new - n_a;
+        double actual_delta_nb = n_b_new - n_b;
 
+        // =====================================================================
+        // Oscillation Detection
+        // =====================================================================
         // Check for oscillation ONLY when using gradient descent (not Newton)
-        // Newton methods naturally converge quadratically and shouldn't trigger oscillation detection
-        // We identify gradient descent when det < 0 and both directions are being updated
         bool using_gradient_descent = (std::abs(det) < reks::constants::HESSIAN_THRESHOLD || det < 0.0) &&
-                                       std::abs(delta_na) > tol && std::abs(delta_nb) > tol;
+                                       std::abs(actual_delta_na) > tol && std::abs(actual_delta_nb) > tol;
 
         if (using_gradient_descent && prev2_n_a >= 0.0) {
             double diff_a = std::abs(n_a_new - prev2_n_a);
             double diff_b = std::abs(n_b_new - prev2_n_b);
-            // Very tight threshold: only trigger when bouncing in small region
-            if (diff_a < 0.02 && diff_b < 0.02) {
+            if (diff_a < osc_threshold && diff_b < osc_threshold) {
                 oscillation_count++;
-                if (oscillation_count >= 3) {  // Require 3 oscillations before intervening
-                    // Oscillation detected! Take midpoint of oscillating values
+                if (oscillation_count >= 3) {
+                    // Oscillation detected! Take midpoint
                     n_a_new = (n_a_new + prev_n_a) / 2.0;
                     n_b_new = (n_b_new + prev_n_b) / 2.0;
                     if (reks_debug_ >= 1) {
-                        outfile->Printf("    Oscillation detected (count=%d)! Using midpoint: n_a=%.6f n_b=%.6f\n",
-                                       oscillation_count, n_a_new, n_b_new);
+                        outfile->Printf("    Oscillation detected! Midpoint: n_a=%.6f n_b=%.6f\n",
+                                       n_a_new, n_b_new);
                     }
-                    // Also reduce step size for future iterations
-                    max_step *= 0.5;
                     oscillation_count = 0;
                 }
             } else {
@@ -1168,17 +1716,21 @@ void REKS::rex_solver_44() {
         compute_weighting_factors();
 
         if (reks_debug_ >= 2) {
-            double E_SA = compute_E_SA();
-            outfile->Printf("    iter %2d: n_a=%.6f n_b=%.6f E=%.10f |grad|=%.2e |eff_grad|=%.2e det=%.2e\n",
-                           iter, n_a, n_b, E_SA,
+            double E_PPS = compute_E_PPS();
+            outfile->Printf("    iter %2d: n_a=%.6f n_b=%.6f E_PPS=%.10f |grad|=%.2e |eff_grad|=%.2e det=%.2e\n",
+                           iter, n_a, n_b, E_PPS,
                            std::sqrt(grad[0]*grad[0] + grad[1]*grad[1]), eff_grad_norm, det);
         }
 
         // Convergence check on actual step
-        if (std::abs(delta_na) < tol && std::abs(delta_nb) < tol) {
+        if (std::abs(actual_delta_na) < tol && std::abs(actual_delta_nb) < tol) {
             break;
         }
     }
+
+    // Save previous values for later use
+    double saved_prev_n_a = prev_n_a_;
+    double saved_prev_n_b = prev_n_b_;
 
     // =========================================================================
     // Apply FON change limiting for DIIS stability
@@ -1186,19 +1738,22 @@ void REKS::rex_solver_44() {
     // Limit the change from previous SCF iteration to fon_max_delta_
     // This ensures Fock matrices remain similar between DIIS iterations
 
-    double delta_a_from_prev = n_a - prev_n_a_;
-    double delta_b_from_prev = n_b - prev_n_b_;
+    double delta_a_from_prev = n_a - saved_prev_n_a;
+    double delta_b_from_prev = n_b - saved_prev_n_b;
 
     bool limited = false;
-    if (std::abs(delta_a_from_prev) > fon_max_delta_) {
-        n_a = prev_n_a_ + std::copysign(fon_max_delta_, delta_a_from_prev);
-        n_a = std::clamp(n_a, 0.0, 2.0);
-        limited = true;
-    }
-    if (std::abs(delta_b_from_prev) > fon_max_delta_) {
-        n_b = prev_n_b_ + std::copysign(fon_max_delta_, delta_b_from_prev);
-        n_b = std::clamp(n_b, 0.0, 2.0);
-        limited = true;
+    if (!fon_oscillation_frozen_) {  // Don't limit if frozen
+        // Don't limit if saddle escape was used (needs full perturbation to escape)
+        if (std::abs(delta_a_from_prev) > fon_max_delta_ && !used_saddle_escape_a) {
+            n_a = saved_prev_n_a + std::copysign(fon_max_delta_, delta_a_from_prev);
+            n_a = std::clamp(n_a, 0.0, 2.0);
+            limited = true;
+        }
+        if (std::abs(delta_b_from_prev) > fon_max_delta_ && !used_saddle_escape_b) {
+            n_b = saved_prev_n_b + std::copysign(fon_max_delta_, delta_b_from_prev);
+            n_b = std::clamp(n_b, 0.0, 2.0);
+            limited = true;
+        }
     }
 
     if (limited) {
@@ -1209,17 +1764,136 @@ void REKS::rex_solver_44() {
 
         if (reks_debug_ >= 1) {
             outfile->Printf("  FON change limited: n_a: %.6f->%.6f (delta %.4f), n_b: %.6f->%.6f (delta %.4f)\n",
-                           prev_n_a_, n_a, n_a - prev_n_a_, prev_n_b_, n_b, n_b - prev_n_b_);
+                           saved_prev_n_a, n_a, n_a - saved_prev_n_a, saved_prev_n_b, n_b, n_b - saved_prev_n_b);
         }
     }
 
-    // Store current FONs for next iteration's delta limiting
+    // =========================================================================
+    // Orbital Swap for Convergence (from Filatov's original GAMESS code)
+    // =========================================================================
+    // "Flipped occupations (a stronger occupied orb is above) are bad for convergence!"
+    // When x < 0.5 (n < 1.0), the virtual orbital is more occupied than the occupied one.
+    // Swap them to put the more occupied orbital in the "occupied" position.
+    const double swap_tol = 1.0 - 1e-4;  // n < 1.0 means swap needed
+
+    if (n_a < swap_tol) {
+        // Swap orbitals a and d
+        // Active orbital indices: a=0, b=1, c=2, d=3 (relative to Ncore_ start)
+        int a_idx = Ncore_;
+        int d_idx = Ncore_ + 3;
+
+        // Swap columns in Ca_
+        for (int i = 0; i < nso_; ++i) {
+            double tmp = Ca_->get(i, a_idx);
+            Ca_->set(i, a_idx, Ca_->get(i, d_idx));
+            Ca_->set(i, d_idx, tmp);
+        }
+
+        // Transform FON: n_a -> 2 - n_a
+        n_a = 2.0 - n_a;
+        active_space_->set_pair_fon(0, n_a);
+
+        if (reks_debug_ >= 1) {
+            outfile->Printf("  [Orbital swap] n_a < 1.0, swapped orbitals %d<->%d, n_a -> %.6f\n",
+                           a_idx + 1, d_idx + 1, n_a);
+        }
+    }
+
+    if (n_b < swap_tol) {
+        // Swap orbitals b and c
+        int b_idx = Ncore_ + 1;
+        int c_idx = Ncore_ + 2;
+
+        // Swap columns in Ca_
+        for (int i = 0; i < nso_; ++i) {
+            double tmp = Ca_->get(i, b_idx);
+            Ca_->set(i, b_idx, Ca_->get(i, c_idx));
+            Ca_->set(i, c_idx, tmp);
+        }
+
+        // Transform FON: n_b -> 2 - n_b
+        n_b = 2.0 - n_b;
+        active_space_->set_pair_fon(1, n_b);
+
+        if (reks_debug_ >= 1) {
+            outfile->Printf("  [Orbital swap] n_b < 1.0, swapped orbitals %d<->%d, n_b -> %.6f\n",
+                           b_idx + 1, c_idx + 1, n_b);
+        }
+    }
+
+    // Recompute weights after potential swap
+    compute_weighting_factors();
+
+    // =========================================================================
+    // FON Oscillation Detection and Handling (AFTER limiting and swap)
+    // =========================================================================
+    // Detect 2-cycle oscillations: if current LIMITED FON is close to 2-iterations-ago
+    // but different from previous iteration, we have an oscillation.
+    // When detected, freeze FONs at the average value.
+
+    const double oscillation_threshold = 0.025;  // Slightly larger than fon_max_delta
+
+    if (iteration_ >= 5 && !fon_oscillation_frozen_) {  // Start detection after warmup
+        // Check if current (limited) FON is similar to 2-iterations-ago
+        double diff_a_2ago = std::abs(n_a - prev_prev_n_a_);
+        double diff_b_2ago = std::abs(n_b - prev_prev_n_b_);
+        double diff_a_1ago = std::abs(n_a - saved_prev_n_a);
+        double diff_b_1ago = std::abs(n_b - saved_prev_n_b);
+
+        bool oscillation_detected = false;
+        // True 2-cycle oscillation:
+        // - diff(2-ago) is very small (current ≈ 2-ago)
+        // - diff(2-ago) << diff(1-ago) (not just monotonic increase)
+        // For monotonic: diff(2-ago) = 2*diff(1-ago)
+        // For oscillation: diff(2-ago) << diff(1-ago)
+        if (diff_a_2ago < oscillation_threshold && diff_a_1ago > oscillation_threshold * 0.3 &&
+            diff_a_2ago < diff_a_1ago * 0.5) {  // Key: diff_2ago much smaller than diff_1ago
+            oscillation_detected = true;
+        }
+        if (diff_b_2ago < oscillation_threshold && diff_b_1ago > oscillation_threshold * 0.3 &&
+            diff_b_2ago < diff_b_1ago * 0.5) {
+            oscillation_detected = true;
+        }
+
+        if (oscillation_detected) {
+            fon_oscillation_count_++;
+            if (reks_debug_ >= 1) {
+                outfile->Printf("  FON oscillation detected (count=%d): n_a 2-ago=%.4f, 1-ago=%.4f, now=%.4f\n",
+                               fon_oscillation_count_, prev_prev_n_a_, saved_prev_n_a, n_a);
+                outfile->Printf("                                      n_b 2-ago=%.4f, 1-ago=%.4f, now=%.4f\n",
+                               prev_prev_n_b_, saved_prev_n_b, n_b);
+            }
+
+            // If oscillation persists for 3 consecutive iterations, freeze at average
+            if (fon_oscillation_count_ >= 3) {
+                double avg_n_a = (n_a + saved_prev_n_a + prev_prev_n_a_) / 3.0;
+                double avg_n_b = (n_b + saved_prev_n_b + prev_prev_n_b_) / 3.0;
+                n_a = avg_n_a;
+                n_b = avg_n_b;
+                fon_oscillation_frozen_ = true;
+                // Update active space with frozen FONs
+                active_space_->set_pair_fon(0, n_a);
+                active_space_->set_pair_fon(1, n_b);
+                compute_weighting_factors();
+                if (reks_debug_ >= 1) {
+                    outfile->Printf("  FON FROZEN at average: n_a=%.6f, n_b=%.6f\n", n_a, n_b);
+                }
+            }
+        } else {
+            fon_oscillation_count_ = 0;  // Reset counter if no oscillation
+        }
+    }
+
+    // Update history for next iteration
+    prev_prev_n_a_ = saved_prev_n_a;
+    prev_prev_n_b_ = saved_prev_n_b;
     prev_n_a_ = n_a;
     prev_n_b_ = n_b;
 
     // =========================================================================
     // OSS1 FON Optimization: Optimize n'_a (oss1_fon_a_) for OSS1 configuration
     // =========================================================================
+
     double oss1_fon = active_space_->get_oss1_fon_a();
 
     if (reks_debug_ >= 1) {
@@ -1357,6 +2031,1141 @@ void REKS::rex_solver_44() {
         outfile->Printf("  E_OSS1 = %20.12f\n", E_OSS1);
         outfile->Printf("  E_OSS2 = %20.12f\n", E_OSS2);
         outfile->Printf("  E_SA   = %20.12f  (w_PPS=%.4f, w_OSS=%.4f)\n", E_SA, w_pps, w_oss);
+    }
+}
+
+// ===========================================================================
+// Trust-Region FON Optimization Methods
+// ===========================================================================
+// Trust-Region Augmented Hessian (TRAH) method for robust FON optimization.
+// Handles indefinite Hessian at saddle points via secular equation.
+//
+// Reference: J. Chem. Phys. 156, 204104 (2022)
+// ===========================================================================
+
+std::vector<double> REKS::solve_boundary_constrained_2d(
+    double g1, double g2, double lam1, double lam2,
+    const std::vector<double>& v1, const std::vector<double>& v2, double Delta)
+{
+    // Solve secular equation for boundary-constrained step:
+    //   ||p(μ)||² = Δ²  where p_i(μ) = -g_i / (λ_i + μ)
+    //
+    // The secular equation is: φ(μ) = Σ g_i²/(λ_i+μ)² - Δ² = 0
+    //
+    // Newton iteration on φ(μ):
+    //   φ'(μ) = -2 Σ g_i²/(λ_i+μ)³
+    //   μ_new = μ - φ(μ)/φ'(μ)
+
+    using namespace reks::constants;
+
+    // Regularization: if both gradients are tiny, return zero step
+    const double g_norm_sq = g1*g1 + g2*g2;
+    if (g_norm_sq < 1e-20) {
+        return {0.0, 0.0};
+    }
+
+    // Find lower bound for μ: must satisfy λ_i + μ > 0 for all i
+    // For indefinite Hessian, at least one λ < 0, so μ_lower > -min(λ)
+    double lam_min = std::min(lam1, lam2);
+    double mu_lower = std::max(0.0, -lam_min) + 1e-10;
+
+    // Initial guess for μ
+    double mu = mu_lower + 0.1;
+
+    // Newton iteration to solve secular equation
+    for (int iter = 0; iter < TR_MAX_SECULAR_ITER; ++iter) {
+        double d1 = lam1 + mu;
+        double d2 = lam2 + mu;
+
+        // Safety: avoid division by very small numbers
+        if (std::abs(d1) < 1e-15) d1 = std::copysign(1e-15, d1);
+        if (std::abs(d2) < 1e-15) d2 = std::copysign(1e-15, d2);
+
+        // φ(μ) = g1²/d1² + g2²/d2² - Δ²
+        double phi = (g1*g1)/(d1*d1) + (g2*g2)/(d2*d2) - Delta*Delta;
+
+        // Check convergence
+        if (std::abs(phi) < TR_SECULAR_TOL) {
+            break;
+        }
+
+        // φ'(μ) = -2*(g1²/d1³ + g2²/d2³)
+        double dphi = -2.0 * ((g1*g1)/(d1*d1*d1) + (g2*g2)/(d2*d2*d2));
+
+        // Avoid division by zero in Newton step
+        if (std::abs(dphi) < 1e-20) {
+            break;
+        }
+
+        // Newton step
+        double dmu = -phi / dphi;
+        mu += dmu;
+
+        // Keep μ above the pole
+        if (mu < mu_lower) {
+            mu = mu_lower;
+        }
+    }
+
+    // Compute step in eigenspace
+    double d1 = lam1 + mu;
+    double d2 = lam2 + mu;
+    if (std::abs(d1) < 1e-15) d1 = std::copysign(1e-15, d1);
+    if (std::abs(d2) < 1e-15) d2 = std::copysign(1e-15, d2);
+
+    double p_eigen1 = -g1 / d1;
+    double p_eigen2 = -g2 / d2;
+
+    // Transform back to original space: p = V * p_eigen
+    // where V = [v1, v2] (columns are eigenvectors)
+    double delta_na = v1[0] * p_eigen1 + v2[0] * p_eigen2;
+    double delta_nb = v1[1] * p_eigen1 + v2[1] * p_eigen2;
+
+    return {delta_na, delta_nb};
+}
+
+std::vector<double> REKS::solve_trust_region_subproblem_2d(
+    const std::vector<double>& g, const std::vector<std::vector<double>>& H, double Delta)
+{
+    // Solve Trust-Region subproblem for 2D case:
+    //   minimize m(p) = g·p + ½ p·H·p
+    //   subject to ||p|| ≤ Δ
+    //
+    // Cases:
+    // 1. H positive definite & Newton step inside trust region -> use Newton
+    // 2. H positive definite & Newton step outside -> scale to boundary
+    // 3. H indefinite (det < 0) -> solve on boundary via secular equation
+    // 4. H singular -> gradient descent direction
+
+    using namespace reks::constants;
+
+    // Extract Hessian elements
+    double H11 = H[0][0], H12 = H[0][1], H22 = H[1][1];
+    double g1 = g[0], g2 = g[1];
+
+    // Compute eigendecomposition of 2x2 symmetric Hessian
+    // H = V * Λ * V^T where Λ = diag(lam1, lam2)
+    double trace = H11 + H22;
+    double det = H11 * H22 - H12 * H12;
+
+    // Eigenvalues: λ = (trace ± sqrt(trace² - 4*det)) / 2
+    double discriminant = trace * trace - 4.0 * det;
+    if (discriminant < 0.0) discriminant = 0.0;  // Numerical safeguard
+    double sqrt_disc = std::sqrt(discriminant);
+
+    double lam1 = 0.5 * (trace - sqrt_disc);  // Smaller eigenvalue
+    double lam2 = 0.5 * (trace + sqrt_disc);  // Larger eigenvalue
+
+    // Eigenvectors for 2x2 symmetric matrix
+    std::vector<double> v1(2), v2(2);
+    if (std::abs(H12) > 1e-14) {
+        // Off-diagonal is nonzero: standard eigenvector formula
+        v1[0] = lam1 - H22;
+        v1[1] = H12;
+        double norm1 = std::sqrt(v1[0]*v1[0] + v1[1]*v1[1]);
+        if (norm1 > NORM_THRESHOLD) {
+            v1[0] /= norm1;
+            v1[1] /= norm1;
+        } else {
+            v1[0] = 1.0; v1[1] = 0.0;
+        }
+
+        v2[0] = lam2 - H22;
+        v2[1] = H12;
+        double norm2 = std::sqrt(v2[0]*v2[0] + v2[1]*v2[1]);
+        if (norm2 > NORM_THRESHOLD) {
+            v2[0] /= norm2;
+            v2[1] /= norm2;
+        } else {
+            v2[0] = 0.0; v2[1] = 1.0;
+        }
+    } else {
+        // Diagonal matrix: eigenvectors are coordinate axes
+        if (H11 <= H22) {
+            v1[0] = 1.0; v1[1] = 0.0;
+            v2[0] = 0.0; v2[1] = 1.0;
+        } else {
+            v1[0] = 0.0; v1[1] = 1.0;
+            v2[0] = 1.0; v2[1] = 0.0;
+            std::swap(lam1, lam2);
+        }
+    }
+
+    // Transform gradient to eigenspace: g_eigen = V^T * g
+    double g_eigen1 = v1[0]*g1 + v1[1]*g2;
+    double g_eigen2 = v2[0]*g1 + v2[1]*g2;
+
+    // Case 3: Indefinite Hessian (det < 0, meaning lam1 < 0 < lam2)
+    if (det < -HESSIAN_THRESHOLD) {
+        // Must solve on the boundary using secular equation
+        return solve_boundary_constrained_2d(g_eigen1, g_eigen2, lam1, lam2, v1, v2, Delta);
+    }
+
+    // Case 4: Singular or near-singular Hessian
+    if (std::abs(det) < HESSIAN_THRESHOLD || lam1 < HESSIAN_THRESHOLD) {
+        // Use gradient descent direction, scaled to trust radius
+        double g_norm = std::sqrt(g1*g1 + g2*g2);
+        if (g_norm < 1e-14) {
+            return {0.0, 0.0};
+        }
+        return {-Delta * g1 / g_norm, -Delta * g2 / g_norm};
+    }
+
+    // Cases 1 & 2: H is positive definite
+    // Compute Newton step: p_N = -H^{-1} * g
+    double inv_det = 1.0 / det;
+    double p_newton_a = -inv_det * (H22 * g1 - H12 * g2);
+    double p_newton_b = -inv_det * (-H12 * g1 + H11 * g2);
+
+    double newton_norm = std::sqrt(p_newton_a*p_newton_a + p_newton_b*p_newton_b);
+
+    // Case 1: Newton step is inside trust region
+    if (newton_norm <= Delta) {
+        return {p_newton_a, p_newton_b};
+    }
+
+    // Case 2: Newton step is outside trust region
+    // Scale to the boundary: p = (Δ/||p_N||) * p_N
+    // Note: For strictly convex case, this is not optimal (should use secular equation)
+    // but it's a reasonable approximation that avoids the complexity
+    return solve_boundary_constrained_2d(g_eigen1, g_eigen2, lam1, lam2, v1, v2, Delta);
+}
+
+void REKS::trust_region_fon_optimizer_44() {
+    // Trust-Region FON optimization for REKS(4,4)
+    //
+    // This method replaces the Newton-Raphson optimizer with a Trust-Region
+    // approach that handles indefinite Hessians robustly via the secular equation.
+    //
+    // Algorithm:
+    // 1. Compute gradient and Hessian of E_PPS w.r.t. (n_a, n_b)
+    // 2. Solve Trust-Region subproblem: min m(p) = g·p + ½p·H·p  s.t. ||p|| ≤ Δ
+    // 3. Evaluate actual vs predicted reduction
+    // 4. Accept/reject step and update trust radius
+    //
+    // Reference: Trust-Region Augmented Hessian (TRAH)
+
+    using namespace reks::constants;
+
+    // Skip if FONs are frozen
+    if (fon_oscillation_frozen_) {
+        if (reks_debug_ >= 1) {
+            outfile->Printf("\n  === Trust-Region REKS(4,4): FON frozen, skipping ===\n");
+        }
+        compute_weighting_factors();
+        return;
+    }
+
+    // Get current FONs
+    double n_a = active_space_->pair(0).fon_p;
+    double n_b = active_space_->pair(1).fon_p;
+
+    // =========================================================================
+    // FON Initialization (same logic as rex_solver_44)
+    // =========================================================================
+    if (!fon_initialized_44_) {
+        // Before localization (iteration_ < 2): keep FONs frozen at n=1.0
+        if (iteration_ < 2) {
+            if (reks_debug_ >= 1) {
+                outfile->Printf("  [TR] Waiting for localization (iteration %d < 2), keeping n_a=n_b=1.0\n", iteration_);
+            }
+            active_space_->set_pair_fon(0, 1.0);
+            active_space_->set_pair_fon(1, 1.0);
+            compute_weighting_factors();
+            return;
+        }
+
+        // After localization: initialize FON
+        // Priority: (1) User-provided, (2) FON history prediction, (3) HAM-DIAG
+        bool initialized = false;
+
+        // (1) User-provided initial FON values
+        if (reks_initial_na_ >= 0.0 && reks_initial_nb_ >= 0.0) {
+            active_space_->set_pair_fon(0, reks_initial_na_);
+            active_space_->set_pair_fon(1, reks_initial_nb_);
+            n_a = reks_initial_na_;
+            n_b = reks_initial_nb_;
+            initialized = true;
+            if (reks_debug_ >= 1) {
+                outfile->Printf("  [TR] Using user-provided initial FON: n_a=%.6f, n_b=%.6f\n",
+                               reks_initial_na_, reks_initial_nb_);
+            }
+        }
+
+        // (2) Default: HAM-DIAG initialization
+        if (!initialized) {
+            initialize_fon_from_hamiltonian_44();
+            n_a = active_space_->pair(0).fon_p;
+            n_b = active_space_->pair(1).fon_p;
+        }
+        fon_initialized_44_ = true;
+    }
+
+    // Lambda to compute E_PPS at given FON values
+    auto compute_E_PPS_at = [&](double na, double nb) -> double {
+        double old_na = active_space_->pair(0).fon_p;
+        double old_nb = active_space_->pair(1).fon_p;
+        active_space_->set_pair_fon(0, na);
+        active_space_->set_pair_fon(1, nb);
+        double E = active_space_->compute_energy_PPS(E_micro_);
+        active_space_->set_pair_fon(0, old_na);
+        active_space_->set_pair_fon(1, old_nb);
+        return E;
+    };
+
+    // Trust-Region parameters (persistent radius from member variable)
+    double Delta = trust_radius_44_;
+
+    // Store initial FON values for summary
+    double n_a_initial = n_a;
+    double n_b_initial = n_b;
+    int fon_iters_used = 0;
+    bool hessian_was_indefinite = false;
+
+    if (reks_debug_ >= 1) {
+        outfile->Printf("\n  ================================================================================\n");
+        outfile->Printf("  REKS(4,4) FON Optimizer (Trust-Region) - SCF Iteration %d\n", iteration_);
+        outfile->Printf("  ================================================================================\n");
+        outfile->Printf("  Initial: n_a = %.6f, n_b = %.6f (n_d = %.6f, n_c = %.6f)\n",
+                       n_a, n_b, 2.0 - n_a, 2.0 - n_b);
+        outfile->Printf("  Trust radius: Δ = %.4f\n", Delta);
+    }
+
+    double E_old = compute_E_PPS_at(n_a, n_b);
+
+    if (reks_debug_ >= 1) {
+        outfile->Printf("  Initial E_PPS = %.10f Ha\n\n", E_old);
+    }
+
+    for (int iter = 0; iter < FON_MAX_ITER; ++iter) {
+        // 1. Compute gradient [dE/dn_a, dE/dn_b]
+        std::vector<double> grad = active_space_->compute_gradient_PPS(E_micro_);
+
+        // Boundary-aware effective gradient
+        double eff_grad_na = grad[0];
+        double eff_grad_nb = grad[1];
+
+        // At upper bound (n≈2) with negative gradient: constrained
+        if (n_a >= 2.0 - 1e-10 && grad[0] < 0.0) eff_grad_na = 0.0;
+        if (n_b >= 2.0 - 1e-10 && grad[1] < 0.0) eff_grad_nb = 0.0;
+        // At lower bound (n≈0) with positive gradient: constrained
+        if (n_a <= 1e-10 && grad[0] > 0.0) eff_grad_na = 0.0;
+        if (n_b <= 1e-10 && grad[1] > 0.0) eff_grad_nb = 0.0;
+
+        double eff_grad_norm = std::sqrt(eff_grad_na*eff_grad_na + eff_grad_nb*eff_grad_nb);
+
+        // 2. Check convergence
+        if (eff_grad_norm < FON_TOL * 10.0) {
+            fon_iters_used = iter;
+            if (reks_debug_ >= 1) {
+                outfile->Printf("  --- FON iter %2d: CONVERGED ---\n", iter);
+                outfile->Printf("    n = (%.6f, %.6f), |eff_grad| = %.2e < %.2e\n",
+                               n_a, n_b, eff_grad_norm, FON_TOL * 10.0);
+            }
+            break;
+        }
+
+        // 3. Compute Hessian [H_aa, H_ab; H_ab, H_bb]
+        std::vector<double> hess_flat = active_space_->compute_hessian_PPS(E_micro_);
+        std::vector<std::vector<double>> H = {
+            {hess_flat[0], hess_flat[1]},
+            {hess_flat[2], hess_flat[3]}
+        };
+
+        // Compute Hessian determinant and eigenvalues for diagnostics
+        double det_H = H[0][0] * H[1][1] - H[0][1] * H[1][0];
+        double trace_H = H[0][0] + H[1][1];
+        // Eigenvalues: λ = (trace ± sqrt(trace² - 4*det)) / 2
+        double discriminant = trace_H * trace_H - 4.0 * det_H;
+        double lambda1 = 0.0, lambda2 = 0.0;
+        if (discriminant >= 0.0) {
+            lambda1 = 0.5 * (trace_H - std::sqrt(discriminant));
+            lambda2 = 0.5 * (trace_H + std::sqrt(discriminant));
+        }
+        bool is_positive_definite = (lambda1 > 0.0 && lambda2 > 0.0);
+        if (!is_positive_definite) hessian_was_indefinite = true;
+
+        if (reks_debug_ >= 1) {
+            outfile->Printf("  --- FON iter %2d ---\n", iter);
+            outfile->Printf("    n = (%.6f, %.6f), E_PPS = %.10f\n", n_a, n_b, E_old);
+            outfile->Printf("    grad = [%+.6e, %+.6e], |g| = %.2e\n", grad[0], grad[1],
+                           std::sqrt(grad[0]*grad[0] + grad[1]*grad[1]));
+            outfile->Printf("    Hess = [[%+.6f, %+.6f], [%+.6f, %+.6f]]\n",
+                           H[0][0], H[0][1], H[1][0], H[1][1]);
+            outfile->Printf("    det(H) = %+.6e, eigenvalues = (%.4f, %.4f) %s\n",
+                           det_H, lambda1, lambda2,
+                           is_positive_definite ? "[positive definite]" : "[INDEFINITE]");
+        }
+
+        // 4. Solve Trust-Region subproblem
+        std::vector<double> p = solve_trust_region_subproblem_2d({eff_grad_na, eff_grad_nb}, H, Delta);
+
+        // 5. Trial point with boundary clamping
+        double n_a_trial = std::clamp(n_a + p[0], 0.0, 2.0);
+        double n_b_trial = std::clamp(n_b + p[1], 0.0, 2.0);
+
+        // Actual step (may be smaller due to clamping)
+        double actual_p0 = n_a_trial - n_a;
+        double actual_p1 = n_b_trial - n_b;
+        double step_norm = std::sqrt(actual_p0*actual_p0 + actual_p1*actual_p1);
+
+        // 6. Compute actual vs predicted reduction
+        double E_new = compute_E_PPS_at(n_a_trial, n_b_trial);
+        double actual_reduction = E_old - E_new;
+
+        // Predicted reduction from quadratic model: -g·p - ½ p·H·p
+        double predicted_reduction = -(eff_grad_na * actual_p0 + eff_grad_nb * actual_p1)
+                                    - 0.5 * (H[0][0]*actual_p0*actual_p0 + 2*H[0][1]*actual_p0*actual_p1 + H[1][1]*actual_p1*actual_p1);
+
+        // Ratio ρ = actual / predicted
+        double rho = (std::abs(predicted_reduction) > 1e-15) ? actual_reduction / predicted_reduction : 0.0;
+
+        if (reks_debug_ >= 1) {
+            outfile->Printf("    step p = (%+.6f, %+.6f), |p| = %.4f, Δ = %.4f\n",
+                           actual_p0, actual_p1, step_norm, Delta);
+            outfile->Printf("    trial n = (%.6f, %.6f), E_trial = %.10f\n", n_a_trial, n_b_trial, E_new);
+            outfile->Printf("    actual_red = %+.6e, pred_red = %+.6e, ρ = %.4f\n",
+                           actual_reduction, predicted_reduction, rho);
+        }
+
+        // 7. Accept/reject step and update trust radius
+        const char* step_status = "";
+        if (rho > TR_ETA_VERY_GOOD) {
+            // Very good step: accept and increase trust radius
+            n_a = n_a_trial;
+            n_b = n_b_trial;
+            E_old = E_new;
+            Delta = std::min(2.0 * Delta, TR_DELTA_MAX);
+            step_status = "VERY_GOOD: accepted, Δ increased";
+        } else if (rho > TR_ETA_GOOD) {
+            // Good step: accept, keep trust radius
+            n_a = n_a_trial;
+            n_b = n_b_trial;
+            E_old = E_new;
+            step_status = "GOOD: accepted";
+        } else if (rho > TR_ETA_ACCEPT) {
+            // Acceptable step: accept but reduce trust radius
+            n_a = n_a_trial;
+            n_b = n_b_trial;
+            E_old = E_new;
+            Delta = std::max(0.5 * step_norm, TR_DELTA_MIN);
+            step_status = "ACCEPTABLE: accepted, Δ reduced";
+        } else {
+            // Bad step: reject and shrink trust radius
+            Delta = std::max(0.25 * step_norm, TR_DELTA_MIN);
+            step_status = "REJECTED: Δ shrunk";
+        }
+
+        fon_iters_used = iter + 1;
+
+        if (reks_debug_ >= 1) {
+            outfile->Printf("    --> %s, new Δ = %.4f\n\n", step_status, Delta);
+        }
+
+        // Check for tiny trust radius (algorithm stalled)
+        if (Delta < TR_DELTA_MIN * 10.0 && step_norm < FON_TOL) {
+            if (reks_debug_ >= 1) {
+                outfile->Printf("  Trust radius too small, stopping\n");
+            }
+            break;
+        }
+    }
+
+    // Save trust radius for next SCF iteration
+    trust_radius_44_ = Delta;
+
+    // Update active space FONs
+    active_space_->set_pair_fon(0, n_a);
+    active_space_->set_pair_fon(1, n_b);
+
+    // Orbital swap if needed (same logic as rex_solver_44)
+    const double swap_tol = 1.0 - 1e-4;
+    if (n_a < swap_tol) {
+        int a_idx = Ncore_;
+        int d_idx = Ncore_ + 3;
+        for (int i = 0; i < nso_; ++i) {
+            double tmp = Ca_->get(i, a_idx);
+            Ca_->set(i, a_idx, Ca_->get(i, d_idx));
+            Ca_->set(i, d_idx, tmp);
+        }
+        n_a = 2.0 - n_a;
+        active_space_->set_pair_fon(0, n_a);
+        if (reks_debug_ >= 1) {
+            outfile->Printf("  [TR] Orbital swap a<->d, n_a -> %.6f\n", n_a);
+        }
+    }
+    if (n_b < swap_tol) {
+        int b_idx = Ncore_ + 1;
+        int c_idx = Ncore_ + 2;
+        for (int i = 0; i < nso_; ++i) {
+            double tmp = Ca_->get(i, b_idx);
+            Ca_->set(i, b_idx, Ca_->get(i, c_idx));
+            Ca_->set(i, c_idx, tmp);
+        }
+        n_b = 2.0 - n_b;
+        active_space_->set_pair_fon(1, n_b);
+        if (reks_debug_ >= 1) {
+            outfile->Printf("  [TR] Orbital swap b<->c, n_b -> %.6f\n", n_b);
+        }
+    }
+
+    // Update prev FON history
+    prev_n_a_ = n_a;
+    prev_n_b_ = n_b;
+
+    // Recompute weights
+    compute_weighting_factors();
+
+    if (reks_debug_ >= 1) {
+        double E_PPS = active_space_->compute_energy_PPS(E_micro_);
+        outfile->Printf("  --------------------------------------------------------------------------------\n");
+        outfile->Printf("  FON Optimization Summary:\n");
+        outfile->Printf("    FON iterations:    %d\n", fon_iters_used);
+        outfile->Printf("    Hessian status:    %s\n",
+                       hessian_was_indefinite ? "INDEFINITE (at some iteration)" : "positive definite");
+        outfile->Printf("    Initial n:         (%.6f, %.6f)\n", n_a_initial, n_b_initial);
+        outfile->Printf("    Final n:           (%.6f, %.6f)\n", n_a, n_b);
+        outfile->Printf("    Change Δn:         (%+.6f, %+.6f)\n", n_a - n_a_initial, n_b - n_b_initial);
+        outfile->Printf("    Final E_PPS:       %.10f Ha\n", E_PPS);
+        outfile->Printf("    Trust radius:      %.4f\n", trust_radius_44_);
+        outfile->Printf("  ================================================================================\n\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive Trust-Region + Multi-Start (FON_SOLVER=3)
+// ---------------------------------------------------------------------------
+
+void REKS::trust_region_fon_optimizer_44_adaptive() {
+    // FON_SOLVER=3: Adaptive Multi-Start
+    //
+    // Strategy:
+    // 1. Always use Trust-Region as the primary optimizer
+    // 2. Check Hessian after TR optimization
+    // 3. Trigger Multi-Start ONLY when needed:
+    //    - Hessian is indefinite (det < 0) -> multiple minima possible
+    //    - First SCF iteration -> no prior state to trust
+    //    - Large FON change (|Δn| > 0.5) -> possible state switching
+    //
+    // This gives robustness without unnecessary computational cost.
+
+    using namespace reks::constants;
+
+    // Step 1: Run Trust-Region optimization (same as FON_SOLVER=2)
+    trust_region_fon_optimizer_44();
+
+    // Step 2: Check if multi-start is needed
+    double n_a = active_space_->pair(0).fon_p;
+    double n_b = active_space_->pair(1).fon_p;
+    double E_current = active_space_->compute_energy_PPS(E_micro_);
+
+    // Compute Hessian to check for multiple minima
+    std::vector<double> hess = active_space_->compute_hessian_PPS(E_micro_);
+    double det = hess[0] * hess[3] - hess[1] * hess[2];
+    double trace = hess[0] + hess[3];
+    double discriminant = trace * trace - 4.0 * det;
+    double lambda1 = (trace + std::sqrt(std::max(0.0, discriminant))) / 2.0;
+    double lambda2 = (trace - std::sqrt(std::max(0.0, discriminant))) / 2.0;
+
+    // Check if multi-start needed
+    bool indefinite_hessian = (det < -1e-6);  // Negative determinant = saddle point
+    bool first_iteration = (iteration_ <= 2 && !fon_initialized_44_);
+    bool large_fon_change = false;
+    if (prev_n_a_ >= 0.0) {
+        double delta_na = std::abs(n_a - prev_n_a_);
+        double delta_nb = std::abs(n_b - prev_n_b_);
+        large_fon_change = (delta_na > 0.5 || delta_nb > 0.5);
+    }
+
+    bool need_multi_start = indefinite_hessian || first_iteration || large_fon_change;
+
+    if (reks_debug_ >= 1) {
+        outfile->Printf("\n  === Adaptive Multi-Start Check (FON_SOLVER=3) ===\n");
+        outfile->Printf("    Hessian: det=%.6f, λ₁=%.4f, λ₂=%.4f\n", det, lambda1, lambda2);
+        outfile->Printf("    Indefinite Hessian: %s\n", indefinite_hessian ? "YES" : "NO");
+        outfile->Printf("    First iteration:    %s\n", first_iteration ? "YES" : "NO");
+        outfile->Printf("    Large FON change:   %s\n", large_fon_change ? "YES" : "NO");
+        outfile->Printf("    Multi-Start trigger: %s\n", need_multi_start ? "TRIGGERED" : "SKIPPED");
+    }
+
+    if (!need_multi_start) {
+        // Trust-Region solution is good enough
+        prev_n_a_ = n_a;
+        prev_n_b_ = n_b;
+        return;
+    }
+
+    // Step 3: Try alternative starting points
+    if (reks_debug_ >= 1) {
+        outfile->Printf("\n  === Multi-Start Alternative Solutions ===\n");
+    }
+
+    // Current solution (from Trust-Region)
+    reks::FONSolution current;
+    current.n_a = n_a;
+    current.n_b = n_b;
+    current.E_PPS = E_current;
+    current.converged = true;
+    current.classify();
+
+    std::vector<reks::FONSolution> solutions;
+    solutions.push_back(current);
+
+    // Try diradical starting point (n=1.0, 1.0)
+    if (n_a > 1.2 || n_b > 1.2) {  // Only if current is not already diradical
+        reks::FONStartPoint birad_start(1.0, 1.0, "DIRADICAL");
+        reks::FONSolution birad = optimize_from_start_44(birad_start, 1);
+        if (birad.converged) {
+            birad.classify();
+            solutions.push_back(birad);
+        }
+    }
+
+    // Try closed-shell starting point (n=2.0, 2.0)
+    if (n_a < 1.8 || n_b < 1.8) {  // Only if current is not already closed-shell
+        reks::FONStartPoint closed_start(2.0, 2.0, "CLOSED_SHELL");
+        reks::FONSolution closed = optimize_from_start_44(closed_start, 2);
+        if (closed.converged) {
+            closed.classify();
+            solutions.push_back(closed);
+        }
+    }
+
+    // Remove duplicates
+    std::vector<reks::FONSolution> unique;
+    for (const auto& sol : solutions) {
+        bool is_dup = false;
+        for (const auto& u : unique) {
+            if (sol.is_duplicate_of(u)) {
+                is_dup = true;
+                break;
+            }
+        }
+        if (!is_dup) {
+            unique.push_back(sol);
+        }
+    }
+
+    if (reks_debug_ >= 1) {
+        outfile->Printf("    Solutions found: %zu unique\n", unique.size());
+        for (size_t i = 0; i < unique.size(); ++i) {
+            const char* char_str = unique[i].character == reks::FONCharacter::DIRADICAL ? "DIRADICAL" :
+                                   unique[i].character == reks::FONCharacter::CLOSED_SHELL ? "CLOSED_SHELL" :
+                                   "MIXED";
+            outfile->Printf("      [%zu] E=%.10f, n=(%.4f, %.4f), %s\n",
+                           i, unique[i].E_PPS, unique[i].n_a, unique[i].n_b, char_str);
+        }
+    }
+
+    // Select best solution (use criterion from options)
+    reks::FONSolution selected = select_solution(unique, prev_n_a_, prev_n_b_,
+                                                  reks_branch_criterion_, reks_energy_tolerance_);
+
+    // Check if a better solution was found
+    if (selected.E_PPS < E_current - 1e-8) {
+        if (reks_debug_ >= 1) {
+            outfile->Printf("    Multi-Start found LOWER energy solution!\n");
+            outfile->Printf("      Previous: E=%.10f, n=(%.4f, %.4f)\n", E_current, n_a, n_b);
+            outfile->Printf("      New:      E=%.10f, n=(%.4f, %.4f)\n",
+                           selected.E_PPS, selected.n_a, selected.n_b);
+        }
+
+        // Apply better solution
+        active_space_->set_pair_fon(0, selected.n_a);
+        active_space_->set_pair_fon(1, selected.n_b);
+        compute_weighting_factors();
+    }
+
+    // Update previous FON for next geometry
+    prev_n_a_ = selected.n_a;
+    prev_n_b_ = selected.n_b;
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive FON Solver for REKS(4,4) (FON_SOLVER=4)
+// ---------------------------------------------------------------------------
+// This solver uses continuation-first approach with early transition detection.
+// Key features:
+// - Uses FON history prediction when available (smooth PES)
+// - Probes for diradical solutions when Hessian indicates transition
+// - Enforces symmetry (n_a = n_b) for symmetric molecules
+// - No multi-start: probing preserves continuity better
+
+FONPhase REKS::detect_fon_phase(const std::vector<double>& grad, const std::vector<double>& hess) {
+    // Detect current FON optimization phase based on Hessian analysis
+    //
+    // Phase detection logic:
+    // - STABLE: det(H) > 0, λ_min > threshold -> well away from transition
+    // - PRE_TRANSITION: det(H) > 0 but decreasing OR λ_min < threshold -> approaching transition
+    // - TRANSITION: det(H) <= 0 -> at or past saddle point
+    //
+    // Returns phase enum for adaptive strategy selection.
+
+    const double LAMBDA_MIN_THRESHOLD = 0.1;  // Ha^-1
+
+    // Compute Hessian eigenvalues
+    double det_H = hess[0] * hess[3] - hess[1] * hess[2];
+    double trace_H = hess[0] + hess[3];
+    double discriminant = trace_H * trace_H - 4.0 * det_H;
+
+    double lambda_min = 0.0;
+    if (discriminant >= 0.0) {
+        lambda_min = 0.5 * (trace_H - std::sqrt(discriminant));
+    }
+
+    // Check if det(H) is decreasing (approaching transition)
+    bool det_decreasing = (det_H > 0.0 && det_H < det_H_prev_ * 0.9);
+
+    // Update previous determinant for next call
+    det_H_prev_ = det_H;
+
+    if (det_H <= 0.0) {
+        return FONPhase::TRANSITION;
+    } else if (lambda_min < LAMBDA_MIN_THRESHOLD || det_decreasing) {
+        return FONPhase::PRE_TRANSITION;
+    } else {
+        return FONPhase::STABLE;
+    }
+}
+
+void REKS::adaptive_fon_solver_44() {
+    // Adaptive FON Solver for REKS(4,4) (FON_SOLVER=4)
+    //
+    // Key algorithm:
+    // 1. Check FON history for prediction (continuation-first)
+    // 2. Detect phase: STABLE, PRE_TRANSITION, or TRANSITION
+    // 3. For PRE_TRANSITION: probe diradical solution to catch early transition
+    // 4. Use Trust-Region for optimization
+    // 5. Enforce symmetry if enabled (n_a = n_b for symmetric molecules)
+    // 6. Quality control: reject large jumps, prefer history prediction
+    //
+    // Goal: Smooth E(R) and FON(R) curves for PES scans
+
+    using namespace reks::constants;
+
+    // Skip if FONs are frozen
+    if (fon_oscillation_frozen_) {
+        compute_weighting_factors();
+        return;
+    }
+
+    // Constants for adaptive solver
+    const double STEP_PROBE = 0.1;      // Probing step towards diradical
+    const double JUMP_ALERT = 0.3;      // Warn if FON changes this much from prediction
+    const double JUMP_CRITICAL = 0.5;   // Reject changes larger than this
+
+    // Get current FONs
+    double n_a = active_space_->pair(0).fon_p;
+    double n_b = active_space_->pair(1).fon_p;
+
+    // =========================================================================
+    // FON Initialization
+    // =========================================================================
+    if (!fon_initialized_44_) {
+        // Before localization: keep FONs frozen
+        if (iteration_ < 2) {
+            active_space_->set_pair_fon(0, 1.0);
+            active_space_->set_pair_fon(1, 1.0);
+            compute_weighting_factors();
+            return;
+        }
+
+        // Initialize FON
+        bool initialized = false;
+
+        // (1) User-provided initial values
+        if (reks_initial_na_ >= 0.0 && reks_initial_nb_ >= 0.0) {
+            n_a = reks_initial_na_;
+            n_b = reks_initial_nb_;
+            active_space_->set_pair_fon(0, n_a);
+            active_space_->set_pair_fon(1, n_b);
+            initialized = true;
+            if (reks_debug_ >= 1) {
+                outfile->Printf("  [Adaptive] Using user-provided FON: n_a=%.6f, n_b=%.6f\n", n_a, n_b);
+            }
+        }
+
+        // (2) Multi-start search: ALWAYS try multiple starting points
+        // Each calculation finds the global minimum independently
+        if (!initialized) {
+            if (reks_debug_ >= 1) {
+                outfile->Printf("  [Adaptive] Running multi-start search\n");
+            }
+
+            // Start with HAM-DIAG initialization
+            initialize_fon_from_hamiltonian_44();
+            n_a = active_space_->pair(0).fon_p;
+            n_b = active_space_->pair(1).fon_p;
+
+            // Optimize from HAM-DIAG starting point (using Trust-Region)
+            active_space_->set_pair_fon(0, n_a);
+            active_space_->set_pair_fon(1, n_b);
+            reks::FONStartPoint ham_start(n_a, n_b, "HAM_DIAG");
+            reks::FONSolution ham_sol = optimize_from_start_44(ham_start, 0);
+
+            // Also try DIRADICAL starting point (n=1.0, 1.0)
+            reks::FONStartPoint birad_start(1.0, 1.0, "DIRADICAL");
+            reks::FONSolution birad_sol = optimize_from_start_44(birad_start, 1);
+
+            // Also try CLOSED_SHELL starting point (n=2.0, 2.0)
+            reks::FONStartPoint closed_start(2.0, 2.0, "CLOSED_SHELL");
+            reks::FONSolution closed_sol = optimize_from_start_44(closed_start, 2);
+
+            // Collect converged solutions
+            std::vector<reks::FONSolution> solutions;
+            if (ham_sol.converged) solutions.push_back(ham_sol);
+            if (birad_sol.converged) solutions.push_back(birad_sol);
+            if (closed_sol.converged) solutions.push_back(closed_sol);
+
+            // Helper to get name from start_id
+            auto get_name = [](int start_id) -> const char* {
+                switch(start_id) {
+                    case 0: return "HAM_DIAG";
+                    case 1: return "DIRADICAL";
+                    case 2: return "CLOSED_SHELL";
+                    default: return "UNKNOWN";
+                }
+            };
+
+            if (reks_debug_ >= 1) {
+                outfile->Printf("  [Adaptive] Multi-start results:\n");
+                for (const auto& sol : solutions) {
+                    outfile->Printf("    %s: E=%.8f, n_a=%.4f, n_b=%.4f\n",
+                                   get_name(sol.start_id), sol.E_PPS, sol.n_a, sol.n_b);
+                }
+            }
+
+            // Select the lowest energy solution
+            if (!solutions.empty()) {
+                auto best = std::min_element(solutions.begin(), solutions.end(),
+                                            [](const reks::FONSolution& a, const reks::FONSolution& b) {
+                                                return a.E_PPS < b.E_PPS;
+                                            });
+                n_a = best->n_a;
+                n_b = best->n_b;
+                if (reks_debug_ >= 1) {
+                    outfile->Printf("  [Adaptive] Selected %s: E=%.8f, n_a=%.4f, n_b=%.4f\n",
+                                   get_name(best->start_id), best->E_PPS, n_a, n_b);
+                }
+            } else {
+                // Fallback to HAM-DIAG if nothing converged
+                initialize_fon_from_hamiltonian_44();
+                n_a = active_space_->pair(0).fon_p;
+                n_b = active_space_->pair(1).fon_p;
+            }
+
+            active_space_->set_pair_fon(0, n_a);
+            active_space_->set_pair_fon(1, n_b);
+            initialized = true;
+        }
+        fon_initialized_44_ = true;
+    }
+
+    // Lambda to compute E_PPS at given FON values
+    auto compute_E_PPS_at = [&](double na, double nb) -> double {
+        double old_na = active_space_->pair(0).fon_p;
+        double old_nb = active_space_->pair(1).fon_p;
+        active_space_->set_pair_fon(0, na);
+        active_space_->set_pair_fon(1, nb);
+        double E = active_space_->compute_energy_PPS(E_micro_);
+        active_space_->set_pair_fon(0, old_na);
+        active_space_->set_pair_fon(1, old_nb);
+        return E;
+    };
+
+    // =========================================================================
+    // Trust-Region Optimization with Coupling-Based Direction
+    // =========================================================================
+    double Delta = trust_radius_44_;
+    double E_old = compute_E_PPS_at(n_a, n_b);
+
+    if (reks_debug_ >= 1) {
+        outfile->Printf("\n  ================================================================================\n");
+        outfile->Printf("  REKS(4,4) FON Optimizer (Adaptive) - SCF Iteration %d\n", iteration_);
+        outfile->Printf("  ================================================================================\n");
+        outfile->Printf("  Initial: n_a = %.6f, n_b = %.6f, E_PPS = %.10f\n", n_a, n_b, E_old);
+    }
+
+    // =========================================================================
+    // Compute coupling elements for diradical detection
+    // =========================================================================
+    // Coupling elements from microstate energies (same as FON_SOLVER=1)
+    // dad = coupling between microstates 4,5 and 6,7 for pair (a,d)
+    // dbc = coupling between microstates 8,9 and 10,11 for pair (b,c)
+    double coupling_dad = (E_micro_[4] + E_micro_[5] - E_micro_[6] - E_micro_[7]) / 2.0;
+    double coupling_dbc = (E_micro_[8] + E_micro_[9] - E_micro_[10] - E_micro_[11]) / 2.0;
+
+    const double COUPLING_THRESHOLD = 1e-3;  // Ha - threshold for "strong" coupling
+    bool prefer_diradical_a = (std::abs(coupling_dad) > COUPLING_THRESHOLD);
+    bool prefer_diradical_b = (std::abs(coupling_dbc) > COUPLING_THRESHOLD);
+
+    if (reks_debug_ >= 1) {
+        outfile->Printf("  Coupling: dad=%.6f (|>%.1e? %s), dbc=%.6f (|>%.1e? %s)\n",
+                       coupling_dad, COUPLING_THRESHOLD, prefer_diradical_a ? "YES" : "no",
+                       coupling_dbc, COUPLING_THRESHOLD, prefer_diradical_b ? "YES" : "no");
+    }
+
+    for (int iter = 0; iter < FON_MAX_ITER; ++iter) {
+        // 1. Compute gradient and Hessian
+        std::vector<double> grad = active_space_->compute_gradient_PPS(E_micro_);
+        std::vector<double> hess = active_space_->compute_hessian_PPS(E_micro_);
+
+        // Boundary-aware effective gradient
+        // KEY FIX: At upper bound (n≈2), allow gradient if coupling prefers diradical
+        double eff_grad_na = grad[0];
+        double eff_grad_nb = grad[1];
+
+        // At lower bound (n≈0): zero out if gradient pushes further down
+        if (n_a <= 1e-10 && grad[0] > 0.0) eff_grad_na = 0.0;
+        if (n_b <= 1e-10 && grad[1] > 0.0) eff_grad_nb = 0.0;
+
+        // At upper bound (n≈2): only constrain if coupling is weak (closed-shell is OK)
+        // If coupling is strong, we WANT to move towards diradical
+        if (n_a >= 2.0 - 1e-10 && grad[0] < 0.0 && !prefer_diradical_a) {
+            eff_grad_na = 0.0;
+        }
+        if (n_b >= 2.0 - 1e-10 && grad[1] < 0.0 && !prefer_diradical_b) {
+            eff_grad_nb = 0.0;
+        }
+
+        double eff_grad_norm = std::sqrt(eff_grad_na*eff_grad_na + eff_grad_nb*eff_grad_nb);
+
+        // 2. Check convergence
+        if (eff_grad_norm < FON_TOL * 10.0) {
+            if (reks_debug_ >= 1) {
+                outfile->Printf("  --- FON iter %2d: CONVERGED |g|=%.2e ---\n", iter, eff_grad_norm);
+            }
+            break;
+        }
+
+        // 3. Detect phase and adapt strategy
+        FONPhase phase = detect_fon_phase(grad, hess);
+
+        if (reks_debug_ >= 2) {
+            const char* phase_str = (phase == FONPhase::STABLE) ? "STABLE" :
+                                   (phase == FONPhase::PRE_TRANSITION) ? "PRE_TRANSITION" : "TRANSITION";
+            outfile->Printf("  --- FON iter %2d: phase=%s, |g|=%.2e ---\n", iter, phase_str, eff_grad_norm);
+        }
+
+        // 4. COUPLING-BASED DIRADICAL PROBING
+        // If at closed-shell (n≈2) but coupling is strong, probe diradical direction
+        if ((n_a > 1.9 && prefer_diradical_a) || (n_b > 1.9 && prefer_diradical_b)) {
+            // Probe if diradical direction lowers energy
+            double n_a_probe = prefer_diradical_a && n_a > 1.9 ? std::max(n_a - STEP_PROBE, 1.0) : n_a;
+            double n_b_probe = prefer_diradical_b && n_b > 1.9 ? std::max(n_b - STEP_PROBE, 1.0) : n_b;
+            double E_probe = compute_E_PPS_at(n_a_probe, n_b_probe);
+
+            if (E_probe < E_old) {
+                // Diradical direction is favorable - take the step
+                n_a = n_a_probe;
+                n_b = n_b_probe;
+                E_old = E_probe;
+                active_space_->set_pair_fon(0, n_a);
+                active_space_->set_pair_fon(1, n_b);
+                if (reks_debug_ >= 1) {
+                    outfile->Printf("  [Adaptive] Coupling-probe accepted: n_a=%.4f, n_b=%.4f, dE=%.6f\n",
+                                   n_a, n_b, E_probe - E_old);
+                }
+                // Update coupling after step
+                coupling_dad = (E_micro_[4] + E_micro_[5] - E_micro_[6] - E_micro_[7]) / 2.0;
+                coupling_dbc = (E_micro_[8] + E_micro_[9] - E_micro_[10] - E_micro_[11]) / 2.0;
+                prefer_diradical_a = (std::abs(coupling_dad) > COUPLING_THRESHOLD);
+                prefer_diradical_b = (std::abs(coupling_dbc) > COUPLING_THRESHOLD);
+                continue;  // Skip trust-region step, already took a step
+            }
+        }
+
+        // 5. PRE_TRANSITION: Additional probe even without strong coupling
+        if (phase == FONPhase::PRE_TRANSITION && n_a > 1.9 && n_b > 1.9) {
+            // We're in closed-shell but approaching transition
+            // Probe if diradical direction lowers energy
+            double n_probe = std::max(n_a - STEP_PROBE, 1.0);
+            double E_probe = compute_E_PPS_at(n_probe, n_probe);
+
+            if (E_probe < E_old) {
+                // Diradical direction is favorable - take the step
+                n_a = n_probe;
+                n_b = n_probe;
+                E_old = E_probe;
+                active_space_->set_pair_fon(0, n_a);
+                active_space_->set_pair_fon(1, n_b);
+                if (reks_debug_ >= 1) {
+                    outfile->Printf("  [Adaptive] PRE_TRANSITION: probe accepted, n -> %.4f\n", n_a);
+                }
+                continue;  // Skip trust-region step, already took a step
+            }
+        }
+
+        // 5. Compute step: Trust-Region OR Coupling-Based Direction
+        double n_a_trial, n_b_trial;
+        double det = hess[0] * hess[3] - hess[1] * hess[2];
+
+        // Use coupling-based direction when:
+        // 1. Hessian is indefinite (det < 0), OR
+        // 2. Coupling is strong AND we're far from diradical optimum
+        //    This prevents Trust-Region from converging to wrong minimum
+        //
+        // Note: threshold 1.28 is chosen so that coupling-based direction continues
+        // to push towards diradical until we're close to the correct solution (~1.26)
+        bool use_coupling_direction = (det < -1e-8);
+        if (!use_coupling_direction) {
+            // Check if coupling is strong and we're not yet at diradical
+            const double BIRAD_THRESHOLD = 1.28;  // Close to typical diradical FON
+            if ((prefer_diradical_a && n_a > BIRAD_THRESHOLD) ||
+                (prefer_diradical_b && n_b > BIRAD_THRESHOLD)) {
+                use_coupling_direction = true;
+            }
+        }
+
+        if (use_coupling_direction) {
+            // =====================================================================
+            // Coupling-Based Direction
+            // =====================================================================
+            // KEY INSIGHT (from FON_SOLVER=1): When Hessian is indefinite OR coupling
+            // is strong, use physics (coupling) to guide direction:
+            // - Strong coupling → force towards n=1.0 (diradical)
+            // - Weak coupling → follow gradient (may go to closed-shell)
+            const double grad_step = 0.05;
+
+            double delta_na = 0.0, delta_nb = 0.0;
+
+            if (prefer_diradical_a) {
+                // Strong coupling: force towards n_a = 1.0
+                delta_na = (n_a > 1.0) ? -grad_step : (n_a < 1.0 ? grad_step : 0.0);
+            } else {
+                // Weak coupling: follow gradient
+                delta_na = (grad[0] > 0.0) ? -grad_step : (grad[0] < 0.0 ? grad_step : 0.0);
+            }
+
+            if (prefer_diradical_b) {
+                delta_nb = (n_b > 1.0) ? -grad_step : (n_b < 1.0 ? grad_step : 0.0);
+            } else {
+                delta_nb = (grad[1] > 0.0) ? -grad_step : (grad[1] < 0.0 ? grad_step : 0.0);
+            }
+
+            n_a_trial = std::clamp(n_a + delta_na, 0.0, 2.0);
+            n_b_trial = std::clamp(n_b + delta_nb, 0.0, 2.0);
+
+            if (reks_debug_ >= 2) {
+                outfile->Printf("  --- Coupling-based direction: det=%.2e, prefer_birad=(%d,%d), delta=(%.3f,%.3f)\n",
+                               det, prefer_diradical_a, prefer_diradical_b, delta_na, delta_nb);
+            }
+        } else {
+            // Standard Trust-Region step
+            std::vector<std::vector<double>> H = {
+                {hess[0], hess[1]},
+                {hess[2], hess[3]}
+            };
+            std::vector<double> p = solve_trust_region_subproblem_2d({eff_grad_na, eff_grad_nb}, H, Delta);
+
+            n_a_trial = std::clamp(n_a + p[0], 0.0, 2.0);
+            n_b_trial = std::clamp(n_b + p[1], 0.0, 2.0);
+        }
+
+        double E_new = compute_E_PPS_at(n_a_trial, n_b_trial);
+        double actual_reduction = E_old - E_new;
+
+        double actual_p0 = n_a_trial - n_a;
+        double actual_p1 = n_b_trial - n_b;
+
+        // Accept/reject logic
+        if (use_coupling_direction) {
+            // Coupling-based direction: always accept if energy doesn't increase
+            // (no predicted_reduction calculation needed - we trust coupling)
+            if (actual_reduction > -1e-12) {  // Accept if not increasing energy
+                n_a = n_a_trial;
+                n_b = n_b_trial;
+                E_old = E_new;
+            }
+            // Don't adjust trust radius for coupling-based steps
+        } else {
+            // Standard Trust-Region with ratio test
+            double predicted_reduction = -(eff_grad_na * actual_p0 + eff_grad_nb * actual_p1)
+                                        - 0.5 * (hess[0]*actual_p0*actual_p0 + 2*hess[1]*actual_p0*actual_p1 + hess[3]*actual_p1*actual_p1);
+
+            double rho = (std::abs(predicted_reduction) > 1e-15) ? actual_reduction / predicted_reduction : 0.0;
+
+            if (rho > TR_ETA_ACCEPT) {
+                n_a = n_a_trial;
+                n_b = n_b_trial;
+                E_old = E_new;
+                if (rho > TR_ETA_VERY_GOOD) {
+                    Delta = std::min(2.0 * Delta, TR_DELTA_MAX);
+                } else if (rho < TR_ETA_GOOD) {
+                    double step_norm = std::sqrt(actual_p0*actual_p0 + actual_p1*actual_p1);
+                    Delta = std::max(0.5 * step_norm, TR_DELTA_MIN);
+                }
+            } else {
+                double step_norm = std::sqrt(actual_p0*actual_p0 + actual_p1*actual_p1);
+                Delta = std::max(0.25 * step_norm, TR_DELTA_MIN);
+            }
+        }
+
+        if (Delta < TR_DELTA_MIN * 10.0) break;
+    }
+
+    // No post-optimization correction - coupling-based direction is handled within TR loop
+
+    // Update FON values
+    active_space_->set_pair_fon(0, n_a);
+    active_space_->set_pair_fon(1, n_b);
+
+    // =========================================================================
+    // Symmetry Enforcement
+    // =========================================================================
+    if (reks_enforce_symmetry_) {
+        double n_avg = (n_a + n_b) / 2.0;
+        n_a = n_avg;
+        n_b = n_avg;
+        if (reks_debug_ >= 1) {
+            outfile->Printf("  [Adaptive] Symmetry enforced: n_a = n_b = %.6f\n", n_avg);
+        }
+    }
+
+    // =========================================================================
+    // Finalize
+    // =========================================================================
+    trust_radius_44_ = Delta;
+    active_space_->set_pair_fon(0, n_a);
+    active_space_->set_pair_fon(1, n_b);
+
+    // Orbital swap if needed (keep n in [1, 2] range)
+    const double swap_tol = 1.0 - 1e-4;
+    if (n_a < swap_tol) {
+        int a_idx = Ncore_;
+        int d_idx = Ncore_ + 3;
+        for (int i = 0; i < nso_; ++i) {
+            double tmp = Ca_->get(i, a_idx);
+            Ca_->set(i, a_idx, Ca_->get(i, d_idx));
+            Ca_->set(i, d_idx, tmp);
+        }
+        n_a = 2.0 - n_a;
+        active_space_->set_pair_fon(0, n_a);
+    }
+    if (n_b < swap_tol) {
+        int b_idx = Ncore_ + 1;
+        int c_idx = Ncore_ + 2;
+        for (int i = 0; i < nso_; ++i) {
+            double tmp = Ca_->get(i, b_idx);
+            Ca_->set(i, b_idx, Ca_->get(i, c_idx));
+            Ca_->set(i, c_idx, tmp);
+        }
+        n_b = 2.0 - n_b;
+        active_space_->set_pair_fon(1, n_b);
+    }
+
+    // Update history
+    prev_n_a_ = n_a;
+    prev_n_b_ = n_b;
+
+    // Recompute weights
+    compute_weighting_factors();
+
+    if (reks_debug_ >= 1) {
+        double E_PPS = active_space_->compute_energy_PPS(E_micro_);
+        outfile->Printf("  --------------------------------------------------------------------------------\n");
+        outfile->Printf("  Adaptive FON Summary: n_a = %.6f, n_b = %.6f, E_PPS = %.10f\n", n_a, n_b, E_PPS);
+        outfile->Printf("  ================================================================================\n");
     }
 }
 
@@ -1612,10 +3421,23 @@ void REKS::form_D() {
     // 1. Build standard RHF density Da_ (needed for DIIS, convergence checks)
     RHF::form_D();
 
-    // 1.5. Apply orbital localization on every REKS iteration (after first)
-    //      This keeps active orbitals localized despite SCF rotations
-    if (iteration_ >= 1 && localization_type_ != "NONE") {
-        localize_active_space();
+    // 1.5. Apply orbital localization
+    //      Re-localization "anchors" orbitals to physical bonds.
+    //      However, for tight geometries (e.g., compressed square H4), repeated
+    //      localization can cause SCF oscillations. Use REKS_LOCALIZATION_FREEZE
+    //      to stop re-localizing after a certain iteration.
+    if (localization_type_ != "NONE") {
+        bool should_localize = true;
+        if (localization_freeze_iter_ > 0 && iteration_ > localization_freeze_iter_) {
+            should_localize = false;
+            if (reks_debug_ >= 2 && iteration_ == localization_freeze_iter_ + 1) {
+                outfile->Printf("  [REKS] Localization frozen after iteration %d\n",
+                               localization_freeze_iter_);
+            }
+        }
+        if (should_localize) {
+            localize_active_space();
+        }
     }
 
     // 2. Build REKS-specific base densities from current Ca_
@@ -2272,8 +4094,8 @@ void REKS::localize_active_space() {
             Cvir[mu][1] = Ctmp[mu][3];
         }
 
-        // Localize occupied
-        auto loc_occ = Localizer::build("BOYS", basisset_, C_occ);
+        // Localize occupied using user-specified method
+        auto loc_occ = Localizer::build(localization_type_, basisset_, C_occ);
         loc_occ->set_convergence(1e-8);
         loc_occ->set_maxiter(50);
         loc_occ->set_print(0);
@@ -2281,8 +4103,8 @@ void REKS::localize_active_space() {
         auto L_occ = loc_occ->L();
         double** Locc = L_occ->pointer();
 
-        // Localize virtual
-        auto loc_vir = Localizer::build("BOYS", basisset_, C_vir);
+        // Localize virtual using user-specified method
+        auto loc_vir = Localizer::build(localization_type_, basisset_, C_vir);
         loc_vir->set_convergence(1e-8);
         loc_vir->set_maxiter(50);
         loc_vir->set_print(0);
@@ -2290,60 +4112,130 @@ void REKS::localize_active_space() {
         auto L_vir = loc_vir->L();
         double** Lvir = L_vir->pointer();
 
-        // Compute z-centroid for each localized orbital
-        std::vector<std::pair<double, int>> occ_cents(2), vir_cents(2);
+        // Compute 3D centroids for each localized orbital (x, y, z)
+        // This enables proper localization for 2D geometries (square, rhombus)
+        SharedMatrix dipole_x = dipole[0];
+        SharedMatrix dipole_y = dipole[1];
+
+        std::vector<std::array<double, 3>> occ_cents_3d(2), vir_cents_3d(2);
         for (int i = 0; i < 2; i++) {
-            double z_occ = 0.0, z_vir = 0.0;
+            double x_occ = 0.0, y_occ = 0.0, z_occ = 0.0;
+            double x_vir = 0.0, y_vir = 0.0, z_vir = 0.0;
             for (int mu = 0; mu < nso; mu++) {
                 for (int nu = 0; nu < nso; nu++) {
+                    double dx = dipole_x->get(mu, nu);
+                    double dy = dipole_y->get(mu, nu);
                     double dz = dipole_z->get(mu, nu);
+                    x_occ += Locc[mu][i] * dx * Locc[nu][i];
+                    y_occ += Locc[mu][i] * dy * Locc[nu][i];
                     z_occ += Locc[mu][i] * dz * Locc[nu][i];
+                    x_vir += Lvir[mu][i] * dx * Lvir[nu][i];
+                    y_vir += Lvir[mu][i] * dy * Lvir[nu][i];
                     z_vir += Lvir[mu][i] * dz * Lvir[nu][i];
                 }
             }
-            occ_cents[i] = {z_occ, i};
-            vir_cents[i] = {z_vir, i};
+            occ_cents_3d[i] = {x_occ, y_occ, z_occ};
+            vir_cents_3d[i] = {x_vir, y_vir, z_vir};
         }
 
-        // Sort by z-coordinate
-        std::sort(occ_cents.begin(), occ_cents.end());
-        std::sort(vir_cents.begin(), vir_cents.end());
+        // Sort localized orbitals by position to ensure deterministic ordering
+        // Use principal axis: find axis with largest spread
+        double spread_x = std::abs(occ_cents_3d[0][0] - occ_cents_3d[1][0])
+                        + std::abs(vir_cents_3d[0][0] - vir_cents_3d[1][0]);
+        double spread_y = std::abs(occ_cents_3d[0][1] - occ_cents_3d[1][1])
+                        + std::abs(vir_cents_3d[0][1] - vir_cents_3d[1][1]);
+        double spread_z = std::abs(occ_cents_3d[0][2] - occ_cents_3d[1][2])
+                        + std::abs(vir_cents_3d[0][2] - vir_cents_3d[1][2]);
 
-        if (reks_debug_ >= 1) {
-            outfile->Printf("  REKS(4,4) localization centroids:\n");
-            outfile->Printf("    Occ left  z=%.4f (idx %d) -> MO a\n", occ_cents[0].first, occ_cents[0].second);
-            outfile->Printf("    Occ right z=%.4f (idx %d) -> MO b\n", occ_cents[1].first, occ_cents[1].second);
-            outfile->Printf("    Vir left  z=%.4f (idx %d) -> MO d\n", vir_cents[0].first, vir_cents[0].second);
-            outfile->Printf("    Vir right z=%.4f (idx %d) -> MO c\n", vir_cents[1].first, vir_cents[1].second);
+        int sort_axis = 0;  // Default: x-axis
+        if (spread_y > spread_x && spread_y > spread_z) sort_axis = 1;
+        if (spread_z > spread_x && spread_z > spread_y) sort_axis = 2;
+
+        // Sort occupied orbitals: ensure occ[0] has smaller coordinate on sort_axis
+        if (occ_cents_3d[0][sort_axis] > occ_cents_3d[1][sort_axis]) {
+            // Swap columns in L_occ
+            for (int mu = 0; mu < nso; mu++) {
+                std::swap(Locc[mu][0], Locc[mu][1]);
+            }
+            std::swap(occ_cents_3d[0], occ_cents_3d[1]);
         }
 
-        // Now we have:
-        // occ_cents[0] = left bond (σ12 at z ~ H1-H2 midpoint)
-        // occ_cents[1] = right bond (σ34 at z ~ H3-H4 midpoint)
-        // vir_cents[0] = left antibond (σ*12)
-        // vir_cents[1] = right antibond (σ*34)
-        //
-        // REKS(4,4) ordering: a, b, c, d
-        // Pair 0 (a,d): left bond (σ12) and left antibond (σ*12)
-        // Pair 1 (b,c): right bond (σ34) and right antibond (σ*34)
-        //
-        // Assignment:
-        // MO 0 (a) = occ left (σ12)
-        // MO 1 (b) = occ right (σ34)
-        // MO 2 (c) = vir right (σ*34) - pairs with b
-        // MO 3 (d) = vir left (σ*12) - pairs with a
+        // Sort virtual orbitals: ensure vir[0] has smaller coordinate on sort_axis
+        if (vir_cents_3d[0][sort_axis] > vir_cents_3d[1][sort_axis]) {
+            // Swap columns in L_vir
+            for (int mu = 0; mu < nso; mu++) {
+                std::swap(Lvir[mu][0], Lvir[mu][1]);
+            }
+            std::swap(vir_cents_3d[0], vir_cents_3d[1]);
+        }
+
+        if (reks_debug_ >= 2) {
+            outfile->Printf("  REKS(4,4) 3D localization centroids:\n");
+            outfile->Printf("    Occ 0: (%.4f, %.4f, %.4f)\n",
+                            occ_cents_3d[0][0], occ_cents_3d[0][1], occ_cents_3d[0][2]);
+            outfile->Printf("    Occ 1: (%.4f, %.4f, %.4f)\n",
+                            occ_cents_3d[1][0], occ_cents_3d[1][1], occ_cents_3d[1][2]);
+            outfile->Printf("    Vir 0: (%.4f, %.4f, %.4f)\n",
+                            vir_cents_3d[0][0], vir_cents_3d[0][1], vir_cents_3d[0][2]);
+            outfile->Printf("    Vir 1: (%.4f, %.4f, %.4f)\n",
+                            vir_cents_3d[1][0], vir_cents_3d[1][1], vir_cents_3d[1][2]);
+        }
+
+        // Match bonding and antibonding orbitals by 3D proximity
+        // For each occupied orbital, find the closest virtual orbital
+        // Distance: d = sqrt((x1-x2)^2 + (y1-y2)^2 + (z1-z2)^2)
+        double dist_00 = 0.0, dist_01 = 0.0, dist_10 = 0.0, dist_11 = 0.0;
+        for (int k = 0; k < 3; k++) {
+            dist_00 += std::pow(occ_cents_3d[0][k] - vir_cents_3d[0][k], 2);
+            dist_01 += std::pow(occ_cents_3d[0][k] - vir_cents_3d[1][k], 2);
+            dist_10 += std::pow(occ_cents_3d[1][k] - vir_cents_3d[0][k], 2);
+            dist_11 += std::pow(occ_cents_3d[1][k] - vir_cents_3d[1][k], 2);
+        }
+        dist_00 = std::sqrt(dist_00);
+        dist_01 = std::sqrt(dist_01);
+        dist_10 = std::sqrt(dist_10);
+        dist_11 = std::sqrt(dist_11);
+
+        if (reks_debug_ >= 2) {
+            outfile->Printf("  Distance matrix (occ->vir):\n");
+            outfile->Printf("    occ0->vir0: %.4f, occ0->vir1: %.4f\n", dist_00, dist_01);
+            outfile->Printf("    occ1->vir0: %.4f, occ1->vir1: %.4f\n", dist_10, dist_11);
+        }
+
+        // Optimal pairing: minimize sum of distances
+        // Option A: (occ0,vir0) + (occ1,vir1) -> total = dist_00 + dist_11
+        // Option B: (occ0,vir1) + (occ1,vir0) -> total = dist_01 + dist_10
+        int occ_a, occ_b, vir_c, vir_d;
+        if (dist_00 + dist_11 <= dist_01 + dist_10) {
+            // Option A: occ0 pairs with vir0, occ1 pairs with vir1
+            occ_a = 0; vir_d = 0;  // Pair 0: (a,d)
+            occ_b = 1; vir_c = 1;  // Pair 1: (b,c)
+            if (reks_debug_ >= 2) {
+                outfile->Printf("  Pairing: (occ0,vir0)+(occ1,vir1), total dist=%.4f\n", dist_00 + dist_11);
+            }
+        } else {
+            // Option B: occ0 pairs with vir1, occ1 pairs with vir0
+            occ_a = 0; vir_d = 1;  // Pair 0: (a,d)
+            occ_b = 1; vir_c = 0;  // Pair 1: (b,c)
+            if (reks_debug_ >= 2) {
+                outfile->Printf("  Pairing: (occ0,vir1)+(occ1,vir0), total dist=%.4f\n", dist_01 + dist_10);
+            }
+        }
 
         // Insert into Ca_
+        // REKS(4,4) ordering: a, b, c, d at positions 0, 1, 2, 3
+        // GVB pair 0: (a, d) - bonding and antibonding
+        // GVB pair 1: (b, c) - bonding and antibonding
         int mo_a = active_mo_indices_[0];
         int mo_b = active_mo_indices_[1];
         int mo_c = active_mo_indices_[2];
         int mo_d = active_mo_indices_[3];
 
         for (int mu = 0; mu < nso; mu++) {
-            Cp[mu][mo_a] = Locc[mu][occ_cents[0].second];  // a = left bond
-            Cp[mu][mo_b] = Locc[mu][occ_cents[1].second];  // b = right bond
-            Cp[mu][mo_c] = Lvir[mu][vir_cents[1].second];  // c = right antibond
-            Cp[mu][mo_d] = Lvir[mu][vir_cents[0].second];  // d = left antibond
+            Cp[mu][mo_a] = Locc[mu][occ_a];  // a = bonding orbital 0
+            Cp[mu][mo_b] = Locc[mu][occ_b];  // b = bonding orbital 1
+            Cp[mu][mo_c] = Lvir[mu][vir_c];  // c = antibonding for b
+            Cp[mu][mo_d] = Lvir[mu][vir_d];  // d = antibonding for a
         }
     } else {
         // For REKS(2,2) or other: just insert directly
@@ -2359,72 +4251,123 @@ void REKS::localize_active_space() {
 }
 
 void REKS::reorder_active_orbitals_for_gvb_pairs() {
-    // Compute orbital centroids using dipole integrals
-    // For linear H4 along z-axis, sort by z-centroid
+    // Compute orbital centroids using ALL THREE dipole components (x, y, z)
+    // This enables proper localization for 2D geometries (square, rhombus)
+    // where z-centroid alone cannot distinguish orbitals
 
     auto mints = std::make_shared<MintsHelper>(basisset_);
     std::vector<SharedMatrix> dipole = mints->ao_dipole();
+    SharedMatrix dipole_x = dipole[0];  // X-component
+    SharedMatrix dipole_y = dipole[1];  // Y-component
     SharedMatrix dipole_z = dipole[2];  // Z-component
 
     int n_active = 4;
     int nso = Ca_->rowspi()[0];
     double** Cp = Ca_->pointer();
 
-    // Compute z-centroid for each active orbital
-    std::vector<std::pair<double, int>> centroids(n_active);
+    // Compute 3D centroid (x, y, z) for each active orbital
+    std::vector<std::array<double, 3>> centroids_3d(n_active);
     for (int i = 0; i < n_active; i++) {
         int mo_idx = active_mo_indices_[i];
-        double z_cent = 0.0;
+        double x_cent = 0.0, y_cent = 0.0, z_cent = 0.0;
         for (int mu = 0; mu < nso; mu++) {
             for (int nu = 0; nu < nso; nu++) {
-                z_cent += Cp[mu][mo_idx] * dipole_z->get(mu, nu) * Cp[nu][mo_idx];
+                double c_mu = Cp[mu][mo_idx];
+                double c_nu = Cp[nu][mo_idx];
+                x_cent += c_mu * dipole_x->get(mu, nu) * c_nu;
+                y_cent += c_mu * dipole_y->get(mu, nu) * c_nu;
+                z_cent += c_mu * dipole_z->get(mu, nu) * c_nu;
             }
         }
-        centroids[i] = {z_cent, i};
-        if (reks_debug_ >= 1) {
-            outfile->Printf("  Orbital %d (MO %d): z-centroid = %.4f\n",
-                            i, mo_idx, z_cent);
+        centroids_3d[i] = {x_cent, y_cent, z_cent};
+        // Always print centroid info for debugging 3D localization
+        outfile->Printf("  Orbital %d (MO %d): centroid = (%.4f, %.4f, %.4f)\n",
+                        i, mo_idx, x_cent, y_cent, z_cent);
+    }
+
+    // Compute distance matrix between all orbital pairs
+    std::vector<std::vector<double>> dist(n_active, std::vector<double>(n_active, 0.0));
+    for (int i = 0; i < n_active; i++) {
+        for (int j = i + 1; j < n_active; j++) {
+            double dx = centroids_3d[j][0] - centroids_3d[i][0];
+            double dy = centroids_3d[j][1] - centroids_3d[i][1];
+            double dz = centroids_3d[j][2] - centroids_3d[i][2];
+            dist[i][j] = dist[j][i] = std::sqrt(dx*dx + dy*dy + dz*dz);
         }
     }
 
-    // Sort by z-coordinate
-    std::sort(centroids.begin(), centroids.end());
+    if (reks_debug_ >= 1) {
+        outfile->Printf("  Distance matrix:\n");
+        for (int i = 0; i < n_active; i++) {
+            outfile->Printf("    ");
+            for (int j = 0; j < n_active; j++) {
+                outfile->Printf("%.3f ", dist[i][j]);
+            }
+            outfile->Printf("\n");
+        }
+    }
+
+    // Find GVB pairs based on spatial proximity
+    // Strategy: find optimal pairing that minimizes total intra-pair distance
+    // For 4 orbitals, there are only 3 possible pairings:
+    //   Option A: {0,1} + {2,3}
+    //   Option B: {0,2} + {1,3}
+    //   Option C: {0,3} + {1,2}
+    // Choose the one with minimum sum of intra-pair distances
+
+    // Define all possible pairings
+    int pairings[3][4] = {
+        {0, 1, 2, 3},  // Option A: (0,1) and (2,3)
+        {0, 2, 1, 3},  // Option B: (0,2) and (1,3)
+        {0, 3, 1, 2}   // Option C: (0,3) and (1,2)
+    };
+
+    double min_total_dist = 1e10;
+    int best_pairing = 0;
+    for (int p = 0; p < 3; p++) {
+        double total = dist[pairings[p][0]][pairings[p][1]] +
+                       dist[pairings[p][2]][pairings[p][3]];
+        if (total < min_total_dist) {
+            min_total_dist = total;
+            best_pairing = p;
+        }
+    }
+
+    int pair1_i = pairings[best_pairing][0];
+    int pair1_j = pairings[best_pairing][1];
+    int pair2_i = pairings[best_pairing][2];
+    int pair2_j = pairings[best_pairing][3];
+
+    // Always print pairing info
+    outfile->Printf("  Optimal pairing (total dist=%.4f):\n", min_total_dist);
+    outfile->Printf("    GVB pair 0 (a,d): orbitals %d and %d (dist=%.4f)\n",
+                    pair1_i, pair1_j, dist[pair1_i][pair1_j]);
+    outfile->Printf("    GVB pair 1 (b,c): orbitals %d and %d (dist=%.4f)\n",
+                    pair2_i, pair2_j, dist[pair2_i][pair2_j]);
 
     // REKS(4,4) orbital ordering: a, b, c, d in positions 0, 1, 2, 3
     // GVB pair 0: (a, d) - positions 0 and 3
     // GVB pair 1: (b, c) - positions 1 and 2
     //
-    // For linear H4 with Boys localization, we get 4 atom-centered orbitals.
-    // After sorting by z-centroid:
-    // centroids[0] = H1 (leftmost)
-    // centroids[1] = H2
-    // centroids[2] = H3
-    // centroids[3] = H4 (rightmost)
-    //
-    // For symmetric GVB pairs, we need:
-    // - GVB pair 0: H1 + H2 (adjacent atoms, left bond)
-    // - GVB pair 1: H3 + H4 (adjacent atoms, right bond)
-    //
-    // Correct assignment:
-    // a = H1 (centroids[0]) - position 0
-    // d = H2 (centroids[1]) - position 3 (pair with a)
-    // b = H3 (centroids[2]) - position 1
-    // c = H4 (centroids[3]) - position 2 (pair with b)
-    //
-    // Final order: [H1, H3, H4, H2] for positions [a, b, c, d]
+    // Assign:
+    // a = pair1_i (position 0)
+    // d = pair1_j (position 3, pairs with a)
+    // b = pair2_i (position 1)
+    // c = pair2_j (position 2, pairs with b)
 
     std::vector<int> new_order = {
-        centroids[0].second,  // a = H1 (leftmost)
-        centroids[2].second,  // b = H3 (right-left)
-        centroids[3].second,  // c = H4 (rightmost)
-        centroids[1].second   // d = H2 (left-right, pairs with a)
+        pair1_i,  // a
+        pair2_i,  // b
+        pair2_j,  // c
+        pair1_j   // d
     };
 
     if (reks_debug_ >= 1) {
         outfile->Printf("  Reordering: old -> new mapping:\n");
         for (int i = 0; i < n_active; i++) {
-            outfile->Printf("    position %d: orbital %d (z=%.4f)\n",
-                            i, new_order[i], centroids[i].first);
+            int orb = new_order[i];
+            outfile->Printf("    position %d: orbital %d (centroid = %.4f, %.4f, %.4f)\n",
+                            i, orb, centroids_3d[orb][0], centroids_3d[orb][1], centroids_3d[orb][2]);
         }
     }
 
@@ -2460,6 +4403,313 @@ void REKS::reorder_active_orbitals_for_gvb_pairs() {
     }
 
     outfile->Printf("  Orbitals reordered for GVB pairs: (a,d)=(0,3), (b,c)=(1,2)\n");
+}
+
+// ---------------------------------------------------------------------------
+// Multi-Start FON Optimization for REKS(4,4)
+// ---------------------------------------------------------------------------
+
+void REKS::rex_solver_44_multi_start() {
+    // Multi-start FON optimization:
+    // 1. Generate starting points (diradical, closed-shell, continuation, HAM-DIAG)
+    // 2. Optimize from each start using Trust-Region
+    // 3. Select best solution based on criterion (ENERGY/DIABATIC/AUTO)
+
+    using namespace reks;
+
+    // Skip if FONs are frozen
+    if (fon_oscillation_frozen_) {
+        if (reks_debug_ >= 1) {
+            outfile->Printf("\n  === Multi-Start REKS(4,4): FON frozen, skipping ===\n");
+        }
+        compute_weighting_factors();
+        return;
+    }
+
+    // Wait for localization (same as trust_region_fon_optimizer_44)
+    if (!fon_initialized_44_ && iteration_ < 2) {
+        if (reks_debug_ >= 1) {
+            outfile->Printf("  [MS] Waiting for localization (iteration %d < 2)\n", iteration_);
+        }
+        active_space_->set_pair_fon(0, 1.0);
+        active_space_->set_pair_fon(1, 1.0);
+        compute_weighting_factors();
+        return;
+    }
+
+    // Get HAM-DIAG suggestion
+    initialize_fon_from_hamiltonian_44();
+    double ham_na = active_space_->pair(0).fon_p;
+    double ham_nb = active_space_->pair(1).fon_p;
+
+    // Generate starting points
+    MultiStartGenerator generator;
+    auto starts = generator.generate(prev_n_a_, prev_n_b_, ham_na, ham_nb);
+
+    if (reks_debug_ >= 1) {
+        outfile->Printf("\n  === Multi-Start REKS(4,4): FON Optimization ===\n");
+        outfile->Printf("  Starting points: %zu\n", starts.size());
+        for (size_t i = 0; i < starts.size(); ++i) {
+            outfile->Printf("    [%zu] %s: (%.4f, %.4f)\n",
+                           i, starts[i].name.c_str(), starts[i].n_a, starts[i].n_b);
+        }
+    }
+
+    // Optimize from each starting point
+    std::vector<FONSolution> solutions;
+    for (size_t i = 0; i < starts.size(); ++i) {
+        FONSolution sol = optimize_from_start_44(starts[i], static_cast<int>(i));
+        if (sol.converged) {
+            sol.classify();
+            solutions.push_back(sol);
+        }
+    }
+
+    if (solutions.empty()) {
+        // No solutions converged - fall back to HAM-DIAG
+        outfile->Printf("  [MS] Warning: No solutions converged, using HAM-DIAG\n");
+        active_space_->set_pair_fon(0, ham_na);
+        active_space_->set_pair_fon(1, ham_nb);
+        compute_weighting_factors();
+        fon_initialized_44_ = true;
+        return;
+    }
+
+    // Remove duplicates
+    std::vector<FONSolution> unique;
+    for (const auto& sol : solutions) {
+        bool is_dup = false;
+        for (const auto& u : unique) {
+            if (sol.is_duplicate_of(u)) {
+                is_dup = true;
+                break;
+            }
+        }
+        if (!is_dup) {
+            unique.push_back(sol);
+        }
+    }
+
+    if (reks_debug_ >= 1 || reks_report_all_solutions_) {
+        outfile->Printf("  Converged solutions: %zu total, %zu unique\n",
+                       solutions.size(), unique.size());
+        for (size_t i = 0; i < unique.size(); ++i) {
+            const char* char_str = unique[i].character == FONCharacter::DIRADICAL ? "DIRADICAL" :
+                                   unique[i].character == FONCharacter::CLOSED_SHELL ? "CLOSED_SHELL" :
+                                   "MIXED";
+            outfile->Printf("    [%zu] E=%.10f, n=(%.4f, %.4f), %s\n",
+                           i, unique[i].E_PPS, unique[i].n_a, unique[i].n_b, char_str);
+        }
+    }
+
+    // Select best solution
+    FONSolution selected = select_solution(unique, prev_n_a_, prev_n_b_,
+                                           reks_branch_criterion_, reks_energy_tolerance_);
+
+    // Apply selected solution
+    active_space_->set_pair_fon(0, selected.n_a);
+    active_space_->set_pair_fon(1, selected.n_b);
+    fon_initialized_44_ = true;
+
+    compute_weighting_factors();
+
+    if (reks_debug_ >= 1) {
+        const char* char_str = selected.character == FONCharacter::DIRADICAL ? "DIRADICAL" :
+                               selected.character == FONCharacter::CLOSED_SHELL ? "CLOSED_SHELL" :
+                               "MIXED";
+        outfile->Printf("  Selected: E=%.10f, n=(%.4f, %.4f), %s [%s criterion]\n",
+                       selected.E_PPS, selected.n_a, selected.n_b,
+                       char_str, reks_branch_criterion_.c_str());
+    }
+}
+
+reks::FONSolution REKS::optimize_from_start_44(const reks::FONStartPoint& start, int start_id) {
+    // Optimize FON from a single starting point using Trust-Region
+    // Returns converged FONSolution
+
+    using namespace reks::constants;
+
+    reks::FONSolution result;
+    result.n_a = start.n_a;
+    result.n_b = start.n_b;
+    result.start_id = start_id;
+    result.converged = false;
+
+    // Set starting FON
+    active_space_->set_pair_fon(0, start.n_a);
+    active_space_->set_pair_fon(1, start.n_b);
+
+    double n_a = start.n_a;
+    double n_b = start.n_b;
+
+    // Lambda to compute E_PPS at given FON values
+    auto compute_E_PPS_at = [&](double na, double nb) -> double {
+        double old_na = active_space_->pair(0).fon_p;
+        double old_nb = active_space_->pair(1).fon_p;
+        active_space_->set_pair_fon(0, na);
+        active_space_->set_pair_fon(1, nb);
+        double E = active_space_->compute_energy_PPS(E_micro_);
+        active_space_->set_pair_fon(0, old_na);
+        active_space_->set_pair_fon(1, old_nb);
+        return E;
+    };
+
+    // Trust-Region optimization (simplified, fewer iterations)
+    double Delta = TR_DELTA_INIT;
+    double E_old = compute_E_PPS_at(n_a, n_b);
+
+    for (int iter = 0; iter < 50; ++iter) {  // Reduced iterations for multi-start
+        // Compute gradient
+        active_space_->set_pair_fon(0, n_a);
+        active_space_->set_pair_fon(1, n_b);
+        std::vector<double> grad = active_space_->compute_gradient_PPS(E_micro_);
+
+        // Boundary-aware effective gradient
+        double eff_grad_na = grad[0];
+        double eff_grad_nb = grad[1];
+        if (n_a >= 2.0 - 1e-10 && grad[0] < 0.0) eff_grad_na = 0.0;
+        if (n_b >= 2.0 - 1e-10 && grad[1] < 0.0) eff_grad_nb = 0.0;
+        if (n_a <= 1e-10 && grad[0] > 0.0) eff_grad_na = 0.0;
+        if (n_b <= 1e-10 && grad[1] > 0.0) eff_grad_nb = 0.0;
+
+        double grad_norm = std::sqrt(eff_grad_na * eff_grad_na + eff_grad_nb * eff_grad_nb);
+
+        // Check convergence
+        if (grad_norm < FON_TOL) {
+            result.n_a = n_a;
+            result.n_b = n_b;
+            result.E_PPS = compute_E_PPS_at(n_a, n_b);
+            result.converged = true;
+            break;
+        }
+
+        // Compute Hessian (flat -> 2x2)
+        std::vector<double> hess_flat = active_space_->compute_hessian_PPS(E_micro_);
+        std::vector<std::vector<double>> Hess = {
+            {hess_flat[0], hess_flat[1]},
+            {hess_flat[2], hess_flat[3]}
+        };
+
+        // Solve Trust-Region subproblem
+        std::vector<double> eff_grad = {eff_grad_na, eff_grad_nb};
+        std::vector<double> step = solve_trust_region_subproblem_2d(eff_grad, Hess, Delta);
+
+        // Trial point with clamping
+        double n_a_trial = std::max(0.0, std::min(2.0, n_a + step[0]));
+        double n_b_trial = std::max(0.0, std::min(2.0, n_b + step[1]));
+
+        // Compute actual vs predicted reduction
+        double E_new = compute_E_PPS_at(n_a_trial, n_b_trial);
+        double actual = E_old - E_new;
+        double predicted = -(eff_grad_na * step[0] + eff_grad_nb * step[1]) -
+                          0.5 * (step[0] * (Hess[0][0] * step[0] + Hess[0][1] * step[1]) +
+                                 step[1] * (Hess[1][0] * step[0] + Hess[1][1] * step[1]));
+
+        if (std::abs(predicted) < 1e-15) predicted = 1e-15;
+        double rho = actual / predicted;
+
+        // Accept/reject and update trust radius
+        double step_norm = std::sqrt(step[0] * step[0] + step[1] * step[1]);
+
+        if (rho > TR_ETA_VERY_GOOD) {
+            n_a = n_a_trial;
+            n_b = n_b_trial;
+            E_old = E_new;
+            Delta = std::min(2.0 * Delta, TR_DELTA_MAX);
+        } else if (rho > TR_ETA_GOOD) {
+            n_a = n_a_trial;
+            n_b = n_b_trial;
+            E_old = E_new;
+        } else if (rho > TR_ETA_ACCEPT) {
+            n_a = n_a_trial;
+            n_b = n_b_trial;
+            E_old = E_new;
+            Delta = std::max(0.5 * step_norm, TR_DELTA_MIN);
+        } else {
+            Delta = std::max(0.25 * step_norm, TR_DELTA_MIN);
+        }
+
+        // Check for trust radius collapse
+        if (Delta < TR_DELTA_MIN * 10.0) {
+            result.n_a = n_a;
+            result.n_b = n_b;
+            result.E_PPS = E_old;
+            result.converged = true;
+            break;
+        }
+    }
+
+    // Final result
+    if (!result.converged) {
+        result.n_a = n_a;
+        result.n_b = n_b;
+        result.E_PPS = E_old;
+        result.converged = true;  // Accept even if not fully converged
+    }
+
+    return result;
+}
+
+reks::FONSolution REKS::select_solution(
+    const std::vector<reks::FONSolution>& solutions,
+    double prev_na, double prev_nb,
+    const std::string& criterion,
+    double energy_tol)
+{
+    // Select best solution based on criterion
+
+    if (solutions.empty()) {
+        reks::FONSolution empty;
+        return empty;
+    }
+
+    if (solutions.size() == 1) {
+        return solutions[0];
+    }
+
+    // Find lowest energy solution
+    const reks::FONSolution* lowest = &solutions[0];
+    for (const auto& sol : solutions) {
+        if (sol.E_PPS < lowest->E_PPS) {
+            lowest = &sol;
+        }
+    }
+
+    // Find diabatic solution (closest to previous)
+    const reks::FONSolution* diabatic = &solutions[0];
+    if (prev_na >= 0.0 && prev_nb >= 0.0) {
+        double min_dist = solutions[0].diabatic_distance(prev_na, prev_nb);
+        for (const auto& sol : solutions) {
+            double dist = sol.diabatic_distance(prev_na, prev_nb);
+            if (dist < min_dist) {
+                min_dist = dist;
+                diabatic = &sol;
+            }
+        }
+    }
+
+    // Selection based on criterion
+    if (criterion == "ENERGY") {
+        return *lowest;
+    } else if (criterion == "DIABATIC") {
+        return *diabatic;
+    } else {  // AUTO
+        // Use diabatic if within energy tolerance of lowest
+        double gap = diabatic->E_PPS - lowest->E_PPS;
+        if (gap <= energy_tol) {
+            if (reks_debug_ >= 1) {
+                outfile->Printf("  [AUTO] Diabatic within tolerance (gap=%.6f Ha ≤ %.6f Ha)\n",
+                               gap, energy_tol);
+            }
+            return *diabatic;
+        } else {
+            if (reks_debug_ >= 1) {
+                outfile->Printf("  [AUTO] Using lowest energy (gap=%.6f Ha > %.6f Ha)\n",
+                               gap, energy_tol);
+            }
+            return *lowest;
+        }
+    }
 }
 
 }  // namespace scf

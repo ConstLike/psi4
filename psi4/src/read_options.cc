@@ -1448,8 +1448,83 @@ int read_options(const std::string &name, Options &options, bool suppress_printi
         options.add_int("REKS_PAIRS", 1);
         /*- Orbital localization for REKS active space.
             NONE = use canonical orbitals (default),
-            BOYS = Boys localization to make GVB pairs symmetric. -*/
-        options.add_str("REKS_LOCALIZATION", "NONE", "NONE BOYS");
+            BOYS = Boys localization (maximize distance between orbital centroids),
+            PIPEK_MEZEY = Pipek-Mezey localization (maximize Mulliken charges on atoms). -*/
+        options.add_str("REKS_LOCALIZATION", "NONE", "NONE BOYS PIPEK_MEZEY");
+        /*- Number of SCF iterations after which to freeze orbital localization.
+            0 = always re-localize (default, maintains locality but can cause oscillations),
+            N > 0 = stop re-localizing after iteration N (improves stability for tight geometries).
+            Recommended: 5-10 for problematic cases like compressed square H4. -*/
+        options.add_int("REKS_LOCALIZATION_FREEZE", 0);
+        /*- Enable line search with golden ratio for REKS(4,4) FON optimization.
+            Prevents oscillations when Newton-Raphson step increases energy. -*/
+        options.add_bool("REKS_LINE_SEARCH", true);
+        /*- Threshold for "shake it up" - if FON is within this of 1.0, reset to 0.5.
+            Prevents FON locking at the degenerate point n=1.0. Set to 0.0 to disable. -*/
+        options.add_double("REKS_SHAKE_THRESHOLD", 1e-6);
+        /*- Coupling threshold for REKS(4,4). If coupling element is below this,
+            fix corresponding FON at boundary (2.0). Set to 0.0 to disable (default). -*/
+        options.add_double("REKS_COUPLING_THRESHOLD", 0.0);
+        /*- Maximum FON change per SCF iteration for REKS(4,4).
+            Smaller values improve stability but require more iterations.
+            Set to 2.0 to effectively disable the limit. -*/
+        options.add_double("REKS_FON_MAX_DELTA", 2.0);
+        /*- Initial value of n_a for REKS(4,4) FON optimization.
+            Set to -1.0 (default) to use HAM-DIAG initialization.
+            For geometry scans, set to previous geometry FON value
+            to ensure smooth PES. Valid range: [0.0, 2.0] or -1.0. -*/
+        options.add_double("REKS_INITIAL_NA", -1.0);
+        /*- Initial value of n_b for REKS(4,4) FON optimization.
+            Set to -1.0 (default) to use HAM-DIAG initialization.
+            For geometry scans, set to previous geometry FON value
+            to ensure smooth PES. Valid range: [0.0, 2.0] or -1.0. -*/
+        options.add_double("REKS_INITIAL_NB", -1.0);
+        /*- Use Trust-Region method for REKS(4,4) FON optimization.
+            Trust-Region Augmented Hessian (TRAH) handles indefinite Hessians
+            robustly via the secular equation. Recommended for difficult geometries
+            where Newton-Raphson may oscillate or diverge. -*/
+        options.add_bool("REKS_USE_TRUST_REGION", false);
+        /*- Enforce FON symmetry for symmetric molecules (n_a = n_b).
+            When true, FON values are averaged to maintain symmetry.
+            Useful for symmetric systems like linear H4 where both GVB pairs
+            should have identical fractional occupations. -*/
+        options.add_bool("REKS_ENFORCE_SYMMETRY", false);
+
+        // ========================================================================
+        // REKS(4,4) Multi-Start FON Optimization
+        // ========================================================================
+
+        /*- Enable multi-start FON optimization for REKS(4,4).
+            Tries multiple starting points (diradical, closed-shell, continuation)
+            and selects the best solution based on REKS_BRANCH_CRITERION. -*/
+        options.add_bool("REKS_MULTI_START", false);
+        /*- Branch selection criterion for multi-start optimization:
+            ENERGY: Always select lowest energy (adiabatic ground state).
+            DIABATIC: Select solution closest to previous geometry FON.
+            AUTO: Use diabatic if within REKS_ENERGY_TOLERANCE of lowest, else energy. -*/
+        options.add_str("REKS_BRANCH_CRITERION", "AUTO", "ENERGY DIABATIC AUTO");
+        /*- Energy tolerance (Ha) for AUTO branch selection.
+            If diabatic solution is within this tolerance of lowest energy,
+            the diabatic solution is preferred for smoother PES. -*/
+        options.add_double("REKS_ENERGY_TOLERANCE", 0.01);
+        /*- Report all converged solutions in multi-start output (debug). -*/
+        options.add_bool("REKS_REPORT_ALL_SOLUTIONS", false);
+
+        // ========================================================================
+        // REKS(4,4) FON Solver Level (simplified interface)
+        // ========================================================================
+
+        /*- FON solver level for REKS(4,4):
+            1 = Fast:     Newton-Raphson only. Use for equilibrium geometries.
+            2 = Balanced: Trust-Region (default). Handles indefinite Hessians.
+            3 = Robust:   Trust-Region + Adaptive Multi-Start. For challenging cases.
+            4 = Adaptive: Multi-start + Coupling-based direction. For PES scans.
+                          Uses coupling elements to guide optimization towards
+                          physically correct diradical solutions.
+            Higher levels are more robust but slower. Level 2 is recommended for most
+            calculations. Level 4 is recommended for PES scans. -*/
+        options.add_int("FON_SOLVER", 2);
+
         /*- Primary basis set -*/
         options.add_str("BASIS", "");
         /*- Auxiliary basis set for SCF density fitting computations.
@@ -4716,7 +4791,7 @@ int read_options(const std::string &name, Options &options, bool suppress_printi
 
         /*- Controls whether excitation energy calculations allow for a
         "spin flip" which changes the $M_s$ quantum number. Such
-        calculations have some advantages for biradicals and are currently
+        calculations have some advantages for diradicals and are currently
         implemented (together with gradients) for CIS and CIS(D)
         calculations. Options are OFF and ON. -*/
         options.add_bool("CFOUR_SPIN_FLIP", false);
