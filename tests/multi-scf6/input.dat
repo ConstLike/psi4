@@ -1,0 +1,52 @@
+#! Multi-SCF test: High-level wfns= API
+#! Tests the simplified psi4.energy('scf', wfns=...) interface
+
+# Reference values (from sequential SCF calculations with DF integrals)
+ref_rhf_h2o = -76.0266327351  #TEST
+ref_uhf_h2o = -76.0266327351  #TEST
+
+# Water molecule
+molecule h2o {
+0 1
+O
+H 1 0.96
+H 1 0.96 2 104.5
+symmetry c1
+}
+
+set {
+    basis cc-pvdz
+    scf_type df
+    e_convergence 10
+    d_convergence 8
+}
+
+# =============================================================================
+# Test 1: Dict format with named wavefunctions
+# =============================================================================
+E, wfns = energy('scf', wfns={
+    'rhf': {'reference': 'RHF'},
+    'uhf': {'reference': 'UHF'},
+}, return_wfn=True)
+
+compare_values(ref_rhf_h2o, wfns['rhf'].energy(), 8, "RHF H2O energy via wfns= dict API")  #TEST
+compare_values(ref_uhf_h2o, wfns['uhf'].energy(), 8, "UHF H2O energy via wfns= dict API")  #TEST
+
+# For closed-shell singlet, RHF and UHF should match
+compare_values(wfns['rhf'].energy(), wfns['uhf'].energy(), 10, "RHF vs UHF closed-shell match")  #TEST
+
+# E should be minimum energy
+compare_values(E, min(wfns['rhf'].energy(), wfns['uhf'].energy()), 10, "Returned E is minimum")  #TEST
+
+# =============================================================================
+# Test 2: List format
+# =============================================================================
+clean()
+
+E_list, wfns_list = energy('scf', wfns=[
+    {'reference': 'RHF'},
+    {'reference': 'UHF'},
+], return_wfn=True)
+
+compare_values(ref_rhf_h2o, wfns_list[0].energy(), 8, "RHF H2O energy via wfns= list API")  #TEST
+compare_values(ref_uhf_h2o, wfns_list[1].energy(), 8, "UHF H2O energy via wfns= list API")  #TEST

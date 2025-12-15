@@ -353,6 +353,15 @@ void export_wavefunction(py::module& m) {
         .def("Vb", &scf::HF::Vb, "Returns the Beta Kohn-Sham Potential Matrix.")
         .def("jk", &scf::HF::jk, "Returns the internal JK object.")
         .def("set_jk", &scf::HF::set_jk, "Sets the internal JK object !expert.")
+        .def("n_states", &scf::HF::n_states, "Returns the number of states (1 for RHF/UHF/ROHF, N for multi-state methods).")
+        .def("get_orbital_matrices", &scf::HF::get_orbital_matrices,
+             "Returns the occupied orbital matrices for multi-cycle JK computation. "
+             "RHF returns [Ca_occ], UHF/ROHF return [Ca_occ, Cb_occ].")
+        .def("set_jk_matrices", &scf::HF::set_jk_matrices,
+             "Sets pre-computed J/K/wK matrices for multi-cycle SCF. "
+             "Enables form_G() to use precomputed matrices instead of calling jk.compute(). "
+             "wK_list is optional (for LRC functionals like wB97X-V).",
+             "J_list"_a, "K_list"_a, "wK_list"_a = std::vector<SharedMatrix>())
         .def("functional", &scf::HF::functional, "Returns the internal DFT Superfunctional.")
         .def("V_potential", &scf::HF::V_potential, "Returns the internal DFT V object.")
         .def("finalize", &scf::HF::finalize, "Cleans up the the Wavefunction's temporary data.")
@@ -370,6 +379,10 @@ void export_wavefunction(py::module& m) {
         .def_property("diis_manager_", &scf::HF::diis_manager, &scf::HF::set_diis_manager, "The DIIS object.")
         .def_property("initialized_diis_manager_", &scf::HF::initialized_diis_manager,
                       &scf::HF::set_initialized_diis_manager, "Has the DIIS object been initialized?")
+        .def("get_wfn_name", &scf::HF::get_wfn_name, "Returns the wavefunction name for file isolation in multi-SCF.")
+        .def("set_wfn_name", &scf::HF::set_wfn_name, "name"_a, "Sets the wavefunction name for file isolation in multi-SCF.")
+        .def("get_diis_filename", &scf::HF::get_diis_filename, "Returns the unique DIIS filename incorporating wfn_name_.")
+        .def("get_orbitals_filename", &scf::HF::get_orbitals_filename, "base"_a, "Returns the unique orbital filename incorporating wfn_name_.")
         .def("damping_update", &scf::HF::damping_update, "docstring")
         .def("check_phases", &scf::HF::check_phases, "docstring")
         .def("print_orbitals", &scf::HF::print_orbitals, "docstring")

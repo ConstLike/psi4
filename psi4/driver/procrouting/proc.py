@@ -1429,6 +1429,9 @@ def scf_wavefunction_factory(name, ref_wfn, reference, **kwargs):
     and prepares any empirical dispersion.
 
     """
+    # Normalize reference to uppercase for case-insensitive matching
+    reference = reference.upper()
+
     # Figure out functional and dispersion
     superfunc, _disp_functor = build_functional_and_disp(name, restricted=(reference in ["RKS", "RHF"]), **kwargs)
 
@@ -1541,6 +1544,374 @@ def _set_external_potentials_to_wavefunction(external_potential: Union[List, Dic
 
     # If no fragment specified, `validate_external_potential` assigns it to "C".
     #   `set_potential_variable("C", total_ep)` is needed for the FSAPT procedure.
+
+
+def _scf_post_processing(scf_wfn, do_properties=True, write_checkpoint_file=True,
+                         file_prefix=None, **kwargs):
+    """
+    Perform SCF post-processing: properties, MOs, molden, checkpoint.
+
+    This function is shared by both single-wfn (scf_helper) and multi-wfn
+    (_run_multi_scf) code paths to avoid duplication.
+
+    Parameters
+    ----------
+    scf_wfn : psi4.core.HF
+        Converged SCF wavefunction
+    do_properties : bool
+        Whether to compute OEProp properties
+    write_checkpoint_file : bool
+        Whether to write checkpoint file
+    file_prefix : str, optional
+        Prefix for output files (molden, checkpoint). If None, uses molecule.name().
+        For multi-wfn, pass wfn_name to ensure unique filenames.
+    **kwargs : dict
+        Additional options (write_orbitals filename, etc.)
+    """
+    if file_prefix is None:
+        file_prefix = scf_wfn.molecule().name()
+
+    # Properties
+    if do_properties:
+        oeprop = core.OEProp(scf_wfn)
+        oeprop.set_title("SCF")
+
+        props = [x.upper() for x in core.get_option("SCF", "SCF_PROPERTIES")]
+        if "DIPOLE" not in props:
+            props.append("DIPOLE")
+
+        proc_util.oeprop_validator(props)
+        for x in props:
+            oeprop.add(x)
+
+        if 'MBIS_VOLUME_RATIOS' in props:
+            p4util.free_atom_volumes(scf_wfn)
+
+        oeprop.compute()
+        for obj in [core, scf_wfn]:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+            obj.set_variable("CURRENT DIPOLE", obj.variable("SCF DIPOLE"))
+
+    # Write MOs
+    if core.get_option("SCF", "PRINT_MOS"):
+        mowriter = core.MOWriter(scf_wfn)
+        mowriter.write()
+
+    # Write molden file
+    if core.get_option("SCF", "MOLDEN_WRITE"):
+        filename = core.get_writer_file_prefix(file_prefix) + ".molden"
+        dovirt = bool(core.get_option("SCF", "MOLDEN_WITH_VIRTUAL"))
+        scf_wfn.write_molden(filename, dovirt, False)
+
+    # Write checkpoint file (can be disabled for findif displacements)
+    _chkfile = kwargs.get('write_orbitals', True)
+    if write_checkpoint_file and isinstance(_chkfile, str):
+        scf_wfn.to_file(_chkfile)
+    elif write_checkpoint_file and _chkfile is True:
+        filename = scf_wfn.get_scratch_filename(180)
+        scf_wfn.to_file(filename)
+        extras.register_numpy_file(filename)
+
+
+def _validate_wfns_spec(wfns_spec, molecule):
+    """
+    Validate wfns= specification for multi-SCF.
+
+    Ensures all wfn specs share required parameters (basis, scf_type)
+    while allowing differences in reference, multiplicity, charge, and convergence.
+
+    Note: Functional validation is done at runtime by validate_multi_scf_compatibility()
+    after wavefunctions are created, since functional is determined by method name
+    not a user-specified option.
+
+    Parameters
+    ----------
+    wfns_spec : dict or list
+        Dict format: {'name': {'reference': 'UHF', ...}, ...}
+        List format: [{'reference': 'RHF'}, {'reference': 'UHF'}, ...]
+    molecule : Molecule
+        Active molecule for reference values
+
+    Raises
+    ------
+    ValidationError
+        If specs have incompatible parameters (different basis/scf_type)
+    """
+    # Only check user-specifiable parameters here
+    # Functional is checked at runtime by validate_multi_scf_compatibility()
+    MUST_BE_SAME = ['basis', 'scf_type']
+
+    # Normalize to list of (key, spec) tuples
+    items = list(wfns_spec.items() if isinstance(wfns_spec, dict)
+                 else enumerate(wfns_spec))
+
+    if len(items) < 2:
+        return  # Single wfn, no compatibility check needed
+
+    # Get global defaults for comparison
+    global_basis = core.get_global_option('BASIS')
+    global_scf_type = core.get_global_option('SCF_TYPE')
+
+    # Check each required parameter for consistency
+    for param in MUST_BE_SAME:
+        values_seen = {}  # Map value -> wfn key for error reporting
+
+        for key, spec in items:
+            if param == 'basis':
+                val = spec.get('basis', global_basis)
+            elif param == 'scf_type':
+                val = spec.get('scf_type', global_scf_type)
+            else:
+                val = spec.get(param)
+
+            val_upper = str(val).upper() if val else None
+            if val_upper not in values_seen:
+                values_seen[val_upper] = key
+            elif len(values_seen) > 1:
+                # Found mismatch, don't add more
+                pass
+
+        if len(values_seen) > 1:
+            raise ValidationError(
+                f"\n"
+                f"Multi-SCF Specification Error: '{param}' mismatch\n"
+                f"{'=' * 70}\n"
+                f"All wavefunctions must share the same '{param}'.\n"
+                f"Found different values:\n" +
+                "\n".join(f"  wfn '{k}': {v}" for v, k in values_seen.items()) +
+                f"\n\n"
+                f"Why this matters:\n"
+                f"  Multi-SCF uses a shared JK object for efficiency. Different\n"
+                f"  {param} values would require different JK configurations.\n"
+                f"\n"
+                f"Solution:\n"
+                f"  Set '{param}' globally before calling energy(), or ensure\n"
+                f"  all wfn specs use the same value (or omit to use global).\n"
+                f"{'=' * 70}\n"
+            )
+
+
+# Per-wfn SCF options that can be specified in wfns= spec
+# Maps spec key (lowercase) to SCF option name (uppercase)
+_PER_WFN_SCF_OPTIONS = {
+    # Guess
+    'guess': 'GUESS',
+    # DIIS
+    'diis': 'DIIS',
+    'diis_start': 'DIIS_START',
+    'diis_min_vecs': 'DIIS_MIN_VECS',
+    'diis_max_vecs': 'DIIS_MAX_VECS',
+    'diis_rms_error': 'DIIS_RMS_ERROR',
+    # Initial accelerator
+    'scf_initial_accelerator': 'SCF_INITIAL_ACCELERATOR',
+    'scf_initial_start_diis_transition': 'SCF_INITIAL_START_DIIS_TRANSITION',
+    'scf_initial_finish_diis_transition': 'SCF_INITIAL_FINISH_DIIS_TRANSITION',
+    # Damping
+    'damping_percentage': 'DAMPING_PERCENTAGE',
+    'damping_convergence': 'DAMPING_CONVERGENCE',
+    # Convergence
+    'e_convergence': 'E_CONVERGENCE',
+    'd_convergence': 'D_CONVERGENCE',
+    'maxiter': 'MAXITER',
+    'fail_on_maxiter': 'FAIL_ON_MAXITER',
+    # SOSCF
+    'soscf': 'SOSCF',
+    'soscf_start_convergence': 'SOSCF_START_CONVERGENCE',
+    'soscf_conv': 'SOSCF_CONV',
+    'soscf_min_iter': 'SOSCF_MIN_ITER',
+    'soscf_max_iter': 'SOSCF_MAX_ITER',
+    'soscf_print': 'SOSCF_PRINT',
+    # MOM
+    'mom_start': 'MOM_START',
+    'mom_occ': 'MOM_OCC',
+    # FRAC
+    'frac_start': 'FRAC_START',
+    'frac_occ': 'FRAC_OCC',
+    'frac_val': 'FRAC_VAL',
+    'frac_renormalize': 'FRAC_RENORMALIZE',
+    # Level shift
+    'level_shift': 'LEVEL_SHIFT',
+    'level_shift_cutoff': 'LEVEL_SHIFT_CUTOFF',
+}
+
+
+def _create_wfn_from_spec(name, spec, molecule, wfn_name, **kwargs):
+    """
+    Create single wavefunction from specification dict.
+
+    Handles molecule cloning for different multiplicity/charge, per-wfn SCF
+    options, and creates the appropriate wfn type via scf_wavefunction_factory().
+
+    Parameters
+    ----------
+    name : str
+        Method name ('scf', 'hf', 'b3lyp', etc.)
+    spec : dict
+        Wavefunction specification with optional keys:
+        - 'reference': 'RHF'/'UHF'/'ROHF' (default: from global SCF/REFERENCE)
+        - 'multiplicity': int (default: from molecule)
+        - 'charge': int (default: from molecule)
+        - Per-wfn SCF options (see _PER_WFN_SCF_OPTIONS):
+          'guess', 'diis', 'diis_start', 'damping_percentage',
+          'e_convergence', 'd_convergence', 'soscf', 'mom_start', etc.
+    molecule : Molecule
+        Base molecule object
+    wfn_name : str
+        Name to assign to wavefunction (used for output identification)
+    **kwargs : dict
+        Additional kwargs passed to scf_wavefunction_factory()
+
+    Returns
+    -------
+    HF wavefunction
+        Configured RHF, UHF, or ROHF wavefunction with frozen options snapshot
+    """
+    from psi4.driver.procrouting.scf_proc.scf_options_snapshot import (
+        snapshot_scf_options, apply_options_snapshot
+    )
+
+    spec_mult = spec.get('multiplicity', molecule.multiplicity())
+    spec_charge = spec.get('charge', molecule.molecular_charge())
+
+    # Clone molecule if multiplicity or charge differs
+    if spec_mult != molecule.multiplicity() or spec_charge != molecule.molecular_charge():
+        mol = molecule.clone()
+        mol.set_multiplicity(spec_mult)
+        mol.set_molecular_charge(spec_charge)
+        mol.update_geometry()
+    else:
+        mol = molecule
+
+    core.prepare_options_for_module("SCF")
+
+    # Collect per-wfn options from spec
+    per_wfn_options = []
+    for spec_key, scf_option in _PER_WFN_SCF_OPTIONS.items():
+        if spec_key in spec:
+            per_wfn_options.append((['SCF', scf_option], spec[spec_key]))
+
+    # Use OptionsState to save/restore per-wfn options
+    # OptionsState(*args) expects each arg to be ['MODULE', 'OPTION']
+    option_keys = [opt[0] for opt in per_wfn_options]
+    optstash = p4util.OptionsState(*option_keys) if option_keys else None
+
+    try:
+        # Set per-wfn options
+        for (scope, opt_name), value in per_wfn_options:
+            core.set_local_option(scope, opt_name, value)
+
+        # Resolve AUTO guess before wfn creation (SAD basissets are set during factory)
+        if core.get_option('SCF', 'GUESS') == "AUTO":
+            if mol.natom() > 1:
+                core.set_local_option('SCF', 'GUESS', 'SAD')
+            else:
+                core.set_local_option('SCF', 'GUESS', 'CORE')
+
+        base_wfn = core.Wavefunction.build(mol, core.get_global_option('BASIS'))
+
+        reference = spec.get('reference')
+        if reference is None:
+            reference = core.get_option('SCF', 'REFERENCE')
+
+        wfn = scf_wavefunction_factory(name, base_wfn, reference, **kwargs)
+        wfn.set_wfn_name(wfn_name)
+
+        # Capture and apply options snapshot after wfn creation
+        # This freezes per-wfn options before restore() clears them
+        snapshot = snapshot_scf_options()
+        apply_options_snapshot(wfn, snapshot, force=True)
+
+    finally:
+        if optstash:
+            optstash.restore()
+
+    return wfn
+
+
+def _run_multi_scf(name, wfns_spec, molecule, **kwargs):
+    """
+    Multi-wavefunction SCF entry point.
+
+    Called by run_scf() when wfns= parameter is provided. Creates multiple
+    wavefunctions, runs multi_scf() with shared JK optimization, and performs
+    post-processing for each wavefunction.
+
+    Parameters
+    ----------
+    name : str
+        Method name ('scf', 'hf', 'b3lyp', etc.)
+    wfns_spec : dict or list
+        Dict format: {'singlet': {'reference': 'UHF', 'multiplicity': 1}, ...}
+        List format: [{'reference': 'RHF'}, {'reference': 'UHF'}, ...]
+    molecule : Molecule
+        Active molecule
+    **kwargs : dict
+        Additional kwargs (scf_do_properties, write_orbitals, etc.)
+
+    Returns
+    -------
+    tuple
+        (min_energy, wfn_collection) where:
+        - min_energy: float, lowest energy among all wavefunctions
+        - wfn_collection: dict or list (matches input format) of converged wfns
+    """
+    from psi4.driver.procrouting.scf_proc.scf_iterator import multi_scf
+
+    _validate_wfns_spec(wfns_spec, molecule)
+
+    is_dict_input = isinstance(wfns_spec, dict)
+    items = list(wfns_spec.items() if is_dict_input else enumerate(wfns_spec))
+
+    # Create wavefunctions
+    # First wfn prints header normally, remaining wfns suppress header
+    # to avoid duplicate geometry/basis/algorithm output
+    wfn_list = []
+    wfn_names = []
+    for i, (key, spec) in enumerate(items):
+        wfn_name = key if is_dict_input else f"wfn{key}"
+
+        if i == 0:
+            # First wfn: print header normally
+            wfn = _create_wfn_from_spec(name, spec, molecule, wfn_name, **kwargs)
+        else:
+            # Subsequent wfns: suppress header printing
+            with p4util.OptionsStateCM(['SCF', 'PRINT']):
+                core.set_local_option('SCF', 'PRINT', 0)
+                wfn = _create_wfn_from_spec(name, spec, molecule, wfn_name, **kwargs)
+
+        wfn_list.append(wfn)
+        wfn_names.append(wfn_name)
+
+    # Run multi_scf with shared JK
+    energies = multi_scf(wfn_list, verbose=True)
+
+    # Post-processing for each wavefunction
+    for i, wfn in enumerate(wfn_list):
+        wfn.finalize_energy()
+
+        e_wfn = wfn.energy()
+        for pv in ["SCF TOTAL ENERGY", "CURRENT ENERGY", "CURRENT REFERENCE ENERGY"]:
+            wfn.set_variable(pv, e_wfn)
+
+        _scf_post_processing(
+            wfn,
+            do_properties=kwargs.get('scf_do_properties', True),
+            write_checkpoint_file=True,
+            file_prefix=wfn_names[i],
+            **kwargs
+        )
+
+    # Return in original format (dict→dict, list→list)
+    if is_dict_input:
+        wfn_result = {wfn_name: wfn for wfn_name, wfn in zip(wfn_names, wfn_list)}
+    else:
+        wfn_result = wfn_list
+
+    min_energy = min(energies)
+    core.set_variable('CURRENT ENERGY', min_energy)
+
+    return min_energy, wfn_result
 
 
 def scf_helper(name, post_scf=True, **kwargs):
@@ -1880,59 +2251,14 @@ def scf_helper(name, post_scf=True, **kwargs):
         for pv in ["SCF TOTAL ENERGY", "CURRENT ENERGY", "CURRENT REFERENCE ENERGY"]:
             obj.set_variable(pv, e_scf)
 
-    # We always would like to print a little property information
-    if kwargs.get('scf_do_properties', True):
-        oeprop = core.OEProp(scf_wfn)
-        oeprop.set_title("SCF")
-
-        # Figure our properties, if empty do dipole
-        props = [x.upper() for x in core.get_option("SCF", "SCF_PROPERTIES")]
-        if "DIPOLE" not in props:
-            props.append("DIPOLE")
-
-        proc_util.oeprop_validator(props)
-        for x in props:
-            oeprop.add(x)
-
-        # Populate free-atom volumes
-        # if we're doing MBIS
-        if 'MBIS_VOLUME_RATIOS' in props:
-            p4util.free_atom_volumes(scf_wfn)
-
-        # Compute properties
-        oeprop.compute()
-        for obj in [core, scf_wfn]:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-            obj.set_variable("CURRENT DIPOLE", obj.variable("SCF DIPOLE"))  # P::e SCF
-
-    # Write out MO's
-    if core.get_option("SCF", "PRINT_MOS"):
-        mowriter = core.MOWriter(scf_wfn)
-        mowriter.write()
-
-    # Write out a molden file
-    if core.get_option("SCF", "MOLDEN_WRITE"):
-        filename = core.get_writer_file_prefix(scf_molecule.name()) + ".molden"
-        dovirt = bool(core.get_option("SCF", "MOLDEN_WITH_VIRTUAL"))
-
-        occa = scf_wfn.occupation_a()
-        occb = scf_wfn.occupation_a()
-
-        mw = core.MoldenWriter(scf_wfn)
-        mw.write(filename, scf_wfn.Ca(), scf_wfn.Cb(), scf_wfn.epsilon_a(),
-                 scf_wfn.epsilon_b(), scf_wfn.occupation_a(),
-                 scf_wfn.occupation_b(), dovirt)
-
-    # Write checkpoint file (orbitals and basis); Can be disabled, e.g., for findif displacements
-    if write_checkpoint_file and isinstance(_chkfile, str):
-        filename = kwargs['write_orbitals']
-        scf_wfn.to_file(filename)
-        # core.set_local_option("SCF", "ORBITALS_WRITE", filename)
-    elif write_checkpoint_file:
-        filename = scf_wfn.get_scratch_filename(180)
-        scf_wfn.to_file(filename)
-        extras.register_numpy_file(filename) # retain with -m (messy) option
+    # Post-processing: properties, MOs, molden, checkpoint
+    _scf_post_processing(
+        scf_wfn,
+        do_properties=kwargs.get('scf_do_properties', True),
+        write_checkpoint_file=write_checkpoint_file,
+        file_prefix=scf_molecule.name(),
+        **kwargs
+    )
 
     if do_timer:
         core.tstop()
@@ -2567,7 +2893,31 @@ def run_occ_gradient(name, **kwargs):
 def run_scf(name, **kwargs):
     """Function encoding sequence of PSI module calls for
     a self-consistent-field theory (HF & DFT) calculation.
+
+    Parameters
+    ----------
+    name : str
+        Method name ('scf', 'hf', 'b3lyp', etc.)
+    wfns : dict or list, optional
+        Multi-wavefunction specification for simultaneous SCF.
+        Dict format: {'singlet': {'reference': 'UHF', 'multiplicity': 1}, ...}
+        List format: [{'reference': 'RHF'}, {'reference': 'UHF'}, ...]
+        When provided, returns (min_energy, wfn_collection) tuple.
+    **kwargs : dict
+        Additional options passed to scf_helper()
+
+    Returns
+    -------
+    float or tuple
+        Single wfn: energy (float)
+        Multi-wfn: (min_energy, wfn_dict_or_list) tuple
     """
+    # Multi-wavefunction mode
+    wfns_spec = kwargs.pop('wfns', None)
+    if wfns_spec is not None:
+        molecule = kwargs.pop('molecule', core.get_active_molecule())
+        return _run_multi_scf(name, wfns_spec, molecule, **kwargs)
+
     optstash_mp2 = p4util.OptionsState(
         ['DF_BASIS_MP2'],
         ['DFMP2', 'MP2_OS_SCALE'],

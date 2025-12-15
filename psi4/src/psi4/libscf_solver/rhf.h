@@ -32,6 +32,7 @@
 #include "psi4/libpsio/psio.hpp"
 #include "psi4/libfock/v.h"
 #include "hf.h"
+#include "multistate_matrix.h"
 
 #include "psi4/pybind11.h"
 
@@ -49,6 +50,11 @@ class RHF : public HF {
 
     std::shared_ptr<RV> potential_;
 
+    // Multi-state matrix containers (Da, Fa, G)
+    std::shared_ptr<MultiStateMatrix> D_multi_;
+    std::shared_ptr<MultiStateMatrix> F_multi_;
+    std::shared_ptr<MultiStateMatrix> G_multi_;
+
     double compute_initial_E() override;
 
     void common_init();
@@ -62,6 +68,9 @@ class RHF : public HF {
 
     virtual bool same_a_b_orbs() const { return true; }
     virtual bool same_a_b_dens() const { return true; }
+
+    /// RHF handles 1 state (closed-shell, alpha = beta)
+    int n_states() const override { return 1; }
 
     void save_density_and_energy() override;
 

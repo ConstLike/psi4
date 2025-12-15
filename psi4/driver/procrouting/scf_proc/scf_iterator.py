@@ -36,6 +36,7 @@ from ... import p4util
 from ...constants import constants
 from ...p4util.exceptions import SCFConvergenceError, ValidationError
 from ..solvent.efp import get_qm_atoms_opts, modify_Fock_induced, modify_Fock_permanent
+from .scf_options_snapshot import get_option_from_snapshot, snapshot_scf_options, apply_options_snapshot, restore_snapshot_to_global
 
 #import logging
 #logger = logging.getLogger("scf.scf_iterator")
@@ -54,48 +55,40 @@ from ..solvent.efp import get_qm_atoms_opts, modify_Fock_induced, modify_Fock_pe
 
 
 def scf_compute_energy(self):
-    """Base class Wavefunction requires this function. Here it is
-    simply a wrapper around initialize(), iterations(), finalize_energy(). It
-    returns the SCF energy computed by finalize_energy().
-
     """
-    if core.get_option('SCF', 'DF_SCF_GUESS') and (core.get_global_option('SCF_TYPE') == 'DIRECT'):
-        # speed up DIRECT algorithm (recomputes full (non-DF) integrals
-        #   each iter) by first converging via fast DF iterations, then
-        #   fully converging in fewer slow DIRECT iterations. aka Andy trick 2.0
-        core.print_out("  Starting with a DF guess...\n\n")
-        with p4util.OptionsStateCM(['SCF_TYPE']):
-            core.set_global_option('SCF_TYPE', 'DF')
-            self.initialize()
-            try:
-                self.iterations()
-            except SCFConvergenceError:
-                self.finalize()
-                raise SCFConvergenceError("""SCF DF preiterations""", self.iteration_, self, 0, 0)
-        core.print_out("\n  DF guess converged.\n\n")
+    Compute SCF energy using multi_scf() framework.
 
-        # reset the DIIS & JK objects in prep for DIRECT
-        if self.initialized_diis_manager_:
-            self.diis_manager_.reset_subspace()
-        self.initialize_jk(self.memory_jk_)
-    else:
-        self.initialize()
+    This is a wrapper that calls multi_scf([self]) to ensure single SCF
+    uses the same code path as multi-cycle SCF. This ensures all features
+    (DIIS, damping, SOSCF, MOM, FRAC, DF_SCF_GUESS, etc.) are automatically
+    available in both modes.
+
+    Single source of truth: All SCF calculations flow through multi_scf().
+
+    Returns
+    -------
+    float
+        SCF energy computed by finalize_energy()
+    """
+    # Initialize iteration_energies for backward compatibility
     self.iteration_energies = []
 
+    # Single SCF is just multi_scf with one wavefunction
+    # This ensures identical behavior and eliminates code duplication
     try:
-        self.iterations()
+        energies = multi_scf([self], verbose=True)
+        scf_energy = energies[0]
     except SCFConvergenceError as e:
         if core.get_option("SCF", "FAIL_ON_MAXITER"):
             core.print_out("  Failed to converge.\n")
-            # energy = 0.0
-            # A P::e fn to either throw or protest upon nonconvergence
-            # die_if_not_converged()
             raise e
         else:
             core.print_out("  Energy and/or wave function did not converge, but proceeding anyway.\n\n")
+            scf_energy = self.get_energies("Total Energy")
     else:
         core.print_out("  Energy and wave function converged.\n\n")
 
+    # Finalize and return
     scf_energy = self.finalize_energy()
     return scf_energy
 
@@ -151,7 +144,7 @@ def scf_initialize(self):
     # Change allocation for collocation matrices based on DFT type
     initialize_jk_obj = False
     if isinstance(self.jk(), core.JK):
-        core.print_out("\nRe-using passed JK object instead of rebuilding\n")
+        core.print_out("\n  Re-using passed JK object instead of rebuilding\n")
         jk = self.jk()
     else:
         initialize_jk_obj = True
@@ -220,7 +213,9 @@ def scf_initialize(self):
         self.form_Shalf()
         core.timer_off("HF: Form S/X")
 
-        core.print_out("\n  ==> Pre-Iterations <==\n\n")
+        # In multi-SCF mode, suppress per-wfn Pre-Iterations header (printed once in multi_scf)
+        if not hasattr(self, '_scf_wfn_index'):
+            core.print_out("\n  ==> Pre-Iterations <==\n\n")
 
         # force SCF_SUBTYPE to AUTO during SCF guess
         optstash = p4util.OptionsState(["SCF", "SCF_SUBTYPE"])
@@ -253,360 +248,408 @@ def scf_initialize(self):
         self.functional().set_do_vv10(False)
         self.functional().set_lock(True)
 
-    # Print iteration header
-    is_dfjk = core.get_global_option('SCF_TYPE').endswith('DF')
-    diis_rms = core.get_option('SCF', 'DIIS_RMS_ERROR')
-    core.print_out("  ==> Iterations <==\n\n")
-    core.print_out("%s                        Total Energy        Delta E     %s |[F,P]|\n\n" %
-                   ("   " if is_dfjk else "", "RMS" if diis_rms else "MAX"))
+    # Print iteration header (suppress in multi-SCF mode - printed once in multi_scf)
+    if not hasattr(self, '_scf_wfn_index'):
+        is_dfjk = core.get_global_option('SCF_TYPE').endswith('DF')
+        diis_rms = get_option_from_snapshot(self, 'DIIS_RMS_ERROR')
+        core.print_out("  ==> Iterations <==\n\n")
+        core.print_out("%s                        Total Energy        Delta E     %s |[F,P]|\n\n" %
+                       ("   " if is_dfjk else "", "RMS" if diis_rms else "MAX"))
 
 
-def scf_iterate(self, e_conv=None, d_conv=None):
+def _scf_initialize_iteration_state(self, e_conv, d_conv):
+    """
+    Initialize state for SCF iterations.
 
-    is_dfjk = core.get_global_option('SCF_TYPE').endswith('DF')
-    verbose = core.get_option('SCF', "PRINT")
-    reference = core.get_option('SCF', "REFERENCE")
+    This method sets up all parameters and state variables needed for the
+    SCF iteration loop, storing them as self._scf_* members to enable
+    multi-cycle SCF coordination.
 
-    # self.member_data_ signals are non-local, used internally by c-side fns
+    Parameters
+    ----------
+    e_conv : float or None
+        Energy convergence threshold
+    d_conv : float or None
+        Density convergence threshold
+    """
+    # Store convergence criteria
+    self._scf_e_conv = e_conv
+    self._scf_d_conv = d_conv
+
+    # ========================================================================
+    # Cache ALL options from snapshot (ONCE) to avoid scattered lookups
+    # ========================================================================
+    # This consolidates all option reads in ONE place, making code cleaner
+    # and easier to maintain. Previously had 34 scattered get_option_from_snapshot()
+    # calls throughout iteration code.
+
+    # DIIS options
+    self._scf_diis = get_option_from_snapshot(self, 'DIIS')
+    self._scf_diis_start = get_option_from_snapshot(self, 'DIIS_START')
+    self._scf_diis_min_vecs = get_option_from_snapshot(self, 'DIIS_MIN_VECS')
+    self._scf_diis_max_vecs = get_option_from_snapshot(self, 'DIIS_MAX_VECS')
+    self._scf_diis_rms_error = get_option_from_snapshot(self, 'DIIS_RMS_ERROR')
+
+    # AEDIIS options
+    self._scf_initial_accelerator = get_option_from_snapshot(self, 'SCF_INITIAL_ACCELERATOR')
+    self._scf_initial_start_diis_transition = get_option_from_snapshot(self, 'SCF_INITIAL_START_DIIS_TRANSITION')
+    self._scf_initial_finish_diis_transition = get_option_from_snapshot(self, 'SCF_INITIAL_FINISH_DIIS_TRANSITION')
+
+    # Damping options
+    self._scf_damping_percentage = get_option_from_snapshot(self, 'DAMPING_PERCENTAGE')
+    self._scf_damping_convergence = get_option_from_snapshot(self, 'DAMPING_CONVERGENCE')
+
+    # SOSCF options
+    self._scf_soscf = get_option_from_snapshot(self, 'SOSCF')
+    self._scf_soscf_start_convergence = get_option_from_snapshot(self, 'SOSCF_START_CONVERGENCE')
+    self._scf_soscf_conv = get_option_from_snapshot(self, 'SOSCF_CONV')
+    self._scf_soscf_min_iter = get_option_from_snapshot(self, 'SOSCF_MIN_ITER')
+    self._scf_soscf_max_iter = get_option_from_snapshot(self, 'SOSCF_MAX_ITER')
+    self._scf_soscf_print = get_option_from_snapshot(self, 'SOSCF_PRINT')
+
+    # MOM options
+    self._scf_mom_start = get_option_from_snapshot(self, 'MOM_START')
+    self._scf_mom_occ = get_option_from_snapshot(self, 'MOM_OCC')
+
+    # FRAC options
+    self._scf_frac_start = get_option_from_snapshot(self, 'FRAC_START')
+    self._scf_frac_occ = get_option_from_snapshot(self, 'FRAC_OCC')
+    self._scf_frac_val = get_option_from_snapshot(self, 'FRAC_VAL')
+    self._scf_frac_renormalize = get_option_from_snapshot(self, 'FRAC_RENORMALIZE')
+
+    # Convergence options
+    self._scf_maxiter = get_option_from_snapshot(self, 'MAXITER')
+    self._scf_e_convergence = get_option_from_snapshot(self, 'E_CONVERGENCE')
+    self._scf_d_convergence = get_option_from_snapshot(self, 'D_CONVERGENCE')
+    self._scf_fail_on_maxiter = get_option_from_snapshot(self, 'FAIL_ON_MAXITER')
+
+    # Other options
+    self._scf_level_shift = get_option_from_snapshot(self, 'LEVEL_SHIFT')
+    self._scf_level_shift_cutoff = get_option_from_snapshot(self, 'LEVEL_SHIFT_CUTOFF')
+    self._scf_print = get_option_from_snapshot(self, 'PRINT')
+
+    # COSX options
+    self._scf_cosx_maxiter_final = get_option_from_snapshot(self, 'COSX_MAXITER_FINAL')
+
+    # ========================================================================
+    # Derived configuration flags (computed from cached options)
+    # ========================================================================
+
+    self._scf_is_dfjk = core.get_global_option('SCF_TYPE').endswith('DF')
+    self._scf_verbose = self._scf_print
+    self._scf_reference = self.name()  # Use wfn's actual reference type (RHF, UHF, ROHF, etc.)
+    self._scf_damping_enabled = _validate_damping(self)
+    self._scf_soscf_enabled = _validate_soscf(self)
+    self._scf_frac_enabled = _validate_frac(self)
+    self._scf_efp_enabled = hasattr(self.molecule(), 'EFP')
+    self._scf_cosx_enabled = "COSX" in core.get_option('SCF', 'SCF_TYPE')  # OK from global
+
+    # Set DIIS/MOM members used by iteration loop
+    # Required by multi_scf() and _scf_iteration()
     self.diis_enabled_ = self.validate_diis()
-    self.MOM_excited_ = _validate_MOM()
-    self.diis_start_ = core.get_option('SCF', 'DIIS_START')
-    damping_enabled = _validate_damping()
-    soscf_enabled = _validate_soscf()
-    frac_enabled = _validate_frac()
-    efp_enabled = hasattr(self.molecule(), 'EFP')
-    cosx_enabled = "COSX" in core.get_option('SCF', 'SCF_TYPE')
-    ooo_scf = core.get_option("SCF", "ORBITAL_OPTIMIZER_PACKAGE") in ["OOO", "OPENORBITALOPTIMIZER"]
-    if ooo_scf:
-        pcm_enabled = core.get_option('SCF', 'PCM')
-        ddx_enabled = core.get_option('SCF', 'DDX')
-        pe_enabled = core.get_option('SCF', 'PE')
-        level_shift_enabled = core.get_option("SCF", "LEVEL_SHIFT") != 0.0
-        autograc_enabled = core.get_option("SAPT", "SAPT_DFT_GRAC_COMPUTE") != "NONE"
-        guessmix_enabled = core.get_option("SCF", "GUESS_MIX")
-        if (reference in ["ROHF", "CUHF"] or soscf_enabled or self.MOM_excited_ or frac_enabled or
-            efp_enabled or pcm_enabled or ddx_enabled or pe_enabled or autograc_enabled or
-            level_shift_enabled or guessmix_enabled):
-            core.print_out(f"    Note: OpenOrbitalOptimizer not compatible with at least one of the following. Falling back to orbital_optimizer_package=internal\n")
-            core.print_out(f"          {reference=}, soscf={soscf_enabled}, mom={self.MOM_excited_}, frac={frac_enabled}, efp={efp_enabled},\n")
-            core.print_out(f"          pcm={pcm_enabled}, ddx={ddx_enabled}, pe={pe_enabled}, autograc={autograc_enabled}, level_shift={level_shift_enabled},\n")
-            core.print_out(f"          guess_mix={guessmix_enabled}\n")
-        else:
-            # SAD needs some special work since the guess doesn't actually make the orbitals in Psi4
-            if self.sad_ and self.iteration_ <= 0:
-                self.iteration_ += 1
-                self.form_G()
-                self.form_initial_F()
-                self.form_initial_C()
-                self.reset_occupation()
-                self.find_occupation()
-                ene_sad = self.compute_E()
-                core.print_out(
-                    "   @%s%s iter %3s: %20.14f   %12.5e   %-11.5e %s\n" %
-                    ("DF-" if is_dfjk else "", reference, "SAD", ene_sad, ene_sad, 0.0, ""))
-            if core.get_option("SCF", "GUESS") == "READ" and self.iteration_ <= 0:
-                self.form_G()
-                self.form_initial_F()
-                self.form_initial_C()
-                self.reset_occupation()
-                self.find_occupation()
-                ene_sad = self.compute_E()
+    self.MOM_excited_ = _validate_MOM(self)
+    self.diis_start_ = self._scf_diis_start
 
-            try:
-                self.openorbital_scf()
-            except RuntimeError as ex:
-                if "openorbital_scf is virtual; it has not been implemented for your class" in str(ex):
-                    core.print_out(f"    Note: OpenOrbitalOptimizer NYI for {reference}. Falling back to Internal.\n")
-                else:
-                    raise ex
-            else:
-                SCFE = self.compute_E()
-                self.set_energies("Total Energy", SCFE)
-                self.set_variable("SCF ITERATION ENERGY", SCFE)
-                self.iteration_energies.append(SCFE)  # note 1-len array, not niter-len array like INTERNAL
-
-                self.form_G()
-                self.form_F()
-                self.form_C()
-                self.form_D()
-                return
-
-    # does the JK algorithm use severe screening approximations for early SCF iterations?
-    early_screening = False
-    if cosx_enabled:
-        early_screening = True
+    # COSX early screening parameters
+    self._scf_early_screening = False
+    if self._scf_cosx_enabled:
+        self._scf_early_screening = True
         self.jk().set_COSX_grid("Initial")
 
-    # maximum number of scf iterations to run after early screening is disabled
-    scf_maxiter_post_screening = core.get_option('SCF', 'COSX_MAXITER_FINAL')
+    self._scf_maxiter_post_screening = self._scf_cosx_maxiter_final
+    if self._scf_maxiter_post_screening < -1:
+        raise ValidationError('COSX_MAXITER_FINAL ({}) must be -1 or above. If you wish to attempt full SCF converge on the final COSX grid, set COSX_MAXITER_FINAL to -1.'.format(self._scf_maxiter_post_screening))
 
-    if scf_maxiter_post_screening < -1:
-        raise ValidationError('COSX_MAXITER_FINAL ({}) must be -1 or above. If you wish to attempt full SCF converge on the final COSX grid, set COSX_MAXITER_FINAL to -1.'.format(scf_maxiter_post_screening))
+    self._scf_early_screening_disabled = False
 
-    # has early_screening changed from True to False?
-    early_screening_disabled = False
+    # Initialize iteration state variables
+    self._scf_SCFE_old = 0.0
+    self._scf_Dnorm = 0.0
+    self._scf_Ediff = 0.0
+    self._scf_iter_post_screening = 0
 
-    # SCF iterations!
-    SCFE_old = 0.0
-    Dnorm = 0.0
-    scf_iter_post_screening = 0
-    while True:
-        self.iteration_ += 1
 
+def _scf_iteration(self):
+    """
+    Performs ONE SCF iteration.
+
+    This method is designed to be called externally by a multi-cycle SCF
+    coordinator. It uses state stored in self._scf_* members initialized
+    by _scf_initialize_iteration_state().
+
+    Returns
+    -------
+    tuple: (continue_flag, reason)
+        continue_flag: True to continue iterations, False to stop
+        reason: 'converged' | 'max_iter' | 'early_screening_maxiter' | 'mom_not_started' | 'frac_not_started'
+    """
+    self.iteration_ += 1
+
+    diis_performed = False
+    soscf_performed = False
+    self.frac_performed_ = False
+    #self.MOM_performed_ = False  # redundant from common_init()
+
+    self.save_density_and_energy()
+
+    if self._scf_efp_enabled:
+        # EFP: Add efp contribution to Fock matrix
+        self.H().copy(self.Horig)
+        global mints_psi4_yo
+        mints_psi4_yo = core.MintsHelper(self.basisset())
+        Vefp = modify_Fock_induced(self.molecule().EFP, mints_psi4_yo, verbose=self._scf_verbose - 1)
+        Vefp = core.Matrix.from_array(Vefp)
+        self.H().add(Vefp)
+
+    SCFE = 0.0
+    self.clear_external_potentials()
+
+    # Two-electron contribution to Fock matrix from self.jk()
+    core.timer_on("HF: Form G")
+    self.form_G()
+    core.timer_off("HF: Form G")
+
+    # Check if special J/K construction algorithms were used
+    incfock_performed = hasattr(self.jk(), "do_incfock_iter") and self.jk().do_incfock_iter()
+    upcm = 0.0
+    if core.get_option('SCF', 'PCM'):
+        calc_type = core.PCM.CalcType.Total
+        if core.get_option("PCM", "PCM_SCF_TYPE") == "SEPARATE":
+            calc_type = core.PCM.CalcType.NucAndEle
+        Dt = self.Da().clone()
+        Dt.add(self.Db())
+        upcm, Vpcm = self.get_PCM().compute_PCM_terms(Dt, calc_type)
+        SCFE += upcm
+        self.push_back_external_potential(Vpcm)
+    self.set_variable("PCM POLARIZATION ENERGY", upcm)  # P::e PCM
+    self.set_energies("PCM Polarization", upcm)
+
+    uddx = 0.0
+    if core.get_option('SCF', 'DDX'):
+        Dt = self.Da().clone()
+        Dt.add(self.Db())
+        uddx, Vddx, self.ddx_state = self.ddx.get_solvation_contributions(Dt, self.ddx_state)
+        SCFE += uddx
+        self.push_back_external_potential(Vddx)
+    self.set_variable("DD SOLVATION ENERGY", uddx)  # P::e DDX
+    self.set_energies("DD Solvation Energy", uddx)
+
+    upe = 0.0
+    if core.get_option('SCF', 'PE'):
+        Dt = self.Da().clone()
+        Dt.add(self.Db())
+        upe, Vpe = self.pe_state.get_pe_contribution(
+            Dt, elec_only=False
+        )
+        SCFE += upe
+        self.push_back_external_potential(Vpe)
+    self.set_variable("PE ENERGY", upe)  # P::e PE
+    self.set_energies("PE Energy", upe)
+
+    core.timer_on("HF: Form F")
+    # SAD: since we don't have orbitals yet, we might not be able
+    # to form the real Fock matrix. Instead, build an initial one
+    # Note: SAD sets iteration_ = -1, first increment makes it 0
+    if (self.iteration_ == 0) and self.sad_:
+        self.form_initial_F()
+    else:
+        self.form_F()
+    core.timer_off("HF: Form F")
+
+    if self._scf_verbose > 3:
+        self.Fa().print_out()
+        self.Fb().print_out()
+
+    SCFE += self.compute_E()
+    if self._scf_efp_enabled:
+        global efp_Dt_psi4_yo
+
+        # EFP: Add efp contribution to energy
+        efp_Dt_psi4_yo = self.Da().clone()
+        efp_Dt_psi4_yo.add(self.Db())
+        SCFE += self.molecule().EFP.get_wavefunction_dependent_energy()
+
+    self.set_energies("Total Energy", SCFE)
+    core.set_variable("SCF ITERATION ENERGY", SCFE)
+    self.iteration_energies.append(SCFE)
+
+    self._scf_Ediff = SCFE - self._scf_SCFE_old
+    self._scf_SCFE_old = SCFE
+
+    status = []
+
+    # Check if we are doing SOSCF
+    if (self._scf_soscf_enabled and (self.iteration_ >= 3) and (self._scf_Dnorm < self._scf_soscf_start_convergence)):
+        self._scf_Dnorm = self.compute_orbital_gradient(False, self._scf_diis_max_vecs)
         diis_performed = False
-        soscf_performed = False
-        self.frac_performed_ = False
-        #self.MOM_performed_ = False  # redundant from common_init()
-
-        self.save_density_and_energy()
-
-        if efp_enabled:
-            # EFP: Add efp contribution to Fock matrix
-            self.H().copy(self.Horig)
-            global mints_psi4_yo
-            mints_psi4_yo = core.MintsHelper(self.basisset())
-            Vefp = modify_Fock_induced(self.molecule().EFP, mints_psi4_yo, verbose=verbose - 1)
-            Vefp = core.Matrix.from_array(Vefp)
-            self.H().add(Vefp)
-
-        SCFE = 0.0
-        self.clear_external_potentials()
-
-        # Two-electron contribution to Fock matrix from self.jk()
-        core.timer_on("HF: Form G")
-        self.form_G()
-        core.timer_off("HF: Form G")
-
-        # Check if special J/K construction algorithms were used
-        incfock_performed = hasattr(self.jk(), "do_incfock_iter") and self.jk().do_incfock_iter()
-        upcm = 0.0
-        if core.get_option('SCF', 'PCM'):
-            calc_type = core.PCM.CalcType.Total
-            if core.get_option("PCM", "PCM_SCF_TYPE") == "SEPARATE":
-                calc_type = core.PCM.CalcType.NucAndEle
-            Dt = self.Da().clone()
-            Dt.add(self.Db())
-            upcm, Vpcm = self.get_PCM().compute_PCM_terms(Dt, calc_type)
-            SCFE += upcm
-            self.push_back_external_potential(Vpcm)
-        self.set_variable("PCM POLARIZATION ENERGY", upcm)  # P::e PCM
-        self.set_energies("PCM Polarization", upcm)
-
-        uddx = 0.0
-        if core.get_option('SCF', 'DDX'):
-            Dt = self.Da().clone()
-            Dt.add(self.Db())
-            uddx, Vddx, self.ddx_state = self.ddx.get_solvation_contributions(Dt, self.ddx_state)
-            SCFE += uddx
-            self.push_back_external_potential(Vddx)
-        self.set_variable("DD SOLVATION ENERGY", uddx)  # P::e DDX
-        self.set_energies("DD Solvation Energy", uddx)
-
-        upe = 0.0
-        if core.get_option('SCF', 'PE'):
-            Dt = self.Da().clone()
-            Dt.add(self.Db())
-            upe, Vpe = self.pe_state.get_pe_contribution(
-                Dt, elec_only=False
-            )
-            SCFE += upe
-            self.push_back_external_potential(Vpe)
-        self.set_variable("PE ENERGY", upe)  # P::e PE
-        self.set_energies("PE Energy", upe)
-
-        core.timer_on("HF: Form F")
-        # SAD: since we don't have orbitals yet, we might not be able
-        # to form the real Fock matrix. Instead, build an initial one
-        if (self.iteration_ == 0) and self.sad_:
-            self.form_initial_F()
+        if self.functional().needs_xc():
+            base_name = "SOKS, nmicro="
         else:
-            self.form_F()
-        core.timer_off("HF: Form F")
+            base_name = "SOSCF, nmicro="
 
-        if verbose > 3:
-            self.Fa().print_out()
-            self.Fb().print_out()
+        if not _converged(self._scf_Ediff, self._scf_Dnorm, e_conv=self._scf_e_conv, d_conv=self._scf_d_conv):
+            nmicro = self.soscf_update(self._scf_soscf_conv,
+                                       self._scf_soscf_min_iter,
+                                       self._scf_soscf_max_iter,
+                                       self._scf_soscf_print)
+            # if zero, the soscf call bounced for some reason
+            soscf_performed = (nmicro > 0)
 
-        SCFE += self.compute_E()
-        if efp_enabled:
-            global efp_Dt_psi4_yo
-
-            # EFP: Add efp contribution to energy
-            efp_Dt_psi4_yo = self.Da().clone()
-            efp_Dt_psi4_yo.add(self.Db())
-            SCFE += self.molecule().EFP.get_wavefunction_dependent_energy()
-
-        self.set_energies("Total Energy", SCFE)
-        core.set_variable("SCF ITERATION ENERGY", SCFE)
-        self.iteration_energies.append(SCFE)
-
-        Ediff = SCFE - SCFE_old
-        SCFE_old = SCFE
-
-        status = []
-
-        # Check if we are doing SOSCF
-        if (soscf_enabled and (self.iteration_ >= 3) and (Dnorm < core.get_option('SCF', 'SOSCF_START_CONVERGENCE'))):
-            Dnorm = self.compute_orbital_gradient(False, core.get_option('SCF', 'DIIS_MAX_VECS'))
-            diis_performed = False
-            if self.functional().needs_xc():
-                base_name = "SOKS, nmicro="
-            else:
-                base_name = "SOSCF, nmicro="
-
-            if not _converged(Ediff, Dnorm, e_conv=e_conv, d_conv=d_conv):
-                nmicro = self.soscf_update(core.get_option('SCF', 'SOSCF_CONV'),
-                                           core.get_option('SCF', 'SOSCF_MIN_ITER'),
-                                           core.get_option('SCF', 'SOSCF_MAX_ITER'),
-                                           core.get_option('SCF', 'SOSCF_PRINT'))
-                # if zero, the soscf call bounced for some reason
-                soscf_performed = (nmicro > 0)
-
-                if soscf_performed:
-                    self.find_occupation()
-                    status.append(base_name + str(nmicro))
-                else:
-                    if verbose > 0:
-                        core.print_out("Did not take a SOSCF step, using normal convergence methods\n")
-
-            else:
-                # need to ensure orthogonal orbitals and set epsilon
-                status.append(base_name + "conv")
-                core.timer_on("HF: Form C")
-                self.form_C()
-                core.timer_off("HF: Form C")
-                soscf_performed = True  # Stops DIIS
-
-        if not soscf_performed:
-            # Normal convergence procedures if we do not do SOSCF
-
-            # SAD: form initial orbitals from the initial Fock matrix, and
-            # reset the occupations. The reset is necessary because SAD
-            # nalpha_ and nbeta_ are not guaranteed physical.
-            # From here on, the density matrices are correct.
-            if (self.iteration_ == 0) and self.sad_:
-                self.form_initial_C()
-                self.reset_occupation()
+            if soscf_performed:
                 self.find_occupation()
-
+                status.append(base_name + str(nmicro))
             else:
-                # Run DIIS
-                core.timer_on("HF: DIIS")
+                if self._scf_verbose > 0:
+                    core.print_out("Did not take a SOSCF step, using normal convergence methods\n")
+
+        else:
+            # need to ensure orthogonal orbitals and set epsilon
+            status.append(base_name + "conv")
+            core.timer_on("HF: Form C")
+            self.form_C()
+            core.timer_off("HF: Form C")
+            soscf_performed = True  # Stops DIIS
+
+    if not soscf_performed:
+        # Normal convergence procedures if we do not do SOSCF
+
+        # SAD: form initial orbitals from the initial Fock matrix, and
+        # reset the occupations. The reset is necessary because SAD
+        # nalpha_ and nbeta_ are not guaranteed physical.
+        # From here on, the density matrices are correct.
+        # Note: SAD sets iteration_ = -1, first increment makes it 0
+        if (self.iteration_ == 0) and self.sad_:
+            self.form_initial_C()
+            self.reset_occupation()
+            self.find_occupation()
+
+        else:
+            # Run DIIS
+            core.timer_on("HF: DIIS")
+            try:
                 diis_performed = False
                 add_to_diis_subspace = self.diis_enabled_ and self.iteration_ >= self.diis_start_
 
-                Dnorm = self.compute_orbital_gradient(add_to_diis_subspace, core.get_option('SCF', 'DIIS_MAX_VECS'))
+                self._scf_Dnorm = self.compute_orbital_gradient(add_to_diis_subspace, self._scf_diis_max_vecs)
 
                 if add_to_diis_subspace:
-                    for engine_used in self.diis(Dnorm):
+                    for engine_used in self.diis(self._scf_Dnorm):
                         status.append(engine_used)
-
+            finally:
+                # Turn off timer even if exception occurs to prevent timer stack errors
                 core.timer_off("HF: DIIS")
 
-                if verbose > 4 and diis_performed:
-                    core.print_out("  After DIIS:\n")
-                    self.Fa().print_out()
-                    self.Fb().print_out()
+            if self._scf_verbose > 4 and diis_performed:
+                core.print_out("  After DIIS:\n")
+                self.Fa().print_out()
+                self.Fb().print_out()
 
-                # frac, MOM invoked here from Wfn::HF::find_occupation
-                core.timer_on("HF: Form C")
-                level_shift = core.get_option("SCF", "LEVEL_SHIFT")
-                if level_shift > 0 and Dnorm > core.get_option('SCF', 'LEVEL_SHIFT_CUTOFF'):
-                    status.append("SHIFT")
-                    self.form_C(level_shift)
-                else:
-                    self.form_C()
-                core.timer_off("HF: Form C")
-
-                if self.MOM_performed_:
-                    status.append("MOM")
-
-                if self.frac_performed_:
-                    status.append("FRAC")
-
-                if incfock_performed:
-                    status.append("INCFOCK")
-
-                # Reset occupations if necessary
-                if (self.iteration_ == 0) and self.reset_occ_:
-                    self.reset_occupation()
-                    self.find_occupation()
-
-        # Form new density matrix
-        core.timer_on("HF: Form D")
-        self.form_D()
-        core.timer_off("HF: Form D")
-
-        self.set_variable("SCF ITERATION ENERGY", SCFE)
-        core.set_variable("SCF D NORM", Dnorm)
-
-        # After we've built the new D, damp the update
-        if (damping_enabled and self.iteration_ > 1 and Dnorm > core.get_option('SCF', 'DAMPING_CONVERGENCE')):
-            damping_percentage = core.get_option('SCF', "DAMPING_PERCENTAGE")
-            self.damping_update(damping_percentage * 0.01)
-            status.append("DAMP={}%".format(round(damping_percentage)))
-
-        if core.has_option_changed("SCF", "ORBITALS_WRITE"):
-            filename = core.get_option("SCF", "ORBITALS_WRITE")
-            self.to_file(filename)
-
-        if verbose > 3:
-            self.Ca().print_out()
-            self.Cb().print_out()
-            self.Da().print_out()
-            self.Db().print_out()
-
-        # Print out the iteration
-        core.print_out(
-            "   @%s%s iter %3s: %20.14f   %12.5e   %-11.5e %s\n" %
-            ("DF-" if is_dfjk else "", reference, "SAD" if
-             ((self.iteration_ == 0) and self.sad_) else self.iteration_, SCFE, Ediff, Dnorm, '/'.join(status)))
-
-        # if a an excited MOM is requested but not started, don't stop yet
-        # Note that MOM_performed_ just checks initialization, and our convergence measures used the pre-MOM orbitals
-        if self.MOM_excited_ and ((not self.MOM_performed_) or self.iteration_ == core.get_option('SCF', "MOM_START")):
-            continue
-
-        # if a fractional occupation is requested but not started, don't stop yet
-        if frac_enabled and not self.frac_performed_:
-            continue
-
-        # have we completed our post-early screening SCF iterations?
-        if early_screening_disabled:
-            scf_iter_post_screening += 1
-            if scf_iter_post_screening >= scf_maxiter_post_screening and scf_maxiter_post_screening > 0:
-                break
-
-        # Call any postiteration callbacks
-        if not ((self.iteration_ == 0) and self.sad_) and _converged(Ediff, Dnorm, e_conv=e_conv, d_conv=d_conv):
-
-            if early_screening:
-
-                # we've reached convergence with early screning enabled; disable it
-                early_screening = False
-
-                # make note of the change to early screening; next SCF iteration(s) will be the last
-                early_screening_disabled = True
-
-                # cosx uses the largest grid for its final SCF iteration(s)
-                if cosx_enabled:
-                    self.jk().set_COSX_grid("Final")
-
-                # clear any cached matrices associated with incremental fock construction
-                # the change in the screening spoils the linearity in the density matrix
-                if hasattr(self.jk(), 'clear_D_prev'):
-                    self.jk().clear_D_prev()
-
-                if scf_maxiter_post_screening == 0:
-                    break
-                else:
-                    core.print_out("  Energy and wave function converged with early screening.\n")
-                    core.print_out("  Continuing SCF iterations with tighter screening.\n\n")
+            # frac, MOM invoked here from Wfn::HF::find_occupation
+            core.timer_on("HF: Form C")
+            level_shift = self._scf_level_shift
+            if level_shift > 0 and self._scf_Dnorm > self._scf_level_shift_cutoff:
+                status.append("SHIFT")
+                self.form_C(level_shift)
             else:
-                break
+                self.form_C()
+            core.timer_off("HF: Form C")
 
-        if self.iteration_ >= core.get_option('SCF', 'MAXITER'):
-            raise SCFConvergenceError("""SCF iterations""", self.iteration_, self, Ediff, Dnorm)
+            if self.MOM_performed_:
+                status.append("MOM")
+
+            if self.frac_performed_:
+                status.append("FRAC")
+
+            if incfock_performed:
+                status.append("INCFOCK")
+
+            # Reset occupations if necessary (first iteration after guess)
+            # Note: SAD sets iteration_ = -1, first increment makes it 0
+            if (self.iteration_ == 0) and self.reset_occ_:
+                self.reset_occupation()
+                self.find_occupation()
+
+    # Form new density matrix
+    core.timer_on("HF: Form D")
+    self.form_D()
+    core.timer_off("HF: Form D")
+
+    self.set_variable("SCF ITERATION ENERGY", SCFE)
+    core.set_variable("SCF D NORM", self._scf_Dnorm)
+
+    # After we've built the new D, damp the update
+    if (self._scf_damping_enabled and self.iteration_ > 1 and self._scf_Dnorm > self._scf_damping_convergence):
+        damping_percentage = self._scf_damping_percentage
+        self.damping_update(damping_percentage * 0.01)
+        status.append("DAMP={}%".format(round(damping_percentage)))
+
+    if core.has_option_changed("SCF", "ORBITALS_WRITE"):
+        filename = core.get_option("SCF", "ORBITALS_WRITE")
+        # Use wfn_name for unique filename in multi-SCF (empty wfn_name preserves original behavior)
+        unique_filename = self.get_orbitals_filename(filename)
+        self.to_file(unique_filename)
+
+    if self._scf_verbose > 3:
+        self.Ca().print_out()
+        self.Cb().print_out()
+        self.Da().print_out()
+        self.Db().print_out()
+
+    # Print out the iteration
+    # Note: SAD sets iteration_ = -1, first increment makes it 0
+    # Add WFN prefix for multi-SCF mode (when _scf_wfn_index is set)
+    wfn_prefix = f"  WFN{self._scf_wfn_index}" if hasattr(self, '_scf_wfn_index') else ""
+    core.print_out(
+        "%s   @%s%s iter %3s: %20.14f   %12.5e   %-11.5e %s\n" %
+        (wfn_prefix, "DF-" if self._scf_is_dfjk else "", self._scf_reference, "SAD" if
+         ((self.iteration_ == 0) and self.sad_) else self.iteration_, SCFE, self._scf_Ediff, self._scf_Dnorm, '/'.join(status)))
+
+    # if a an excited MOM is requested but not started, don't stop yet
+    # Note that MOM_performed_ just checks initialization, and our convergence measures used the pre-MOM orbitals
+    if self.MOM_excited_ and ((not self.MOM_performed_) or self.iteration_ == self._scf_mom_start):
+        return (True, 'mom_not_started')
+
+    # if a fractional occupation is requested but not started, don't stop yet
+    if self._scf_frac_enabled and not self.frac_performed_:
+        return (True, 'frac_not_started')
+
+    # have we completed our post-early screening SCF iterations?
+    if self._scf_early_screening_disabled:
+        self._scf_iter_post_screening += 1
+        if self._scf_iter_post_screening >= self._scf_maxiter_post_screening and self._scf_maxiter_post_screening > 0:
+            return (False, 'early_screening_maxiter')
+
+    # Call any postiteration callbacks
+    # Note: SAD sets iteration_ = -1, first increment makes it 0
+    if not ((self.iteration_ == 0) and self.sad_) and _converged(self._scf_Ediff, self._scf_Dnorm, e_conv=self._scf_e_conv, d_conv=self._scf_d_conv):
+
+        if self._scf_early_screening:
+
+            # we've reached convergence with early screning enabled; disable it
+            self._scf_early_screening = False
+
+            # make note of the change to early screening; next SCF iteration(s) will be the last
+            self._scf_early_screening_disabled = True
+
+            # cosx uses the largest grid for its final SCF iteration(s)
+            if self._scf_cosx_enabled:
+                self.jk().set_COSX_grid("Final")
+
+            # clear any cached matrices associated with incremental fock construction
+            # the change in the screening spoils the linearity in the density matrix
+            if hasattr(self.jk(), 'clear_D_prev'):
+                self.jk().clear_D_prev()
+
+            if self._scf_maxiter_post_screening == 0:
+                return (False, 'converged')
+            else:
+                core.print_out("  Energy and wave function converged with early screening.\n")
+                core.print_out("  Continuing SCF iterations with tighter screening.\n\n")
+        else:
+            return (False, 'converged')
+
+    # Continue iterating
+    return (True, 'continue')
 
 
 def scf_finalize_energy(self):
@@ -671,7 +714,14 @@ def scf_finalize_energy(self):
             # reading the rotated orbitals in before starting iterations
             self.form_D()
             self.set_energies("Total Energy", self.compute_initial_E())
-            self.iterations()
+
+            # Re-converge with rotated orbitals using unified multi_scf framework
+            try:
+                multi_scf([self], verbose=False)
+            except SCFConvergenceError:
+                # Continue with stability check even if not fully converged
+                pass
+
             follow = self.stability_analysis()
 
         if follow and self.attempt_number_ > core.get_option('SCF', 'MAX_ATTEMPTS'):
@@ -701,7 +751,12 @@ def scf_finalize_energy(self):
         self.set_variable("EFP TOTAL ENERGY", efpene['total'])  # P::e EFP
         self.set_variable("CURRENT ENERGY", efpene['total'])  # P::e EFP
 
-    core.print_out("\n  ==> Post-Iterations <==\n\n")
+    # Add WFN identifier for multi-SCF mode
+    if hasattr(self, '_scf_wfn_index'):
+        wfn_name = self.get_wfn_name()
+        core.print_out(f"\n  ==> Post-Iterations (WFN{self._scf_wfn_index}: {wfn_name}) <==\n\n")
+    else:
+        core.print_out("\n  ==> Post-Iterations <==\n\n")
 
     if self.V_potential():
         quad = self.V_potential().quadrature_values()
@@ -725,7 +780,7 @@ def scf_finalize_energy(self):
     self.check_phases()
     self.compute_spin_contamination()
     self.frac_renormalize()
-    reference = core.get_option("SCF", "REFERENCE")
+    reference = self.name()  # Use wfn's actual reference type for correct multi-SCF output
 
     energy = self.get_energies("Total Energy")
 
@@ -918,7 +973,8 @@ def scf_print_preiterations(self,small=False):
 # Bind functions to core.HF class
 core.HF.initialize = scf_initialize
 core.HF.initialize_jk = initialize_jk
-core.HF.iterations = scf_iterate
+core.HF._scf_initialize_iteration_state = _scf_initialize_iteration_state
+core.HF._scf_iteration = _scf_iteration
 core.HF.compute_energy = scf_compute_energy
 core.HF.finalize_energy = scf_finalize_energy
 core.HF.print_energies = scf_print_energies
@@ -935,8 +991,14 @@ def _converged(e_delta, d_rms, e_conv=None, d_conv=None):
     return (abs(e_delta) < e_conv and d_rms < d_conv)
 
 
-def _validate_damping():
+def _validate_damping(wfn=None):
     """Sanity-checks DAMPING control options
+
+    Parameters
+    ----------
+    wfn : HF wavefunction, optional
+        If provided, reads options from wfn._options_snapshot instead of global.
+        This ensures deterministic behavior in multi_scf().
 
     Raises
     ------
@@ -950,22 +1012,29 @@ def _validate_damping():
         Whether DAMPING is enabled during scf.
 
     """
-    # Q: I changed the enabled criterion get_option <-- has_option_changed
-    enabled = (core.get_option('SCF', 'DAMPING_PERCENTAGE') > 0.0)
-    if enabled:
-        parameter = core.get_option('SCF', "DAMPING_PERCENTAGE")
-        if parameter < 0.0 or parameter > 100.0:
-            raise ValidationError('SCF DAMPING_PERCENTAGE ({}) must be between 0 and 100'.format(parameter))
+    # Read from snapshot if available, otherwise from global
+    if wfn is not None:
+        damping_pct = get_option_from_snapshot(wfn, 'DAMPING_PERCENTAGE')
+        damping_conv = get_option_from_snapshot(wfn, 'DAMPING_CONVERGENCE')
+    else:
+        damping_pct = core.get_option('SCF', 'DAMPING_PERCENTAGE')
+        damping_conv = core.get_option('SCF', 'DAMPING_CONVERGENCE')
 
-        stop = core.get_option('SCF', 'DAMPING_CONVERGENCE')
-        if stop < 0.0:
-            raise ValidationError('SCF DAMPING_CONVERGENCE ({}) must be > 0'.format(stop))
+    enabled = (damping_pct > 0.0)
+    if enabled:
+        if damping_pct < 0.0 or damping_pct > 100.0:
+            raise ValidationError('SCF DAMPING_PERCENTAGE ({}) must be between 0 and 100'.format(damping_pct))
+
+        if damping_conv < 0.0:
+            raise ValidationError('SCF DAMPING_CONVERGENCE ({}) must be > 0'.format(damping_conv))
 
     return enabled
 
 
 def _validate_diis(self):
     """Sanity-checks DIIS control options
+
+    Reads options from wfn._options_snapshot if available, otherwise falls back to global.
 
     Raises
     ------
@@ -980,11 +1049,12 @@ def _validate_diis(self):
     """
 
     restricted_open = self.same_a_b_orbs() and not self.same_a_b_dens()
-    aediis_active = core.get_option('SCF', 'SCF_INITIAL_ACCELERATOR') != "NONE" and not restricted_open
+    aediis_accelerator = get_option_from_snapshot(self, 'SCF_INITIAL_ACCELERATOR')
+    aediis_active = aediis_accelerator != "NONE" and not restricted_open
 
     if aediis_active:
-        start = core.get_option('SCF', 'SCF_INITIAL_START_DIIS_TRANSITION')
-        stop = core.get_option('SCF', 'SCF_INITIAL_FINISH_DIIS_TRANSITION')
+        start = get_option_from_snapshot(self, 'SCF_INITIAL_START_DIIS_TRANSITION')
+        stop = get_option_from_snapshot(self, 'SCF_INITIAL_FINISH_DIIS_TRANSITION')
         if start < stop:
             raise ValidationError('SCF_INITIAL_START_DIIS_TRANSITION error magnitude cannot be less than SCF_INITIAL_FINISH_DIIS_TRANSITION.')
         elif start < 0:
@@ -992,17 +1062,23 @@ def _validate_diis(self):
         elif stop < 0:
             raise ValidationError('SCF_INITIAL_FINISH_DIIS_TRANSITION cannot be negative.')
 
-    enabled = bool(core.get_option('SCF', 'DIIS')) or aediis_active
+    diis_enabled = get_option_from_snapshot(self, 'DIIS')
+    enabled = bool(diis_enabled) or aediis_active
     if enabled:
-        start = core.get_option('SCF', 'DIIS_START')
+        start = get_option_from_snapshot(self, 'DIIS_START')
         if start < 1:
             raise ValidationError('SCF DIIS_START ({}) must be at least 1'.format(start))
 
     return enabled
 
 
-def _validate_frac():
+def _validate_frac(wfn=None):
     """Sanity-checks FRAC control options
+
+    Parameters
+    ----------
+    wfn : HF wavefunction, optional
+        If provided, reads options from wfn._options_snapshot instead of global.
 
     Raises
     ------
@@ -1015,16 +1091,26 @@ def _validate_frac():
         Whether FRAC is enabled during scf.
 
     """
-    enabled = (core.get_option('SCF', 'FRAC_START') != 0)
+    if wfn is not None:
+        frac_start = get_option_from_snapshot(wfn, 'FRAC_START')
+    else:
+        frac_start = core.get_option('SCF', 'FRAC_START')
+
+    enabled = (frac_start != 0)
     if enabled:
-        if enabled < 0:
-            raise ValidationError('SCF FRAC_START ({}) must be at least 1'.format(enabled))
+        if frac_start < 0:
+            raise ValidationError('SCF FRAC_START ({}) must be at least 1'.format(frac_start))
 
     return enabled
 
 
-def _validate_MOM():
+def _validate_MOM(wfn=None):
     """Sanity-checks MOM control options
+
+    Parameters
+    ----------
+    wfn : HF wavefunction, optional
+        If provided, reads options from wfn._options_snapshot instead of global.
 
     Raises
     ------
@@ -1037,17 +1123,28 @@ def _validate_MOM():
         Whether excited-state MOM (not just the plain stabilizing MOM) is enabled during scf.
 
     """
-    enabled = (core.get_option('SCF', "MOM_START") != 0 and len(core.get_option('SCF', "MOM_OCC")) > 0)
+    if wfn is not None:
+        mom_start = get_option_from_snapshot(wfn, 'MOM_START')
+        mom_occ = get_option_from_snapshot(wfn, 'MOM_OCC')
+    else:
+        mom_start = core.get_option('SCF', "MOM_START")
+        mom_occ = core.get_option('SCF', "MOM_OCC")
+
+    enabled = (mom_start != 0 and len(mom_occ) > 0)
     if enabled:
-        start = core.get_option('SCF', "MOM_START")
-        if enabled < 0:
-            raise ValidationError('SCF MOM_START ({}) must be at least 1'.format(start))
+        if mom_start < 0:
+            raise ValidationError('SCF MOM_START ({}) must be at least 1'.format(mom_start))
 
     return enabled
 
 
-def _validate_soscf():
+def _validate_soscf(wfn=None):
     """Sanity-checks SOSCF control options
+
+    Parameters
+    ----------
+    wfn : HF wavefunction, optional
+        If provided, reads options from wfn._options_snapshot instead of global.
 
     Raises
     ------
@@ -1061,28 +1158,991 @@ def _validate_soscf():
         Whether SOSCF is enabled during scf.
 
     """
-    enabled = core.get_option('SCF', 'SOSCF')
-    if enabled:
+    # Read from snapshot if available
+    if wfn is not None:
+        enabled = get_option_from_snapshot(wfn, 'SOSCF')
+        start = get_option_from_snapshot(wfn, 'SOSCF_START_CONVERGENCE')
+        miniter = get_option_from_snapshot(wfn, 'SOSCF_MIN_ITER')
+    else:
+        enabled = core.get_option('SCF', 'SOSCF')
         start = core.get_option('SCF', 'SOSCF_START_CONVERGENCE')
+        miniter = core.get_option('SCF', 'SOSCF_MIN_ITER')
+
+    if enabled:
         if start < 0.0:
             raise ValidationError('SCF SOSCF_START_CONVERGENCE ({}) must be positive'.format(start))
 
-        miniter = core.get_option('SCF', 'SOSCF_MIN_ITER')
         if miniter < 1:
             raise ValidationError('SCF SOSCF_MIN_ITER ({}) must be at least 1'.format(miniter))
 
-        maxiter = core.get_option('SCF', 'SOSCF_MAX_ITER')
+        if wfn is not None:
+            maxiter = get_option_from_snapshot(wfn, 'SOSCF_MAX_ITER')
+            conv = get_option_from_snapshot(wfn, 'SOSCF_CONV')
+        else:
+            maxiter = core.get_option('SCF', 'SOSCF_MAX_ITER')
+            conv = core.get_option('SCF', 'SOSCF_CONV')
+
         if maxiter < miniter:
             raise ValidationError('SCF SOSCF_MAX_ITER ({}) must be at least SOSCF_MIN_ITER ({})'.format(
                 maxiter, miniter))
 
-        conv = core.get_option('SCF', 'SOSCF_CONV')
         if conv < 1.e-10:
             raise ValidationError('SCF SOSCF_CONV ({}) must be achievable'.format(conv))
 
     return enabled
 
 core.HF.validate_diis = _validate_diis
+
+
+def validate_multi_scf_compatibility(wfn_list):
+    """
+    Validate that wavefunctions can share a single JK object.
+
+    MUST be same across all wfn (JK object constraints):
+    - Primary basis set (JK dimensions, 3-index integrals)
+    - Geometry coordinates (integrals depend on atom positions)
+    - Auxiliary basis (if SCF_TYPE='DF')
+    - SCF_TYPE (determines JK algorithm)
+    - SCREENING (set at JK build time)
+    - DFT functional (determines do_K, do_wK)
+    - LRC omega/alpha/beta (built into JK)
+
+    CAN differ (per-wfn SCF algorithm options via options snapshot):
+    - Reference type (RHF/UHF/ROHF)
+    - Multiplicity (affects occupation)
+    - Charge (affects number of electrons)
+    - GUESS (SAD/CORE/READ/HUCKEL)
+    - DIIS settings (DIIS_START, DIIS_MIN_VECS, etc.)
+    - Damping (DAMPING_PERCENTAGE, DAMPING_CONVERGENCE)
+    - E_CONVERGENCE, D_CONVERGENCE
+    - SOSCF settings
+    - MOM/FRAC settings
+
+    Note: Charge and multiplicity can differ because they only affect the number
+    of electrons (occupation), not the 2-electron integrals which are computed
+    over basis functions centered on atoms.
+
+    Parameters
+    ----------
+    wfn_list : list of HF
+        Wavefunctions to validate for shared JK compatibility
+
+    Raises
+    ------
+    ValidationError
+        If wavefunctions have incompatible parameters for shared JK
+    """
+    if len(wfn_list) < 2:
+        return  # Single wfn, no compatibility issues
+
+    ref_wfn = wfn_list[0]
+
+    # ========================================================================
+    # Category 1: JK Structure (baked into JK.build(), cannot change)
+    # ========================================================================
+
+    # Check 1.1: Primary Basis Set
+    # Code: _build_jk() line 97: wfn.get_basisset("ORBITAL")
+    # Why: JK object built with specific basis dimensions, 3-index integrals
+    #      computed for this basis. Different basis requires different integrals.
+    ref_basis = ref_wfn.basisset()
+    ref_basis_name = ref_basis.name()
+    ref_nbf = ref_basis.nbf()
+
+    for i, wfn in enumerate(wfn_list[1:], 1):
+        wfn_basis = wfn.basisset()
+        wfn_basis_name = wfn_basis.name()
+        wfn_nbf = wfn_basis.nbf()
+
+        if wfn_basis_name != ref_basis_name or wfn_nbf != ref_nbf:
+            raise ValidationError(
+                f"\n"
+                f"Shared JK Compatibility Error: Primary basis set mismatch\n"
+                f"{'=' * 70}\n"
+                f"Wavefunction {i} has different primary basis set:\n"
+                f"  Reference (wfn 0): {ref_basis_name} ({ref_nbf} basis functions)\n"
+                f"  Wavefunction {i}:  {wfn_basis_name} ({wfn_nbf} basis functions)\n"
+                f"\n"
+                f"Why this matters:\n"
+                f"  All wavefunctions share a single JK object built with specific\n"
+                f"  basis set dimensions. The 3-index integrals (Q|μν) are computed\n"
+                f"  for this basis. Different basis sets require different integrals.\n"
+                f"\n"
+                f"Code location: _build_jk() line 97\n"
+                f"  jk = core.JK.build(wfn.get_basisset('ORBITAL'), ...)\n"
+                f"\n"
+                f"Solution:\n"
+                f"  Use the same primary basis set for all wavefunctions in multi_scf().\n"
+                f"  Example: set basis cc-pVDZ for all molecules before creating wfn.\n"
+                f"{'=' * 70}\n"
+            )
+
+    # Check 1.2: Geometry (Molecule)
+    # Code: jk.initialize() line 121 - computes 3-index integrals
+    # Why: Integrals (Q|μν) = ∫∫ χ_Q(r1) χ_μ(r1) r12^-1 χ_ν(r2) dr1 dr2
+    #      Basis functions χ centered on atoms, integrals depend on geometry
+    ref_mol = ref_wfn.molecule()
+
+    for i, wfn in enumerate(wfn_list[1:], 1):
+        wfn_mol = wfn.molecule()
+
+        # Check if same molecule object (identity check is fastest)
+        if wfn_mol is not ref_mol:
+            # Different objects - check if geometries are identical
+            # This can happen if molecules were cloned
+            ref_geom = ref_mol.geometry().np.flatten()
+            wfn_geom = wfn_mol.geometry().np.flatten()
+
+            if ref_geom.shape != wfn_geom.shape or \
+               not np.allclose(ref_geom, wfn_geom, atol=1e-10):
+                raise ValidationError(
+                    f"\n"
+                    f"Shared JK Compatibility Error: Geometry mismatch\n"
+                    f"{'=' * 70}\n"
+                    f"Wavefunction {i} has different molecular geometry:\n"
+                    f"  Reference and wfn {i} have different atomic coordinates.\n"
+                    f"\n"
+                    f"Why this matters:\n"
+                    f"  The 3-index integrals (Q|μν) depend on atomic positions because\n"
+                    f"  basis functions are centered on atoms. Different geometries\n"
+                    f"  require completely different integrals.\n"
+                    f"\n"
+                    f"Code location: jk.initialize() called in initialize_jk() line 121\n"
+                    f"  Computes integrals for current molecular geometry.\n"
+                    f"\n"
+                    f"Solution:\n"
+                    f"  Use the same molecule object for all wavefunctions.\n"
+                    f"  If you need different multiplicities/charges, use:\n"
+                    f"    mol.set_multiplicity(...)  # Changes occupation\n"
+                    f"    mol.set_molecular_charge(...)  # Changes charge\n"
+                    f"  but keep the SAME molecule object (same geometry).\n"
+                    f"{'=' * 70}\n"
+                )
+
+    # Check 1.3: Auxiliary Basis (for DF only)
+    # Code: _build_jk() line 98: aux=wfn.get_basisset("DF_BASIS_SCF")
+    # Why: For density fitting, different auxiliary basis yields different approximation
+    #      (μν|ρσ) ≈ (μν|P) (P|Q)^-1 (Q|ρσ)
+    scf_type = core.get_global_option('SCF_TYPE')
+    if scf_type == 'DF':
+        ref_aux = ref_wfn.get_basisset("DF_BASIS_SCF")
+        ref_aux_name = ref_aux.name()
+
+        for i, wfn in enumerate(wfn_list[1:], 1):
+            wfn_aux = wfn.get_basisset("DF_BASIS_SCF")
+            wfn_aux_name = wfn_aux.name()
+
+            if wfn_aux_name != ref_aux_name:
+                raise ValidationError(
+                    f"\n"
+                    f"Shared JK Compatibility Error: DF auxiliary basis mismatch\n"
+                    f"{'=' * 70}\n"
+                    f"Wavefunction {i} has different DF auxiliary basis:\n"
+                    f"  Reference (wfn 0): {ref_aux_name}\n"
+                    f"  Wavefunction {i}:  {wfn_aux_name}\n"
+                    f"\n"
+                    f"Why this matters:\n"
+                    f"  For SCF_TYPE='DF', the auxiliary basis is used to approximate\n"
+                    f"  4-index integrals: (μν|ρσ) ≈ (μν|P) (P|Q)^-1 (Q|ρσ)\n"
+                    f"  Different auxiliary basis yields different J/K integrals.\n"
+                    f"\n"
+                    f"Code location: _build_jk() line 98\n"
+                    f"  jk = core.JK.build(..., aux=wfn.get_basisset('DF_BASIS_SCF'))\n"
+                    f"\n"
+                    f"Solution:\n"
+                    f"  Use the same DF auxiliary basis for all wavefunctions.\n"
+                    f"  Example: set df_basis_scf cc-pVDZ-RI for all molecules.\n"
+                    f"{'=' * 70}\n"
+                )
+
+    # Check 1.4: LRC Capability
+    # Code: _build_jk() line 99: do_wK=wfn.functional().is_x_lrc()
+    # Why: JK built with or without long-range K capability. If built without,
+    #      cannot compute wK later!
+    ref_is_lrc = ref_wfn.functional().is_x_lrc()
+
+    for i, wfn in enumerate(wfn_list[1:], 1):
+        wfn_is_lrc = wfn.functional().is_x_lrc()
+
+        if wfn_is_lrc != ref_is_lrc:
+            ref_func_name = ref_wfn.functional().name()
+            wfn_func_name = wfn.functional().name()
+
+            raise ValidationError(
+                f"\n"
+                f"Shared JK Compatibility Error: LRC capability mismatch\n"
+                f"{'=' * 70}\n"
+                f"Wavefunction {i} has incompatible functional:\n"
+                f"  Reference (wfn 0): {ref_func_name} (is_x_lrc={ref_is_lrc})\n"
+                f"  Wavefunction {i}:  {wfn_func_name} (is_x_lrc={wfn_is_lrc})\n"
+                f"\n"
+                f"Why this matters:\n"
+                f"  The shared JK object is built with or without long-range K (wK)\n"
+                f"  capability. If built without wK support (non-LRC functional), it\n"
+                f"  cannot compute wK for LRC functionals later!\n"
+                f"\n"
+                f"Code location: _build_jk() line 99\n"
+                f"  jk = core.JK.build(..., do_wK=wfn.functional().is_x_lrc())\n"
+                f"\n"
+                f"Solution:\n"
+                f"  All wavefunctions must be either:\n"
+                f"    - All LRC functionals (ωB97X, ωB97X-D, LC-ωPBE, etc.), OR\n"
+                f"    - All non-LRC (HF, B3LYP, PBE0, etc.)\n"
+                f"  Mixing LRC and non-LRC is not supported for shared JK.\n"
+                f"{'=' * 70}\n"
+            )
+
+    # Check: DFT Functional must be identical
+    # Different functionals have different exchange requirements (no K, fractional K, full K)
+    ref_func = ref_wfn.functional()
+    ref_func_name = ref_func.name()
+
+    for i, wfn in enumerate(wfn_list[1:], 1):
+        wfn_func = wfn.functional()
+        wfn_func_name = wfn_func.name()
+
+        if wfn_func_name != ref_func_name:
+            raise ValidationError(
+                f"\n"
+                f"Shared JK Compatibility Error: DFT Functional mismatch\n"
+                f"{'=' * 70}\n"
+                f"Wavefunction {i} uses different functional:\n"
+                f"  Reference (wfn 0): {ref_func_name}\n"
+                f"  Wavefunction {i}:  {wfn_func_name}\n"
+                f"\n"
+                f"Why this matters:\n"
+                f"  All wavefunctions share a single JK object that computes J and K\n"
+                f"  integrals once per iteration. Different functionals have different\n"
+                f"  exchange requirements:\n"
+                f"    - Pure DFT (PBE, BLYP): no K required\n"
+                f"    - Hybrid (B3LYP, PBE0): fractional K (scaled by hybrid fraction)\n"
+                f"    - Pure HF: full K\n"
+                f"  Mixing functionals would compute wrong exchange for some wfns\n"
+                f"  or waste computation on unused K integrals.\n"
+                f"\n"
+                f"Solution:\n"
+                f"  Use the same DFT functional for all wavefunctions.\n"
+                f"  If you need different functionals, run separate SCF calculations.\n"
+                f"{'=' * 70}\n"
+            )
+
+    # ========================================================================
+    # Category 2: JK Configuration (set in initialize_jk(), not updated later)
+    # ========================================================================
+
+    # Check 2.1: LRC omega parameter
+    # Code: initialize_jk() line 116
+    # Why: omega is the range-separation parameter used in erf(ωr)/r operator
+    #      for long-range wK integrals. Different omega yields different integrals.
+    if ref_is_lrc:
+        ref_omega = ref_wfn.functional().x_omega()
+
+        for i, wfn in enumerate(wfn_list[1:], 1):
+            wfn_omega = wfn.functional().x_omega()
+
+            # Check omega MUST match
+            if abs(wfn_omega - ref_omega) > 1e-10:
+                ref_func_name = ref_wfn.functional().name()
+                wfn_func_name = wfn.functional().name()
+
+                raise ValidationError(
+                    f"\n"
+                    f"Shared JK Compatibility Error: LRC omega parameter mismatch\n"
+                    f"{'=' * 70}\n"
+                    f"Wavefunction {i} has different omega parameter:\n"
+                    f"  Reference (wfn 0): {ref_func_name}, omega = {ref_omega}\n"
+                    f"  Wavefunction {i}:  {wfn_func_name}, omega = {wfn_omega}\n"
+                    f"\n"
+                    f"Why this matters:\n"
+                    f"  For LRC functionals, omega is the range-separation parameter:\n"
+                    f"    wK_μν = Σ_ρσ P_ρσ (μρ|erf(ω r)/r|νσ)\n"
+                    f"  Different omega yields different wK integrals.\n"
+                    f"  The shared JK is configured with omega from wfn[0] only.\n"
+                    f"  Other wavefunctions skip JK configuration due to idempotency,\n"
+                    f"  so they inherit omega from wfn[0].\n"
+                    f"\n"
+                    f"Code location: initialize_jk() line 116\n"
+                    f"  jk.set_omega(functional.x_omega())\n"
+                    f"  Only called for wfn[0], skipped for wfn[1:] (scf_initialize\n"
+                    f"  idempotency check at lines 146-148).\n"
+                    f"\n"
+                    f"Solution:\n"
+                    f"  All wavefunctions must use LRC functionals with the SAME omega.\n"
+                    f"  Different LRC functionals (ωB97X vs ωB97X-D) typically have\n"
+                    f"  different omega values, so they cannot be mixed.\n"
+                    f"{'=' * 70}\n"
+                )
+
+    # Checks 2.2-2.3: LRC alpha/beta parameters (CONDITIONAL on wcombine)
+    # Code: initialize_jk() lines 118-119
+    # Why: alpha/beta affect integrals ONLY if wcombine=TRUE (combined K mode)
+    #
+    # Physics:
+    #   wcombine=FALSE (default): K and wK computed separately, alpha/beta used
+    #                             during Fock assembly, can differ between wfn
+    #   wcombine=TRUE: Combined matrix = alpha*K + beta*wK computed directly
+    #                  with alpha/beta baked into integrals, must match
+    #
+    # See: INVESTIGATION_VALIDATION_CHECKS.md for C++ code analysis (DFHelper.cc)
+
+    # Check if wcombine mode is enabled (global option)
+    wcombine_enabled = core.get_option('SCF', 'WCOMBINE') if core.has_option_changed('SCF', 'WCOMBINE') else False
+
+    if ref_is_lrc and wcombine_enabled:
+        # wcombine mode: alpha/beta affect integrals, MUST validate
+        ref_alpha = ref_wfn.functional().x_alpha()
+        ref_beta = ref_wfn.functional().x_beta()
+
+        for i, wfn in enumerate(wfn_list[1:], 1):
+            wfn_alpha = wfn.functional().x_alpha()
+            wfn_beta = wfn.functional().x_beta()
+
+            # Check alpha
+            if abs(wfn_alpha - ref_alpha) > 1e-10:
+                ref_func_name = ref_wfn.functional().name()
+                wfn_func_name = wfn.functional().name()
+
+                raise ValidationError(
+                    f"\n"
+                    f"Shared JK Compatibility Error: RSH alpha parameter mismatch (wcombine=TRUE)\n"
+                    f"{'=' * 70}\n"
+                    f"Wavefunction {i} has different alpha parameter:\n"
+                    f"  Reference (wfn 0): {ref_func_name}, alpha = {ref_alpha}\n"
+                    f"  Wavefunction {i}:  {wfn_func_name}, alpha = {wfn_alpha}\n"
+                    f"\n"
+                    f"Why this matters:\n"
+                    f"  You have enabled WCOMBINE=TRUE (combined K matrix mode).\n"
+                    f"  In this mode, the combined matrix K_combined = alpha*K + beta*wK\n"
+                    f"  is computed directly with alpha/beta baked into integrals.\n"
+                    f"  Different alpha yields incorrect results.\n"
+                    f"\n"
+                    f"Code location: DFHelper.cc compute_sparse_pQq_blocking_p_symm_abw()\n"
+                    f"  param_Mp = omega_alpha * buffer + omega_beta * wbuffer\n"
+                    f"  (only called if wcombine=TRUE)\n"
+                    f"\n"
+                    f"Solution:\n"
+                    f"  All wavefunctions must use functionals with the SAME alpha.\n"
+                    f"  Or disable wcombine mode (set WCOMBINE=FALSE, which is default).\n"
+                    f"{'=' * 70}\n"
+                )
+
+            # Check beta
+            if abs(wfn_beta - ref_beta) > 1e-10:
+                ref_func_name = ref_wfn.functional().name()
+                wfn_func_name = wfn.functional().name()
+
+                raise ValidationError(
+                    f"\n"
+                    f"Shared JK Compatibility Error: RSH beta parameter mismatch (wcombine=TRUE)\n"
+                    f"{'=' * 70}\n"
+                    f"Wavefunction {i} has different beta parameter:\n"
+                    f"  Reference (wfn 0): {ref_func_name}, beta = {ref_beta}\n"
+                    f"  Wavefunction {i}:  {wfn_func_name}, beta = {wfn_beta}\n"
+                    f"\n"
+                    f"Why this matters:\n"
+                    f"  You have enabled WCOMBINE=TRUE (combined K matrix mode).\n"
+                    f"  In this mode, the combined matrix K_combined = alpha*K + beta*wK\n"
+                    f"  is computed directly with alpha/beta baked into integrals.\n"
+                    f"  Different beta yields incorrect results.\n"
+                    f"\n"
+                    f"Code location: DFHelper.cc compute_sparse_pQq_blocking_p_symm_abw()\n"
+                    f"  param_Mp = omega_alpha * buffer + omega_beta * wbuffer\n"
+                    f"  (only called if wcombine=TRUE)\n"
+                    f"\n"
+                    f"Solution:\n"
+                    f"  All wavefunctions must use functionals with the SAME beta.\n"
+                    f"  Or disable wcombine mode (set WCOMBINE=FALSE, which is default).\n"
+                    f"{'=' * 70}\n"
+                )
+    # else: wcombine=FALSE (default) - alpha/beta used in Fock assembly, not in integrals, OK to differ
+
+    # All checks passed!
+    # Parameters that CAN differ (safe) are NOT checked:
+    # - Multiplicity, Reference type, Charge, Non-LRC XC, Hybrid fraction,
+    #   Convergence settings - these don't affect shared JK
+    # Parameters already protected:
+    # - SCF_TYPE (options snapshot), do_J/do_K (overwritten in _multi_scf_inner)
+
+
+def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
+    """
+    Run multiple SCF calculations with shared JK computation.
+
+    This multi-cycle SCF coordinator uses the refactored _scf_iteration()
+    method from each wavefunction. This version supports ALL SCF features:
+    DIIS, damping, SOSCF, MOM, FRAC, convergence acceleration, etc.
+
+    Algorithm
+    ---------
+    1. Initialize iteration state for each wfn via _scf_initialize_iteration_state()
+    2. Main loop:
+       a. Collect all C matrices from all wfn (via get_orbital_matrices())
+       b. Single shared JK computation (jk.compute())
+       c. Distribute J/K to each wfn (via set_jk_matrices())
+       d. Each wfn._scf_iteration() uses precomputed J/K
+       e. Check convergence for all wfn
+    3. Return final energies
+
+    Parameters
+    ----------
+    wfn_list : list of HF wavefunction objects
+        List of RHF, UHF, or ROHF wavefunctions to converge simultaneously
+    e_conv : float, optional
+        Energy convergence threshold. Defaults to SCF E_CONVERGENCE option
+    d_conv : float, optional
+        Density convergence threshold. Defaults to SCF D_CONVERGENCE option
+    max_iter : int, optional
+        Maximum number of iterations. Defaults to SCF MAXITER option
+    verbose : bool, optional
+        Print iteration information. Default True
+
+    Returns
+    -------
+    list of float
+        Final energies for each wavefunction
+
+    Raises
+    ------
+    ValidationError
+        If wfn_list is empty or wavefunctions are incompatible
+    SCFConvergenceError
+        If any wavefunction fails to converge within max_iter
+
+    Examples
+    --------
+    Converge singlet and triplet states simultaneously::
+
+        import psi4
+        mol = psi4.geometry('''
+        0 1
+        H 0 0 0
+        H 0 0 0.74
+        ''')
+        psi4.set_options({'basis': 'cc-pVDZ'})
+
+        # Create singlet wavefunction
+        mol.set_multiplicity(1)
+        wfn_s = psi4.core.RHF(psi4.core.Wavefunction.build(mol, 'cc-pVDZ'))
+
+        # Create triplet wavefunction
+        mol.set_multiplicity(3)
+        wfn_t = psi4.core.UHF(psi4.core.Wavefunction.build(mol, 'cc-pVDZ'))
+
+        # Converge both simultaneously with shared JK
+        energies = multi_scf([wfn_s, wfn_t])
+
+        print(f"Singlet energy: {energies[0]}")
+        print(f"Triplet energy: {energies[1]}")
+
+    Notes
+    -----
+    - All wavefunctions must use the same basis set
+    - All wavefunctions must use the same JK algorithm (SCF_TYPE)
+    - Each wfn maintains its own DIIS, damping, convergence state
+    - JK computation is shared across wavefunctions
+    - Uses existing C++ infrastructure (use_precomputed_jk_ flag)
+
+    DF_SCF_GUESS Support
+    ~~~~~~~~~~~~~~~~~~~~
+    When DF_SCF_GUESS=True (default) and SCF_TYPE='DIRECT':
+    - Phase 1: All wfn converge using DF iterations
+    - Phase 2: DIIS reset, JK reinitialized for DIRECT
+    - Phase 3: Final convergence with DIRECT integrals
+
+    This matches single SCF behavior and produces identical iteration counts.
+    Total iterations shown = DF iterations + DIRECT iterations.
+    """
+    if len(wfn_list) == 0:
+        raise ValidationError("multi_scf requires at least one wavefunction")
+
+    # Validate wavefunction compatibility for shared JK
+    # Checks: basis set, geometry, LRC parameters, etc.
+    # Only checks what affects SHARED components (no half-measures!)
+    validate_multi_scf_compatibility(wfn_list)
+
+    # OpenOrbitalOptimizer (OOO) support
+    # OOO is an external optimizer that replaces Psi4's iteration loop.
+    # It calls jk_->compute() internally, so it CANNOT use shared JK batching.
+    #
+    # Architecture decision:
+    # - Single-wfn + OOO compatible: use openorbital_scf() for full OOO support
+    # - Multi-wfn + OOO requested: OOO can't batch JK, fall back to INTERNAL
+    # - OOO incompatible: fall back to INTERNAL optimizer
+    ooo_requested = core.get_option("SCF", "ORBITAL_OPTIMIZER_PACKAGE") in ["OOO", "OPENORBITALOPTIMIZER"]
+
+    if ooo_requested:
+        if len(wfn_list) > 1:
+            # Multi-wfn: OOO fundamentally incompatible with shared JK batching
+            core.print_out("  Note: OpenOrbitalOptimizer cannot batch JK for multiple wavefunctions.\n")
+            core.print_out("        Using internal SCF optimizer for multi-wfn calculation.\n\n")
+        else:
+            # Single-wfn: try OOO if compatible
+            wfn = wfn_list[0]
+            reference = core.get_option('SCF', 'REFERENCE')
+
+            # Check OOO compatibility with current SCF settings
+            soscf_enabled = core.get_option('SCF', 'SOSCF')
+            mom_enabled = hasattr(wfn, 'MOM_excited_') and wfn.MOM_excited_
+            frac_enabled = core.get_option('SCF', 'FRAC_OCC')
+            efp_enabled = hasattr(wfn.molecule(), 'EFP')
+            pcm_enabled = core.get_option('SCF', 'PCM')
+            ddx_enabled = core.get_option('SCF', 'DDX')
+            pe_enabled = core.get_option('SCF', 'PE')
+            level_shift_enabled = core.get_option("SCF", "LEVEL_SHIFT") != 0.0
+            guessmix_enabled = core.get_option("SCF", "GUESS_MIX")
+
+            ooo_incompatible = (
+                reference in ["ROHF", "CUHF"] or
+                soscf_enabled or mom_enabled or frac_enabled or
+                efp_enabled or pcm_enabled or ddx_enabled or pe_enabled or
+                level_shift_enabled or guessmix_enabled
+            )
+
+            if ooo_incompatible:
+                core.print_out("  Note: OpenOrbitalOptimizer not compatible with current settings.\n")
+                core.print_out(f"        reference={reference}, soscf={soscf_enabled}, mom={mom_enabled},\n")
+                core.print_out(f"        frac={frac_enabled}, efp={efp_enabled}, pcm={pcm_enabled},\n")
+                core.print_out(f"        ddx={ddx_enabled}, pe={pe_enabled}, level_shift={level_shift_enabled},\n")
+                core.print_out(f"        guess_mix={guessmix_enabled}\n")
+                core.print_out("        Falling back to internal SCF optimizer.\n\n")
+            else:
+                # OOO compatible! Use openorbital_scf()
+                if verbose:
+                    core.print_out("\n  ==> OpenOrbitalOptimizer SCF <==\n\n")
+
+                # Initialize wfn (creates JK, etc.)
+                wfn.initialize()
+
+                # OOO requires SAD setup for initial orbitals
+                is_dfjk = "DF" in core.get_option('SCF', 'SCF_TYPE')
+                if wfn.sad_ and wfn.iteration_ <= 0:
+                    wfn.iteration_ += 1
+                    wfn.form_G()
+                    wfn.form_initial_F()
+                    wfn.form_initial_C()
+                    wfn.reset_occupation()
+                    wfn.find_occupation()
+                    ene_sad = wfn.compute_E()
+                    core.print_out(
+                        "   @%s%s iter %3s: %20.14f   %12.5e   %-11.5e %s\n" %
+                        ("DF-" if is_dfjk else "", reference, "SAD", ene_sad, ene_sad, 0.0, ""))
+
+                if core.get_option("SCF", "GUESS") == "READ" and wfn.iteration_ <= 0:
+                    wfn.form_G()
+                    wfn.form_initial_F()
+                    wfn.form_initial_C()
+                    wfn.reset_occupation()
+                    wfn.find_occupation()
+                    wfn.compute_E()
+
+                try:
+                    wfn.openorbital_scf()
+                except RuntimeError as ex:
+                    if "openorbital_scf is virtual" in str(ex) or "OpenOrbitalOptimizer support has not been enabled" in str(ex):
+                        core.print_out(f"  Note: OpenOrbitalOptimizer not available ({reference}). Falling back to internal.\n\n")
+                        # Fall through to normal multi_scf path
+                    else:
+                        raise ex
+                else:
+                    # OOO succeeded - finalize and return
+                    SCFE = wfn.compute_E()
+                    wfn.set_energies("Total Energy", SCFE)
+                    wfn.set_variable("SCF ITERATION ENERGY", SCFE)
+                    wfn.iteration_energies = [SCFE]  # OOO doesn't track per-iteration
+
+                    wfn.form_G()
+                    wfn.form_F()
+                    wfn.form_C()
+                    wfn.form_D()
+
+                    if verbose:
+                        core.print_out(f"\n  OpenOrbitalOptimizer converged: E = {SCFE:.14f}\n\n")
+
+                    return [SCFE]
+
+    # Auto-assign unique wavefunction names for file isolation
+    # This enables proper DIIS, stability analysis, and orbital file separation
+    wfn_names_used = set()
+    for i, wfn in enumerate(wfn_list):
+        current_name = wfn.get_wfn_name()
+
+        # Auto-assign if empty (default for single-cycle SCF)
+        if not current_name:
+            wfn_name = f"wfn_{i}"
+            wfn.set_wfn_name(wfn_name)
+        else:
+            wfn_name = current_name
+
+        # Validate no duplicates
+        if wfn_name in wfn_names_used:
+            raise ValidationError(
+                f"Duplicate wavefunction name '{wfn_name}' detected. "
+                f"Each wavefunction in multi_scf must have a unique name for file isolation. "
+                f"Either clear all names (for auto-naming) or ensure all custom names are unique."
+            )
+        wfn_names_used.add(wfn_name)
+
+    # Get convergence criteria
+    if e_conv is None:
+        e_conv = core.get_option('SCF', 'E_CONVERGENCE')
+    if d_conv is None:
+        d_conv = core.get_option('SCF', 'D_CONVERGENCE')
+    if max_iter is None:
+        max_iter = core.get_option('SCF', 'MAXITER')
+
+    # GUESS AUTO must be resolved before wfn creation (caller's responsibility)
+    # because SAD basissets are set during scf_wavefunction_factory()
+
+    # Apply options snapshot for deterministic behavior
+    # With force=False (default), existing per-wfn snapshots are preserved.
+    # This enables per-wfn options: create wfn with different global options,
+    # apply snapshot immediately (force=True), then call multi_scf().
+    options_snapshot = snapshot_scf_options()
+
+    for wfn in wfn_list:
+        apply_options_snapshot(wfn, options_snapshot)  # force=False preserves existing
+
+    # DF guess for DIRECT algorithm: converge with DF first, then switch to DIRECT
+    # DIRECT recomputes full integrals each iteration; DF pre-convergence reduces
+    # the number of DIRECT iterations needed
+    use_df_guess = (core.get_option('SCF', 'DF_SCF_GUESS') and
+                    core.get_global_option('SCF_TYPE') == 'DIRECT')
+
+    if use_df_guess:
+        if verbose:
+            core.print_out("  Starting with a DF guess for DIRECT algorithm...\n\n")
+
+        # Phase 1: DF pre-iterations
+        with p4util.OptionsStateCM(['SCF_TYPE']):
+            core.set_global_option('SCF_TYPE', 'DF')
+
+            # Initialize all wfn with DF
+            for wfn in wfn_list:
+                if wfn.jk() is None:
+                    wfn.initialize()
+
+            # Run multi-SCF iterations with DF
+            try:
+                _multi_scf_inner(wfn_list, e_conv, d_conv, max_iter, verbose)
+            except SCFConvergenceError:
+                # DF guess failed to converge - not critical, continue to DIRECT
+                pass
+
+        if verbose:
+            core.print_out("\n  DF guess converged. Switching to DIRECT...\n\n")
+
+        # Phase 2: Reset for DIRECT
+        for wfn in wfn_list:
+            # Reset DIIS subspace (DF gradients not compatible with DIRECT)
+            if wfn.initialized_diis_manager_:
+                wfn.diis_manager_.reset_subspace()
+
+            # Re-initialize JK with DIRECT (recomputes full integrals)
+            wfn.initialize_jk(wfn.memory_jk_)
+    else:
+        # Normal initialization (no DF guess)
+        # Shared JK pre-initialization reduces memory and computation time.
+        #
+        # Problem: Each wfn.initialize() creates its own JK via _build_jk()
+        #          causing N× redundant 3-index integrals computation.
+        #
+        # Solution: Create single shared JK, then share it with all wfn.
+        #          scf_initialize() is idempotent - reuses JK if already set (line 154-156)
+        #
+        # NOTE: 3-index integrals (Q|μν) depend only on basis + geometry,
+        #       not on reference type (RHF/UHF/ROHF). JK object is generic
+        #       and works with any number of density matrices.
+
+        needs_jk_init = any(wfn.jk() is None for wfn in wfn_list)
+
+        if needs_jk_init:
+            # Build single shared JK for all wavefunctions
+            ref_wfn = wfn_list[0]
+
+            # Use integer arithmetic to avoid float-to-int type error
+            # Python 3: `/` returns float, but C++ expects int
+            # Use `//` (integer division) + explicit int() conversion
+            total_memory_bytes = core.get_memory()
+            safety_factor = core.get_global_option("SCF_MEM_SAFETY_FACTOR")
+            total_memory = int((total_memory_bytes // 8) * safety_factor)
+
+            # Create JK for reference wfn
+            shared_jk = _build_jk(ref_wfn, total_memory)
+
+            # Initialize JK (computes 3-index integrals once for all wavefunctions)
+            ref_wfn.initialize_jk(total_memory, jk=shared_jk)
+
+            # Share JK with other wavefunctions (they skip _build_jk() and reuse shared JK)
+            for wfn in wfn_list[1:]:
+                wfn.set_jk(shared_jk)
+
+            if verbose:
+                core.print_out(f"  Shared JK object created for {len(wfn_list)} wavefunctions.\n\n")
+
+        # Initialize wavefunctions (reuses shared JK)
+        for i, wfn in enumerate(wfn_list):
+            # Only store WFN index for multi-wfn mode (for iteration output prefix)
+            if len(wfn_list) > 1:
+                wfn._scf_wfn_index = i
+                wfn_name = wfn.get_wfn_name()
+                wfn_type = wfn.__class__.__name__
+                if verbose:
+                    core.print_out("\n")
+                    core.print_out("  " + "=" * 76 + "\n")
+                    core.print_out(f"   WFN{i}: {wfn_name} ({wfn_type})\n")
+                    core.print_out("  " + "=" * 76 + "\n")
+            # Restore per-wfn options to global state before C++ initialize()
+            # C++ HF::compute_initial_guess() reads GUESS from global options
+            restore_snapshot_to_global(wfn)
+            wfn.initialize()
+
+    # Phase 3: Main iterations (DIRECT if using DF guess, otherwise normal)
+    return _multi_scf_inner(wfn_list, e_conv, d_conv, max_iter, verbose)
+
+
+def _multi_scf_inner(wfn_list, e_conv, d_conv, max_iter, verbose):
+    """
+    Inner multi-SCF iteration loop.
+
+    This function is called by multi_scf() and performs the actual SCF iterations.
+    It is separated to allow DF_SCF_GUESS to run DF pre-iterations followed by
+    DIRECT final iterations (Andy Trick 2.0).
+
+    Parameters
+    ----------
+    wfn_list : list of Wavefunction
+        List of wavefunctions to converge simultaneously
+    e_conv : float
+        Energy convergence threshold
+    d_conv : float
+        Density convergence threshold
+    max_iter : int
+        Maximum number of SCF iterations
+    verbose : bool
+        Verbosity level
+
+    Returns
+    -------
+    list of float
+        Final energies for each wavefunction
+    """
+    # Get JK object from first wavefunction (all must use same basis)
+    jk = wfn_list[0].jk()
+    if jk is None:
+        raise ValidationError("JK object not initialized after wfn.initialize(). This should not happen.")
+
+    # Ensure JK is configured to compute J and K matrices
+    jk.set_do_J(True)
+    jk.set_do_K(True)  # Needed for hybrid functionals (HF exchange)
+
+    # Initialize iteration state for each wavefunction
+    # Snapshot already applied above, so reads from frozen options
+    for wfn in wfn_list:
+        wfn._scf_initialize_iteration_state(e_conv, d_conv)
+
+    # Initialize SAD guess occupations BEFORE first JK computation
+    #
+    # Why this is necessary (not a workaround):
+    #   SAD guess sets nalphapi_ = nbetapi_ = sad_dim (all equal) because it doesn't
+    #   know the physical electron configuration. reset_occupation() corrects this
+    #   to the actual values (e.g., nalpha > nbeta for open-shell systems).
+    #
+    # Why it must be here (not inside _scf_iteration):
+    #   multi_scf computes J/K BEFORE calling _scf_iteration(), using orbitals from
+    #   get_orbital_matrices(). If occupation is wrong, orbitals are wrong, and J/K
+    #   are computed for the wrong density. The mismatch causes SCF divergence.
+    #
+    # Why iteration_ <= 0 (not == 0):
+    #   C++ SAD guess sets iteration_ = -1 (see hf.cc:1136) to signal "this is a
+    #   guess iteration: orbital occupations must be reset in SCF". The condition
+    #   matches the original check in _scf_iteration() line 401.
+    #
+    # Note: SAD initialization is handled internally by _scf_iteration()
+    # The external JK computation is skipped for COSX/ROHF/UHF which require
+    # the internal form_G() path for proper convergence.
+
+    # Track convergence status for each wfn
+    converged_flags = [False] * len(wfn_list)
+    final_energies = [0.0] * len(wfn_list)
+
+    # Pre-compute wavefunction state counts (invariant: RHF=1, UHF/ROHF=2)
+    # This eliminates redundant n_states() calls and enables pre-allocation
+    # n_states() is a const method - value doesn't change between iterations
+    wfn_state_counts = [wfn.n_states() for wfn in wfn_list]
+    total_states = sum(wfn_state_counts)
+
+    # Print common Iterations header for multi-SCF mode
+    if len(wfn_list) > 1 and verbose:
+        is_dfjk = core.get_global_option('SCF_TYPE').endswith('DF')
+        core.print_out("\n  ==> Iterations <==\n\n")
+        core.print_out("%s                        Total Energy        Delta E     RMS |[F,P]|\n\n" %
+                       ("   " if is_dfjk else ""))
+
+    # Main multi-cycle SCF iteration loop
+    # Note: range(max_iter + 1) allows max_iter + 1 loop iterations, matching master's
+    # behavior where iteration_ can reach max_iter before the >= check fails
+    # (SAD at iteration_=0, then iterations 1..max_iter for convergence)
+    for iteration in range(max_iter + 1):
+
+        # Step 1: Collect occupied orbital matrices from ACTIVE wavefunctions only
+        # Skip JK computation for converged wfn (orbitals unchanged → J/K unchanged)
+        # J^i and K^i depend only on C^i, so converged wfn reuse via use_precomputed_jk_
+
+        # Build list of (wfn_index, C_matrices) for active wfn only
+        # This preserves original wfn indices for correct distribution
+        active_C_data = []  # [(wfn_index, C_matrices), ...]
+
+        for i, wfn in enumerate(wfn_list):
+            if converged_flags[i]:
+                # Skip converged wfn - will reuse J/K from last active iteration
+                # wfn.precomputed_J/K still valid (C unchanged since convergence)
+                # wfn.use_precomputed_jk_ = true (unchanged from previous iteration)
+                # wfn.form_G() will automatically use cached J/K
+                if verbose >= 2:
+                    core.print_out(f"  [DEBUG iter={iteration}] wfn {i}: CONVERGED, skipping JK\n")
+                continue
+
+            # Get current C matrices for active wfn
+            C_matrices = wfn.get_orbital_matrices()
+            n_states = len(C_matrices)
+
+            if verbose >= 2:
+                core.print_out(f"  [DEBUG iter={iteration}] wfn {i}: ACTIVE, collected {n_states} C matrices\n")
+
+            # Sanity check: ensure n_states() matches get_orbital_matrices() length
+            if n_states != wfn_state_counts[i]:
+                raise ValidationError(
+                    f"Inconsistent state count for wavefunction {i} ({wfn.__class__.__name__}):\n"
+                    f"  n_states() returned {wfn_state_counts[i]}\n"
+                    f"  get_orbital_matrices() returned {n_states} matrices\n"
+                    f"This indicates a bug in the C++ implementation."
+                )
+
+            # Store wfn index and C matrices for JK computation
+            active_C_data.append((i, C_matrices))
+
+        # Early exit if all converged (no active wfn left)
+        if not active_C_data:
+            if verbose:
+                core.print_out("\n  All wavefunctions converged!\n\n")
+            break
+
+        # Determine if external JK computation should be used
+        # External JK allows sharing integrals across wfn but requires
+        # careful handling of SCF iteration state.
+        #
+        # Skip external JK for:
+        # - COSX: requires internal form_G() path due to grid switching state
+        # - ROHF/UHF: open-shell references have complex SAD handling that
+        #   requires orbitals to be updated within iteration
+        cosx_enabled = "COSX" in core.get_global_option('SCF_TYPE')
+        reference = core.get_option('SCF', 'REFERENCE')
+        use_external_jk = not cosx_enabled and reference in ['RHF', 'RKS']
+
+        if use_external_jk:
+            # Step 2: Shared JK computation for ACTIVE wavefunctions only
+            # Skip contraction for converged wfn (C unchanged → J/K unchanged)
+            # Integrals (Q|mn) loaded once, contracted with all active C matrices
+            # Note: Use C_left_add() only to trigger lr_symmetric_=true in JK::compute()
+            # (C_add() populates both C_left and C_right, which sets lr_symmetric_=false)
+            jk.C_clear()
+            for i, C_matrices in active_C_data:
+                for C in C_matrices:
+                    jk.C_left_add(C)
+
+            # Single JK call for active wavefunctions
+            jk.compute()
+
+            # Step 3: Distribute J/K/wK results back to ACTIVE wavefunctions only
+            # Converged wfn: set_jk_matrices() NOT called, preserves old J/K
+            J_all = jk.J()
+            K_all = jk.K()
+            wK_all = jk.wK()  # Long-range K for LRC functionals (empty if not LRC)
+
+            # Diagnostic check: verify J/K count matches active C count
+            total_active_states = sum(len(C_matrices) for _, C_matrices in active_C_data)
+            if len(J_all) != total_active_states or len(K_all) != total_active_states:
+                raise ValidationError(
+                    f"JK compute failed: expected {total_active_states} J/K matrices, "
+                    f"got {len(J_all)} J and {len(K_all)} K matrices. "
+                    f"Active wfn: {len(active_C_data)}, C_left has {len(jk.C_left())} matrices."
+                )
+
+            # Distribute to ACTIVE wfn only (preserves indexing via active_C_data)
+            jk_index = 0
+            for i, C_matrices in active_C_data:
+                n_states = len(C_matrices)
+
+                wfn_list[i].set_jk_matrices(
+                    J_all[jk_index:jk_index + n_states],
+                    K_all[jk_index:jk_index + n_states],
+                    wK_all[jk_index:jk_index + n_states] if wK_all else []
+                )
+                jk_index += n_states
+
+            # Note: Converged wfn do NOT receive updated J/K
+            # - precomputed_J/K unchanged (still valid from last active iteration)
+            # - use_precomputed_jk_ = true (unchanged)
+        # - form_G() will reuse cached J/K automatically
+
+        # Step 4: Each wavefunction completes its SCF iteration
+        # Iterate through ALL wfn (to track status), but only active ones call _scf_iteration()
+        # This is where ALL features work: DIIS, damping, SOSCF, MOM, FRAC, etc.
+        all_converged = True
+        status_strs = []
+
+        for i, wfn in enumerate(wfn_list):
+            if converged_flags[i]:
+                # Converged, skip iteration
+                status_strs.append("CONV")
+                continue
+
+            # Call the refactored _scf_iteration() method
+            # This uses precomputed J/K automatically (use_precomputed_jk_ flag)
+            should_continue, reason = wfn._scf_iteration()
+
+            if not should_continue:
+                if reason == 'converged':
+                    # Mark as converged
+                    converged_flags[i] = True
+                    final_energies[i] = wfn.get_energies("Total Energy")
+                    status_strs.append("CONV")
+                    if verbose >= 2:
+                        core.print_out(f"  [DEBUG iter={iteration}] wfn {i} CONVERGED\n")
+                elif reason in ['mom_not_started', 'frac_not_started']:
+                    # Special cases - keep iterating
+                    all_converged = False
+                    status_strs.append(reason[:4].upper())
+                elif reason == 'early_screening_maxiter':
+                    # COSX finished final grid iterations
+                    converged_flags[i] = True
+                    final_energies[i] = wfn.get_energies("Total Energy")
+                    status_strs.append("COSX")
+                else:
+                    # Unknown reason
+                    status_strs.append(reason[:4].upper())
+            else:
+                # Continue iterating
+                all_converged = False
+                status_strs.append("----")
+                final_energies[i] = wfn.get_energies("Total Energy")
+
+        # Check if all converged
+        if all(converged_flags):
+            if verbose:
+                core.print_out("\n  All wavefunctions converged!\n\n")
+            break
+
+    else:
+        # Max iterations reached without full convergence
+        not_converged = [i for i, flag in enumerate(converged_flags) if not flag]
+        raise SCFConvergenceError(
+            "Multi-cycle SCF: {} wavefunction(s) did not converge in {} iterations (indices: {})".format(
+                len(not_converged), max_iter, not_converged),
+            iteration, wfn_list[0], 0.0, 0.0)
+
+    return final_energies
+
 
 def efp_field_fn(xyz):
     """Callback function for PylibEFP to compute electric field from electrons

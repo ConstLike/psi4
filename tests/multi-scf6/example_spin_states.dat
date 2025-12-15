@@ -1,0 +1,48 @@
+#! Example: Singlet-Triplet Splitting with Multi-SCF
+#!
+#! This example demonstrates how to compute singlet and triplet
+#! states simultaneously using the wfns= parameter.
+#!
+#! Run with: psi4 example_spin_states.dat
+
+molecule ch2 {
+0 1
+C  0.000000  0.000000  0.000000
+H  0.000000  0.989000  0.363000
+H  0.000000 -0.989000  0.363000
+symmetry c1
+}
+
+set {
+    basis cc-pvdz
+    scf_type df
+    e_convergence 8
+    d_convergence 6
+}
+
+# Compute singlet (RHF) and triplet (UHF) simultaneously
+E, wfns = energy('scf', wfns={
+    'singlet': {'reference': 'RHF', 'multiplicity': 1},
+    'triplet': {'reference': 'UHF', 'multiplicity': 3},
+}, return_wfn=True)
+
+# Print results
+print_out("\n" + "="*60 + "\n")
+print_out("  Multi-SCF Singlet-Triplet Calculation Results\n")
+print_out("="*60 + "\n\n")
+
+E_singlet = wfns['singlet'].energy()
+E_triplet = wfns['triplet'].energy()
+
+print_out(f"  Singlet (RHF) energy: {E_singlet:16.10f} Eh\n")
+print_out(f"  Triplet (UHF) energy: {E_triplet:16.10f} Eh\n\n")
+
+gap_hartree = E_triplet - E_singlet
+gap_kcal = gap_hartree * psi4.constants.hartree2kcalmol
+gap_ev = gap_hartree * psi4.constants.hartree2ev
+
+print_out(f"  Singlet-Triplet Gap:\n")
+print_out(f"    {gap_hartree:16.10f} Eh\n")
+print_out(f"    {gap_kcal:16.4f} kcal/mol\n")
+print_out(f"    {gap_ev:16.4f} eV\n")
+print_out("\n" + "="*60 + "\n")

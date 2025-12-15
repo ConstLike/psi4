@@ -1,0 +1,50 @@
+#! Multi-SCF test: UHF singlet and triplet water
+#! Tests batch optimization of different spin states
+
+import psi4
+from psi4.driver.procrouting.proc import scf_wavefunction_factory
+from psi4.driver.procrouting.scf_proc.scf_iterator import multi_scf
+
+# Reference values (from sequential SCF calculations)
+# Note: multi_scf uses CORE guess which may find different local minima
+ref_uhf_singlet = -76.0266536619  #TEST
+ref_uhf_triplet = -75.6904931914  #TEST (CORE guess local minimum)
+
+# Water molecule
+molecule h2o {
+0 1
+O
+H 1 0.96
+H 1 0.96 2 104.5
+symmetry c1
+}
+
+set {
+    basis cc-pvdz
+    scf_type pk
+    e_convergence 10
+    d_convergence 8
+}
+
+# Create singlet UHF wavefunction
+wfn_base_s = psi4.core.Wavefunction.build(h2o, psi4.core.get_global_option('BASIS'))
+wfn_uhf_s = scf_wavefunction_factory('hf', wfn_base_s, 'UHF')
+wfn_uhf_s.set_wfn_name("uhf_singlet")
+
+# Modify molecule to triplet
+h2o.set_multiplicity(3)
+
+# Create triplet UHF wavefunction
+wfn_base_t = psi4.core.Wavefunction.build(h2o, psi4.core.get_global_option('BASIS'))
+wfn_uhf_t = scf_wavefunction_factory('hf', wfn_base_t, 'UHF')
+wfn_uhf_t.set_wfn_name("uhf_triplet")
+
+# Run multi_scf with both wavefunctions
+energies = multi_scf([wfn_uhf_s, wfn_uhf_t])
+
+compare_values(ref_uhf_singlet, energies[0], 8, "UHF H2O singlet energy from multi_scf")  #TEST
+compare_values(ref_uhf_triplet, energies[1], 8, "UHF H2O triplet energy from multi_scf")  #TEST
+
+# Report energies (singlet should be lower than triplet)
+gap_kcal = (energies[1] - energies[0]) * 627.5095
+psi4.core.print_out(f"\n  Singlet-Triplet gap: {gap_kcal:.2f} kcal/mol\n")

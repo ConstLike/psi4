@@ -28,7 +28,7 @@
 
 .. include:: autodoc_abbr_options_c.rst
 
-.. index:: SCF, HF, Hartree--Fock
+.. index:: SCF, HF, Hartree--Fock, Multi-SCF
 .. _`sec:scf`:
 
 HF: Hartree--Fock Theory
@@ -1267,6 +1267,224 @@ Convergence and Algorithm Defaults
    |scf__e_convergence| and |scf__d_convergence| for SCF of HF or DFT, 11
    for |scf__e_convergence| and |scf__d_convergence| for SCF of post-HF,
    and 10 for E_CONVERGENCE for post-HF of post-HF.
+
+.. _`sec:multiscf`:
+
+Multi-SCF: Batch Wavefunction Optimization
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Multi-SCF enables simultaneous optimization of multiple SCF wavefunctions
+sharing the same JK integral engine. Integral construction is performed once
+and reused across all wavefunctions, reducing total computation time compared
+to running sequential independent SCF calculations.
+
+**Use cases:**
+
+- Delta-SCF calculations (ground + excited states)
+- Spin-state splitting (singlet + triplet on same geometry)
+- Electron affinity / ionization potential calculations
+- Any scenario requiring multiple SCF solutions on the same molecule
+
+High-Level API: ``wfns=`` Parameter
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+To run multi-SCF, use the ``wfns=`` parameter in :py:func:`~psi4.energy`.
+This handles wavefunction setup based on the provided specifications.
+
+**Basic example (dict format with named wavefunctions):**
+
+.. code-block:: python
+
+    import psi4
+
+    molecule h2o {
+    0 1
+    O
+    H 1 0.96
+    H 1 0.96 2 104.5
+    symmetry c1
+    }
+
+    set {
+        basis cc-pvdz
+        scf_type df
+        e_convergence 10
+        d_convergence 8
+    }
+
+    # Run RHF and UHF simultaneously
+    E, wfns = psi4.energy('scf', wfns={
+        'rhf': {'reference': 'RHF'},
+        'uhf': {'reference': 'UHF'},
+    }, return_wfn=True)
+
+    print(f"Minimum energy: {E}")
+    print(f"RHF energy: {wfns['rhf'].energy()}")
+    print(f"UHF energy: {wfns['uhf'].energy()}")
+
+**List format:**
+
+.. code-block:: python
+
+    # Alternative: list format returns list of wavefunctions
+    E, wfns = psi4.energy('scf', wfns=[
+        {'reference': 'RHF'},
+        {'reference': 'UHF'},
+    ], return_wfn=True)
+
+    print(f"wfn[0] energy: {wfns[0].energy()}")
+    print(f"wfn[1] energy: {wfns[1].energy()}")
+
+**Spin-state splitting (singlet vs triplet):**
+
+.. code-block:: python
+
+    molecule ch2 {
+    0 1
+    C
+    H 1 1.08
+    H 1 1.08 2 102.4
+    symmetry c1
+    }
+
+    set {
+        basis cc-pvdz
+        scf_type df
+    }
+
+    # Compute singlet and triplet on same geometry
+    E, wfns = psi4.energy('scf', wfns={
+        'singlet': {'reference': 'RHF', 'multiplicity': 1},
+        'triplet': {'reference': 'UHF', 'multiplicity': 3},
+    }, return_wfn=True)
+
+    gap = (wfns['triplet'].energy() - wfns['singlet'].energy()) * psi4.constants.hartree2kcalmol
+    print(f"Singlet-Triplet gap: {gap:.2f} kcal/mol")
+
+**DFT example:**
+
+.. code-block:: python
+
+    # Works with any DFT functional
+    E, wfns = psi4.energy('b3lyp', wfns={
+        'rks': {'reference': 'RKS'},
+        'uks': {'reference': 'UKS'},
+    }, return_wfn=True)
+
+**Per-wavefunction options:**
+
+Each wavefunction specification can include:
+
+- ``reference``: RHF, UHF, ROHF, RKS, UKS, ROKS
+- ``multiplicity``: spin multiplicity (1, 2, 3, ...)
+- ``charge``: molecular charge
+- ``guess``: initial guess (SAD, CORE, READ, etc.)
+- ``e_convergence``: energy convergence threshold
+- ``d_convergence``: density convergence threshold
+- ``maxiter``: maximum SCF iterations
+- ``diis``: enable/disable DIIS
+- ``mom_start``: MOM starting iteration
+
+Example with per-wfn convergence settings::
+
+    E, wfns = psi4.energy('scf', wfns=[
+        {'reference': 'RHF', 'e_convergence': 1e-8},
+        {'reference': 'UHF', 'e_convergence': 1e-10, 'maxiter': 200},
+    ], return_wfn=True)
+
+Psi4 Input File Format (.dat)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+For running with ``psi4 input.dat`` command::
+
+    #! Multi-SCF: RHF vs UHF comparison
+
+    molecule h2o {
+    0 1
+    O
+    H 1 0.96
+    H 1 0.96 2 104.5
+    symmetry c1
+    }
+
+    set {
+        basis cc-pvdz
+        scf_type df
+    }
+
+    E, wfns = energy('scf', wfns={
+        'rhf': {'reference': 'RHF'},
+        'uhf': {'reference': 'UHF'},
+    }, return_wfn=True)
+
+    print_out(f"\nRHF energy: {wfns['rhf'].energy():.10f}\n")
+    print_out(f"UHF energy: {wfns['uhf'].energy():.10f}\n")
+
+    # Compare energies
+    compare_values(wfns['rhf'].energy(), wfns['uhf'].energy(), 8,
+                   "RHF vs UHF for closed-shell singlet")
+
+Low-Level API: ``multi_scf()`` Function
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+For advanced users who need full control over wavefunction construction,
+the ``multi_scf`` function accepts pre-configured wavefunction objects::
+
+    from psi4.driver.procrouting.proc import scf_wavefunction_factory
+    from psi4.driver.procrouting.scf_proc.scf_iterator import multi_scf
+
+    molecule h2o {
+    0 1
+    O
+    H 1 0.96
+    H 1 0.96 2 104.5
+    symmetry c1
+    }
+
+    set {
+        basis cc-pvdz
+        scf_type pk
+    }
+
+    # Create base wavefunction
+    wfn_base = psi4.core.Wavefunction.build(h2o, psi4.core.get_global_option('BASIS'))
+
+    # Create wavefunctions manually
+    wfn_rhf = scf_wavefunction_factory('hf', wfn_base, 'RHF')
+    wfn_uhf = scf_wavefunction_factory('hf', wfn_base, 'UHF')
+
+    # Run multi-SCF optimization
+    energies = multi_scf([wfn_rhf, wfn_uhf])
+
+    print(f"RHF energy: {energies[0]}")
+    print(f"UHF energy: {energies[1]}")
+
+Performance
+^^^^^^^^^^^
+
+Multi-SCF reduces computation time by sharing the JK integral engine across
+all wavefunctions. The time savings depend on system size, number of wavefunctions,
+and SCF type. Fock matrix construction is batched when possible.
+
+Supported References
+^^^^^^^^^^^^^^^^^^^^
+
+- RHF, UHF, ROHF (Hartree-Fock)
+- RKS, UKS, ROKS (DFT with any functional)
+
+Compatibility Requirements
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+All wavefunctions in a multi-SCF batch must share:
+
+- The same DFT functional (or all must be pure HF)
+- The same orbital basis set
+- The same |globals__scf_type| (PK, DIRECT, DF)
+- Compatible auxiliary basis sets (for DF)
+
+.. note:: Multi-SCF uses the CORE initial guess by default for batch optimization.
+   You can override this with ``'guess': 'SAD'`` in each wavefunction spec if needed.
+   Note that SAD guess may converge to different local minima for open-shell systems.
 
 .. _`sec:scfrec`:
 

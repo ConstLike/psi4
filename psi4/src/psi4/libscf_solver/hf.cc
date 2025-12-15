@@ -101,6 +101,8 @@ void HF::common_init() {
     sad_ = false;
     module_ = "scf";
     frac_performed_ = false;
+    use_precomputed_jk_ = false;  // Multi-cycle JK: default to normal JK computation
+    wfn_name_ = "";  // Empty for single-cycle SCF (backward compatible)
 
     // This quantity is needed fairly soon
     nirrep_ = factory_->nirrep();
@@ -408,6 +410,44 @@ void HF::set_jk(std::shared_ptr<JK> jk) {
     jk_ = jk;
 }
 
+void HF::set_wfn_name(const std::string& name) {
+    // Validate: only alphanumeric, underscore, hyphen allowed
+    // IMPORTANT: Cast to unsigned char to avoid UB with negative char values (e.g., UTF-8)
+    for (char c : name) {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-') {
+            throw PSIEXCEPTION("Wavefunction name must contain only letters, digits, '_', or '-'. Got: " + name);
+        }
+    }
+    wfn_name_ = name;
+}
+
+std::string HF::get_orbitals_filename(const std::string& base) const {
+    // Backward compatible: if wfn_name_ is empty, return base as-is
+    if (wfn_name_.empty()) {
+        return base;
+    }
+
+    // Insert wfn_name before file extension
+    std::string result;
+    result.reserve(base.size() + wfn_name_.size() + 1);
+
+    // Find extension (last '.')
+    size_t dot_pos = base.rfind('.');
+    if (dot_pos != std::string::npos) {
+        // Insert wfn_name before extension: "orbs.dat" → "orbs_wfn_0.dat"
+        result.append(base, 0, dot_pos);
+        result += '_';
+        result += wfn_name_;
+        result.append(base, dot_pos, std::string::npos);
+    } else {
+        // No extension: append wfn_name
+        result = base;
+        result += '_';
+        result += wfn_name_;
+    }
+    return result;
+}
+
 void HF::semicanonicalize() { throw PSIEXCEPTION("This type of wavefunction cannot be semicanonicalized!"); }
 
 void HF::find_occupation() {
@@ -498,7 +538,8 @@ void HF::print_header() {
     outfile->Printf("                                   SCF\n");
     outfile->Printf("               by Justin Turney, Rob Parrish, Andy Simmonett\n");
     outfile->Printf("                          and Daniel G. A. Smith\n");
-    outfile->Printf("                             %4s Reference\n", options_.get_str("REFERENCE").c_str());
+    // Use class name() instead of global REFERENCE option for correct multi-SCF output
+    outfile->Printf("                             %4s Reference\n", name().c_str());
     outfile->Printf("                      %3d Threads, %6ld MiB Core\n", nthread, memory_ / 1048576L);
     outfile->Printf("         ---------------------------------------------------------\n");
     outfile->Printf("\n");
@@ -853,7 +894,8 @@ void HF::print_orbitals() {
 
     outfile->Printf("    Orbital Energies [Eh]\n    ---------------------\n\n");
 
-    std::string reference = options_.get_str("REFERENCE");
+    // Use class name() instead of global REFERENCE option for correct multi-SCF output
+    std::string reference = name();
     if ((reference == "RHF") || (reference == "RKS")) {
         std::vector<std::pair<double, std::pair<std::string, int> > > occ;
         std::vector<std::pair<double, std::pair<std::string, int> > > vir;
@@ -1023,7 +1065,8 @@ void HF::guess() {
     if (guess_Ca_) {
         if (print_) outfile->Printf("  SCF Guess: Orbitals guess was supplied from a previous computation.\n\n");
 
-        std::string reference = options_.get_str("REFERENCE");
+        // Use class name() instead of global REFERENCE option for correct multi-SCF behavior
+        std::string reference = name();
         bool single_orb = (reference == "RHF");
 
         if (single_orb) {
@@ -1281,7 +1324,8 @@ void HF::check_phases() {
 
 void HF::print_occupation() {
     auto labels = molecule_->irrep_labels();
-    auto reference = options_.get_str("REFERENCE");
+    // Use class name() instead of global REFERENCE option for correct multi-SCF output
+    auto reference = name();
     outfile->Printf("          ");
     for (int h = 0; h < nirrep_; ++h) outfile->Printf(" %4s ", labels[h].c_str());
     outfile->Printf("\n");
@@ -1450,5 +1494,6 @@ bool HF::stability_analysis() {
     throw PSIEXCEPTION("Stability analysis hasn't been implemented yet for this wfn type.");
     return false;
 }
+
 }  // namespace scf
 }  // namespace psi

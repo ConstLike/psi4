@@ -1,0 +1,46 @@
+#! Multi-SCF test: Density Fitting SCF_TYPE
+#! Tests multi_scf with DF integrals (most common production use case)
+
+import psi4
+from psi4.driver.procrouting.proc import scf_wavefunction_factory
+from psi4.driver.procrouting.scf_proc.scf_iterator import multi_scf
+
+# Reference values (from sequential DF-SCF calculations)
+ref_rhf_df_h2o = -76.0266327351  #TEST
+ref_uhf_df_h2o = -76.0266327351  #TEST
+
+# Water molecule
+molecule h2o {
+0 1
+O
+H 1 0.96
+H 1 0.96 2 104.5
+symmetry c1
+}
+
+set {
+    basis cc-pvdz
+    scf_type df
+    e_convergence 10
+    d_convergence 8
+}
+
+# Create base wavefunction
+wfn_base = psi4.core.Wavefunction.build(h2o, psi4.core.get_global_option('BASIS'))
+
+# Create RHF wavefunction
+wfn_rhf = scf_wavefunction_factory('hf', wfn_base, 'RHF')
+wfn_rhf.set_wfn_name("rhf_df")
+
+# Create UHF wavefunction
+wfn_uhf = scf_wavefunction_factory('hf', wfn_base, 'UHF')
+wfn_uhf.set_wfn_name("uhf_df")
+
+# Run multi_scf with DF integrals
+energies = multi_scf([wfn_rhf, wfn_uhf])
+
+compare_values(ref_rhf_df_h2o, energies[0], 8, "RHF DF H2O energy from multi_scf")  #TEST
+compare_values(ref_uhf_df_h2o, energies[1], 8, "UHF DF H2O energy from multi_scf")  #TEST
+
+# RHF and UHF should give same energy for closed-shell singlet
+compare_values(energies[0], energies[1], 10, "RHF vs UHF energies with DF")  #TEST

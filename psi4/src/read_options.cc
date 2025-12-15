@@ -1463,6 +1463,7 @@ int read_options(const std::string &name, Options &options, bool suppress_printi
         /*- Reference wavefunction type.
         **Cfour Interface:** Keyword translates into |cfour__cfour_reference|. -*/
         options.add_str("REFERENCE", "RHF", "RHF ROHF UHF CUHF RKS UKS");
+
         /*- Primary basis set -*/
         options.add_str("BASIS", "");
         /*- Auxiliary basis set for SCF density fitting computations.
@@ -4808,7 +4809,7 @@ int read_options(const std::string &name, Options &options, bool suppress_printi
 
         /*- Controls whether excitation energy calculations allow for a
         "spin flip" which changes the $M_s$ quantum number. Such
-        calculations have some advantages for biradicals and are currently
+        calculations have some advantages for diradicals and are currently
         implemented (together with gradients) for CIS and CIS(D)
         calculations. Options are OFF and ON. -*/
         options.add_bool("CFOUR_SPIN_FLIP", false);

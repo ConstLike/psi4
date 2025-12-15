@@ -131,6 +131,21 @@ class HF : public Wavefunction {
     /// The soon to be ubiquitous JK object
     std::shared_ptr<JK> jk_;
 
+    /// Multi-cycle JK: pre-computed J/K/wK matrices from shared JK computation
+    /// Used when multiple SCF calculations share a single JK builder
+    std::vector<SharedMatrix> precomputed_J_;
+    std::vector<SharedMatrix> precomputed_K_;
+    std::vector<SharedMatrix> precomputed_wK_;  // Long-range K for LRC functionals (ωB97X-V, CAM-B3LYP)
+    /// Flag: use pre-computed J/K/wK instead of calling jk_->compute()
+    /// Enables backward compatibility (default: false, compute J/K normally)
+    bool use_precomputed_jk_;
+
+    /// Wavefunction name for file isolation in multi-SCF calculations
+    /// Used to generate unique filenames for DIIS, stability analysis, orbital writes
+    /// Empty string ("") for single-cycle SCF (backward compatible)
+    /// Set to "wfn_0", "wfn_1", etc. or custom names in multi-SCF
+    std::string wfn_name_;
+
     /// Are we to do MOM?
     bool MOM_enabled_;
     /// Are we to do excited-state MOM?
@@ -226,6 +241,22 @@ class HF : public Wavefunction {
     /** Performs any operations required for a incoming guess **/
     virtual void format_guess();
 
+    // Orbital matrix caching for multi_scf()
+    // Cache for get_orbital_matrices() to avoid repeated deep copies of orbital matrices
+    //
+    // Implementation details:
+    //   - RHF: 1 matrix (Ca_occ)
+    //   - UHF: 2 matrices (Ca_occ, Cb_occ)
+    //   - ROHF: 2 matrices (Cdocc, Csocc)
+    //
+    // Mutable allows modification in const method (standard C++ const-correctness pattern)
+    // Cache invalidated when orbitals change: form_C(), SOSCF, MOM, FRAC
+    mutable std::vector<SharedMatrix> cached_orbital_matrices_;
+
+    // Cache validity flag - invalidated when orbitals change
+    // C++11 in-class member initializer (default to invalid)
+    mutable bool orbital_cache_valid_ = false;
+
    public:
     HF(SharedWavefunction ref_wfn, std::shared_ptr<SuperFunctional> funct, Options& options,
        std::shared_ptr<PSIO> psio);
@@ -297,6 +328,22 @@ class HF : public Wavefunction {
     bool initialized_diis_manager() const { return initialized_diis_manager_; }
     void set_initialized_diis_manager(bool tf) { initialized_diis_manager_ = tf; }
 
+    /// Get/set wavefunction name for file isolation in multi-SCF
+    const std::string& get_wfn_name() const noexcept { return wfn_name_; }
+    void set_wfn_name(const std::string& name);
+
+    /// Generate unique DIIS filename incorporating wfn_name_ for file isolation
+    /// Returns "HF DIIS vector" for single-cycle SCF (backward compatible)
+    /// Returns "wfn_0 DIIS vector", "custom_name DIIS vector" for multi-SCF
+    std::string get_diis_filename() const {
+        return wfn_name_.empty() ? "HF DIIS vector" : wfn_name_ + " DIIS vector";
+    }
+
+    /// Generate unique orbital filename incorporating wfn_name_ for file isolation
+    /// If wfn_name_ is empty: returns base (backward compatible)
+    /// If wfn_name_ is set: inserts before extension (e.g., "orbs.dat" → "orbs_wfn_0.dat")
+    std::string get_orbitals_filename(const std::string& base) const;
+
     /// The JK object (or null if it has been deleted)
     std::shared_ptr<JK> jk() const { return jk_; }
 
@@ -314,6 +361,54 @@ class HF : public Wavefunction {
     /// Returns the occupation vectors
     std::shared_ptr<Vector> occupation_a() const;
     std::shared_ptr<Vector> occupation_b() const;
+
+    /// Returns the number of states this theory handles
+    /// RHF: 1 (closed-shell)
+    /// UHF: 2 (alpha, beta)
+    /// ROHF: 2 (alpha, beta with different occupations)
+    /// Multi-state methods: N (multiple electronic states)
+    virtual int n_states() const { return 1; }
+
+    /// Returns list of orbital matrices for multi-cycle JK computation
+    /// Used by Python multi_scf() to collect C matrices
+    /// IMPORTANT: Returns ONLY OCCUPIED orbitals, not full C matrix
+    /// RHF: returns {Ca_occ}
+    /// UHF: returns {Ca_occ, Cb_occ}
+    /// ROHF: returns {Cdocc, Csocc}
+    /// Multi-state: returns {C_state0_occ, C_state1_occ, ..., C_stateN_occ}
+    ///
+    /// Implements mutable cache to avoid repeated deep copies of orbital matrices
+    /// Cache invalidated by: form_C(), SOSCF, MOM, FRAC
+    virtual std::vector<SharedMatrix> get_orbital_matrices() const {
+        // Fast path: return cached matrices if valid (typical for converged wfn)
+        // This is the common case after wavefunction convergence
+        if (orbital_cache_valid_) {
+            return cached_orbital_matrices_;
+        }
+
+        // Slow path: compute, cache, and return
+        // This executes on first call and after any orbital modification
+        // RHF default: single alpha occupied orbital matrix
+        cached_orbital_matrices_ = {Ca_subset("SO", "OCC")};
+        orbital_cache_valid_ = true;
+        return cached_orbital_matrices_;
+    }
+
+    /// Sets pre-computed J/K/wK matrices for multi-cycle JK computation
+    /// Used by Python multi_scf() to distribute shared JK results
+    /// After calling this, form_G() should use these matrices instead of computing new ones
+    /// @param J_list: List of J matrices (length = n_states())
+    /// @param K_list: List of K matrices (length = n_states())
+    /// @param wK_list: List of long-range K matrices (length = n_states(), empty if not LRC functional)
+    virtual void set_jk_matrices(const std::vector<SharedMatrix>& J_list,
+                                  const std::vector<SharedMatrix>& K_list,
+                                  const std::vector<SharedMatrix>& wK_list = std::vector<SharedMatrix>()) {
+        // Store pre-computed J/K/wK and enable flag for form_G() to use them
+        precomputed_J_ = J_list;
+        precomputed_K_ = K_list;
+        precomputed_wK_ = wK_list;
+        use_precomputed_jk_ = true;
+    }
 
     /// Save the current density and energy.
     virtual void save_density_and_energy();

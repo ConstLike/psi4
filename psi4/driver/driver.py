@@ -540,6 +540,12 @@ def energy(name, **kwargs):
 
     if return_wfn:  # TODO current energy safer than wfn.energy() for now, but should be revisited
 
+        # Multi-wfn mode: wfn is (min_energy, wfn_collection) tuple from run_scf(wfns=...)
+        if isinstance(wfn, tuple) and len(wfn) == 2:
+            min_energy, wfn_collection = wfn
+            core.set_variable('CURRENT ENERGY', min_energy)
+            return (min_energy, wfn_collection)
+
         # TODO place this with the associated call, very awkward to call this in other areas at the moment
         if lowername in ['efp', 'mrcc', 'dmrg']:
             core.print_out("\n\nWarning! %s does not have an associated derived wavefunction." % name)
@@ -550,6 +556,12 @@ def energy(name, **kwargs):
 
         return (core.variable('CURRENT ENERGY'), wfn)
     else:
+        # Multi-wfn mode without return_wfn
+        if isinstance(wfn, tuple) and len(wfn) == 2:
+            min_energy, _ = wfn
+            core.set_variable('CURRENT ENERGY', min_energy)
+            return min_energy
+
         return core.variable('CURRENT ENERGY')
 
 

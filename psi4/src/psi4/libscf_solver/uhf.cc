@@ -102,17 +102,27 @@ void UHF::common_init() {
     step_scale_ = options_.get_double("FOLLOW_STEP_SCALE");
     step_increment_ = options_.get_double("FOLLOW_STEP_INCREMENT");
 
-    Fa_ = SharedMatrix(factory_->create_matrix("F alpha"));
-    Fb_ = SharedMatrix(factory_->create_matrix("F beta"));
-    Da_ = SharedMatrix(factory_->create_matrix("SCF alpha density"));
-    Db_ = SharedMatrix(factory_->create_matrix("SCF beta density"));
+    // Multi-state matrix containers (n=2 for UHF: alpha/beta)
+    D_multi_ = std::make_shared<MultiStateMatrix>("D", 2, nirrep_, nsopi_, nsopi_, 0);
+    F_multi_ = std::make_shared<MultiStateMatrix>("F", 2, nirrep_, nsopi_, nsopi_, 0);
+    G_multi_ = std::make_shared<MultiStateMatrix>("G", 2, nirrep_, nsopi_, nsopi_, 0);
+
+    // Get matrix views
+    Da_ = D_multi_->get(0);  // Alpha density
+    Db_ = D_multi_->get(1);  // Beta density
+    Fa_ = F_multi_->get(0);  // Alpha Fock
+    Fb_ = F_multi_->get(1);  // Beta Fock
+    Ga_ = G_multi_->get(0);  // Alpha G matrix
+    Gb_ = G_multi_->get(1);  // Beta G matrix
+
+    // Old densities for DIIS
     Da_old_ = SharedMatrix(factory_->create_matrix("Old alpha SCF density"));
     Db_old_ = SharedMatrix(factory_->create_matrix("Old beta SCF density"));
+
+    // Other matrices
     Lagrangian_ = SharedMatrix(factory_->create_matrix("Lagrangian"));
     Ca_ = SharedMatrix(factory_->create_matrix("alpha MO coefficients (C)"));
     Cb_ = SharedMatrix(factory_->create_matrix("beta MO coefficients (C)"));
-    Ga_ = SharedMatrix(factory_->create_matrix("G alpha"));
-    Gb_ = SharedMatrix(factory_->create_matrix("G beta"));
     Va_ = SharedMatrix(factory_->create_matrix("V alpha"));
     Vb_ = SharedMatrix(factory_->create_matrix("V beta"));
     J_ = SharedMatrix(factory_->create_matrix("J total"));
@@ -191,27 +201,49 @@ void UHF::form_G() {
         Gb_->zero();
     }
 
-    // Push the C matrix on
-    std::vector<SharedMatrix>& C = jk_->C_left();
-    C.clear();
-    C.push_back(Ca_subset("SO", "OCC"));
-    C.push_back(Cb_subset("SO", "OCC"));
-    // Run the JK object
-    jk_->compute();
-    // Pull the J and K matrices off
-    const std::vector<SharedMatrix>& J = jk_->J();
-    const std::vector<SharedMatrix>& K = jk_->K();
-    const std::vector<SharedMatrix>& wK = jk_->wK();
-    J_->copy(J[0]);
-    J_->add(J[1]);
-    if (functional_->is_x_hybrid()) {
-        Ka_ = K[0];
-        Kb_ = K[1];
+    // Multi-cycle JK: use pre-computed J/K/wK if available
+    if (use_precomputed_jk_) {
+        // Python multi_scf() provided pre-computed J/K/wK
+        // UHF has 2 states: J[0] for alpha, J[1] for beta
+        J_->copy(precomputed_J_[0]);
+        J_->add(precomputed_J_[1]);  // Total J = J_alpha + J_beta
+        if (functional_->is_x_hybrid()) {
+            Ka_ = precomputed_K_[0];
+            Kb_ = precomputed_K_[1];
+        }
+        if (functional_->is_x_lrc()) {
+            if (!precomputed_wK_.empty() && precomputed_wK_.size() >= 2) {
+                wKa_ = precomputed_wK_[0];
+                wKb_ = precomputed_wK_[1];
+            } else {
+                throw PSIEXCEPTION("LRC functional requires wK matrices in multi_scf()");
+            }
+        }
+    } else {
+        // Normal path: compute J/K using JK builder
+        // Push the C matrix on
+        std::vector<SharedMatrix>& C = jk_->C_left();
+        C.clear();
+        C.push_back(Ca_subset("SO", "OCC"));
+        C.push_back(Cb_subset("SO", "OCC"));
+        // Run the JK object
+        jk_->compute();
+        // Pull the J and K matrices off
+        const std::vector<SharedMatrix>& J = jk_->J();
+        const std::vector<SharedMatrix>& K = jk_->K();
+        const std::vector<SharedMatrix>& wK = jk_->wK();
+        J_->copy(J[0]);
+        J_->add(J[1]);
+        if (functional_->is_x_hybrid()) {
+            Ka_ = K[0];
+            Kb_ = K[1];
+        }
+        if (functional_->is_x_lrc()) {
+            wKa_ = wK[0];
+            wKb_ = wK[1];
+        }
     }
-    if (functional_->is_x_lrc()) {
-        wKa_ = wK[0];
-        wKb_ = wK[1];
-    }
+
     Ga_->add(J_);
     Gb_->add(J_);
 
@@ -320,11 +352,14 @@ void UHF::form_C(double shift) {
         Ca_->print("outfile");
         Cb_->print("outfile");
     }
+
+    // Phase 1.8: Invalidate orbital cache after orbitals updated
+    orbital_cache_valid_ = false;
 }
 
 void UHF::form_D() {
-    Da_->zero();
-    Db_->zero();
+    // Zero all density matrices
+    D_multi_->zero_all();
 
     for (int h = 0; h < nirrep_; ++h) {
         int nso = nsopi_[h];
@@ -339,6 +374,7 @@ void UHF::form_D() {
         double** Da = Da_->pointer(h);
         double** Db = Db_->pointer(h);
 
+        // DGEMM writes directly to Matrix storage
         C_DGEMM('N', 'T', nso, nso, na, 1.0, Ca[0], nmo, Ca[0], nmo, 0.0, Da[0], nso);
         C_DGEMM('N', 'T', nso, nso, nb, 1.0, Cb[0], nmo, Cb[0], nmo, 0.0, Db[0], nso);
     }
@@ -851,7 +887,8 @@ std::vector<SharedMatrix> UHF::cphf_solve(std::vector<SharedMatrix> x_vec, doubl
     // => Header <= //
     if (print_lvl) {
         outfile->Printf("\n");
-        outfile->Printf("   ==> Coupled-Perturbed %s Solver <==\n\n", options_.get_str("REFERENCE").c_str());
+        // Use class name() instead of global REFERENCE option for correct multi-SCF output
+        outfile->Printf("   ==> Coupled-Perturbed %s Solver <==\n\n", name().c_str());
         outfile->Printf("    Maxiter             = %11d\n", max_iter);
         outfile->Printf("    Convergence         = %11.3E\n", conv_tol);
         outfile->Printf("    Number of equations = %11ld\n", x_vec.size());
@@ -1088,6 +1125,9 @@ int UHF::soscf_update(double soscf_conv, int soscf_min_iter, int soscf_max_iter,
     // => Rotate orbitals <= //
     rotate_orbitals(Ca_, ret_x[0]);
     rotate_orbitals(Cb_, ret_x[1]);
+
+    // Phase 1.8: Invalidate orbital cache after orbital rotation
+    orbital_cache_valid_ = false;
 
     return cphf_nfock_builds_;
 }
@@ -1496,7 +1536,8 @@ void UHF::openorbital_scf() {
   };
 
   std::function<void(const std::map<std::string,std::any> &)> callback_function = [&](const std::map<std::string,std::any> & data) {
-    std::string reference = options_.get_str("REFERENCE");
+    // Use class name() instead of global REFERENCE option for correct multi-SCF output
+    std::string reference = name();
     if(options_.get_str("SCF_TYPE").ends_with("DF"))
       reference = "DF-" + reference;
 

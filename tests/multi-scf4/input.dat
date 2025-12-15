@@ -1,0 +1,46 @@
+#! Multi-SCF test: DFT with B3LYP functional
+#! Tests RKS and UKS wavefunctions with hybrid DFT
+
+import psi4
+from psi4.driver.procrouting.proc import scf_wavefunction_factory
+from psi4.driver.procrouting.scf_proc.scf_iterator import multi_scf
+
+# Reference values (from sequential DFT calculations with PK integrals)
+ref_rks_b3lyp_h2o = -76.4204414315  #TEST
+ref_uks_b3lyp_h2o = -76.4204414315  #TEST
+
+# Water molecule
+molecule h2o {
+0 1
+O
+H 1 0.96
+H 1 0.96 2 104.5
+symmetry c1
+}
+
+set {
+    basis cc-pvdz
+    scf_type pk
+    e_convergence 10
+    d_convergence 8
+}
+
+# Create base wavefunction
+wfn_base = psi4.core.Wavefunction.build(h2o, psi4.core.get_global_option('BASIS'))
+
+# Create RKS B3LYP wavefunction
+wfn_rks = scf_wavefunction_factory('b3lyp', wfn_base, 'RKS')
+wfn_rks.set_wfn_name("rks_b3lyp")
+
+# Create UKS B3LYP wavefunction
+wfn_uks = scf_wavefunction_factory('b3lyp', wfn_base, 'UKS')
+wfn_uks.set_wfn_name("uks_b3lyp")
+
+# Run multi_scf with both wavefunctions
+energies = multi_scf([wfn_rks, wfn_uks])
+
+compare_values(ref_rks_b3lyp_h2o, energies[0], 8, "RKS B3LYP H2O energy from multi_scf")  #TEST
+compare_values(ref_uks_b3lyp_h2o, energies[1], 8, "UKS B3LYP H2O energy from multi_scf")  #TEST
+
+# RKS and UKS should give same energy for closed-shell singlet
+compare_values(energies[0], energies[1], 10, "RKS vs UKS energies for closed-shell singlet")  #TEST

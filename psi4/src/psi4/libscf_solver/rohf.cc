@@ -71,20 +71,28 @@ ROHF::~ROHF() {}
 
 void ROHF::common_init() {
     name_ = "ROHF";
-    Fa_ = SharedMatrix(factory_->create_matrix("Alpha Fock Matrix"));
-    Fb_ = SharedMatrix(factory_->create_matrix("Beta Fock Matrix"));
+
+    // Multi-state matrix containers (n=2 for ROHF: alpha/beta)
+    D_multi_ = std::make_shared<MultiStateMatrix>("D", 2, nirrep_, nsopi_, nsopi_, 0);
+    F_multi_ = std::make_shared<MultiStateMatrix>("F", 2, nirrep_, nsopi_, nsopi_, 0);
+    G_multi_ = std::make_shared<MultiStateMatrix>("G", 2, nirrep_, nsopi_, nsopi_, 0);
+
+    // Get matrix views
+    Da_ = D_multi_->get(0);
+    Db_ = D_multi_->get(1);
+    Fa_ = F_multi_->get(0);
+    Fb_ = F_multi_->get(1);
+    Ga_ = G_multi_->get(0);
+    Gb_ = G_multi_->get(1);
+
     moFeff_ = SharedMatrix(factory_->create_matrix("F effective (MO basis)"));
     soFeff_ = SharedMatrix(factory_->create_matrix("F effective (orthogonalized SO basis)"));
     Ct_ = SharedMatrix(factory_->create_matrix("Orthogonalized Molecular orbitals"));
     Ca_ = SharedMatrix(factory_->create_matrix("MO coefficients (C)"));
     Cb_ = Ca_;
-    Da_ = SharedMatrix(factory_->create_matrix("SCF alpha density"));
-    Db_ = SharedMatrix(factory_->create_matrix("SCF beta density"));
     Lagrangian_ = SharedMatrix(factory_->create_matrix("Lagrangian matrix"));
     Ka_ = SharedMatrix(factory_->create_matrix("K alpha"));
     Kb_ = SharedMatrix(factory_->create_matrix("K beta"));
-    Ga_ = SharedMatrix(factory_->create_matrix("G alpha"));
-    Gb_ = SharedMatrix(factory_->create_matrix("G beta"));
     Dt_ = SharedMatrix(factory_->create_matrix("Total SCF density"));
     Dt_old_ = SharedMatrix(factory_->create_matrix("Old total SCF density"));
     Da_old_ = SharedMatrix(factory_->create_matrix("Old alpha SCF density"));
@@ -271,8 +279,12 @@ void ROHF::finalize() {
     moFeff_.reset();
     Ka_.reset();
     Kb_.reset();
-    Ga_.reset();
-    Gb_.reset();
+
+    // Reset multi-state matrix containers
+    D_multi_.reset();
+    F_multi_.reset();
+    G_multi_.reset();
+
     Da_old_.reset();
     Db_old_.reset();
     Dt_old_.reset();
@@ -415,6 +427,9 @@ void ROHF::form_C(double shift) {
         outfile->Printf("In ROHF::form_C:\n");
         Ct_->eivprint(epsilon_a_);
     }
+
+    // Phase 1.8: Invalidate orbital cache after orbitals updated
+    orbital_cache_valid_ = false;
 }
 
 void ROHF::prepare_canonical_orthogonalization() {
@@ -449,8 +464,8 @@ void ROHF::form_initial_C() {
 }
 
 void ROHF::form_D() {
-    Da_->zero();
-    Db_->zero();
+    // Zero all density matrices
+    D_multi_->zero_all();
 
     for (int h = 0; h < nirrep_; ++h) {
         int nso = nsopi_[h];
@@ -461,8 +476,8 @@ void ROHF::form_D() {
         if (nso == 0 || nmo == 0) continue;
 
         auto Ca = Ca_->pointer(h);
-        auto Da = Da_->pointer(h);
-        auto Db = Db_->pointer(h);
+        auto Da = Da_->pointer(h);  // View into D_multi_
+        auto Db = Db_->pointer(h);  // View into D_multi_
 
         C_DGEMM('N', 'T', nso, nso, na, 1.0, Ca[0], nmo, Ca[0], nmo, 0.0, Da[0], nso);
         C_DGEMM('N', 'T', nso, nso, nb, 1.0, Ca[0], nmo, Ca[0], nmo, 0.0, Db[0], nso);
@@ -921,6 +936,9 @@ int ROHF::soscf_update(double soscf_conv, int soscf_min_iter, int soscf_max_iter
     rotate_orbitals(Ca_, x);
     rotate_orbitals(Ct_, x);
 
+    // Phase 1.8: Invalidate orbital cache after orbital rotation
+    orbital_cache_valid_ = false;
+
     // // => Cleanup <= //
     Precon.reset();
     Gradient.reset();
@@ -935,34 +953,57 @@ int ROHF::soscf_update(double soscf_conv, int soscf_min_iter, int soscf_max_iter
 void ROHF::form_G() {
     Dimension dim_zero(nirrep_, "Zero Dim");
 
-    auto& C = jk_->C_left();
-    C.clear();
+    // Multi-cycle JK: use pre-computed J/K/wK if available
+    if (use_precomputed_jk_) {
+        // Python multi_scf() provided pre-computed J/K/wK
+        // ROHF has 2 states: J[0] for docc, J[1] for socc
+        Ga_->copy(precomputed_J_[0]);
+        Ga_->scale(2.0);
+        Ga_->add(precomputed_J_[1]);
 
-    // Push back docc orbitals
-    SharedMatrix Cdocc = Ca_->get_block({dim_zero, nsopi_}, {dim_zero, nbetapi_});
-    C.push_back(Cdocc);
+        Ka_->copy(precomputed_K_[0]);
+        Ka_->add(precomputed_K_[1]);
+        Kb_ = precomputed_K_[0];
 
-    // Push back socc orbitals
-    SharedMatrix Csocc = Ca_->get_block({dim_zero, nsopi_}, {nbetapi_, nalphapi_});
-    C.push_back(Csocc);
+        Gb_->copy(Ga_);
+        Ga_->subtract(Ka_);
+        Gb_->subtract(Kb_);
 
-    // Run the JK object
-    jk_->compute();
+        // Note: ROHF does not support LRC functionals (no wKa_/wKb_ members)
+        if (functional_->is_x_lrc()) {
+            throw PSIEXCEPTION("ROHF does not support LRC functionals in multi_scf()");
+        }
+    } else {
+        // Normal path: compute J/K using JK builder
+        auto& C = jk_->C_left();
+        C.clear();
 
-    // Pull the J and K matrices off
-    const std::vector<SharedMatrix>& J = jk_->J();
-    const std::vector<SharedMatrix>& K = jk_->K();
-    Ga_->copy(J[0]);
-    Ga_->scale(2.0);
-    Ga_->add(J[1]);
+        // Push back docc orbitals
+        SharedMatrix Cdocc = Ca_->get_block({dim_zero, nsopi_}, {dim_zero, nbetapi_});
+        C.push_back(Cdocc);
 
-    Ka_->copy(K[0]);
-    Ka_->add(K[1]);
-    Kb_ = K[0];
+        // Push back socc orbitals
+        SharedMatrix Csocc = Ca_->get_block({dim_zero, nsopi_}, {nbetapi_, nalphapi_});
+        C.push_back(Csocc);
 
-    Gb_->copy(Ga_);
-    Ga_->subtract(Ka_);
-    Gb_->subtract(Kb_);
+        // Run the JK object
+        jk_->compute();
+
+        // Pull the J and K matrices off
+        const std::vector<SharedMatrix>& J = jk_->J();
+        const std::vector<SharedMatrix>& K = jk_->K();
+        Ga_->copy(J[0]);
+        Ga_->scale(2.0);
+        Ga_->add(J[1]);
+
+        Ka_->copy(K[0]);
+        Ka_->add(K[1]);
+        Kb_ = K[0];
+
+        Gb_->copy(Ga_);
+        Ga_->subtract(Ka_);
+        Gb_->subtract(Kb_);
+    }
 }
 
 bool ROHF::stability_analysis() {

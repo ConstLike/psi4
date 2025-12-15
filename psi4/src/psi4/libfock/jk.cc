@@ -360,22 +360,30 @@ void JK::allocate_JK() {
     }
 
     if (!same) {
+        const size_t n_matrices = D_.size();
+
         J_.clear();
         K_.clear();
         wK_.clear();
-        for (size_t N = 0; N < D_.size() && do_J_; ++N) {
+
+        // Reserve capacity based on enabled matrices
+        if (do_J_) J_.reserve(n_matrices);
+        if (do_K_) K_.reserve(n_matrices);
+        if (do_wK_) wK_.reserve(n_matrices);
+
+        for (size_t N = 0; N < n_matrices && do_J_; ++N) {
             std::stringstream s;
             s << "J " << N << " (SO)";
             J_.push_back(std::make_shared<Matrix>(s.str(), D_[N]->nirrep(), D_[N]->rowspi(), D_[N]->rowspi(),
                                                   D_[N]->symmetry()));
         }
-        for (size_t N = 0; N < D_.size() && do_K_; ++N) {
+        for (size_t N = 0; N < n_matrices && do_K_; ++N) {
             std::stringstream s;
             s << "K " << N << " (SO)";
             K_.push_back(std::make_shared<Matrix>(s.str(), D_[N]->nirrep(), D_[N]->rowspi(), D_[N]->rowspi(),
                                                   D_[N]->symmetry()));
         }
-        for (size_t N = 0; N < D_.size() && do_wK_; ++N) {
+        for (size_t N = 0; N < n_matrices && do_wK_; ++N) {
             std::stringstream s;
             s << "wK " << N << " (SO)";
             wK_.push_back(std::make_shared<Matrix>(s.str(), D_[N]->nirrep(), D_[N]->rowspi(), D_[N]->rowspi(),
@@ -398,27 +406,36 @@ void JK::USO2AO() {
     }
 
     if (J_ao_.size() != D_.size()) {
+        const size_t n_matrices = D_.size();
+        const int nao = AO2USO_->rowspi()[0];
+
         J_ao_.clear();
         K_ao_.clear();
         wK_ao_.clear();
         D_ao_.clear();
-        int nao = AO2USO_->rowspi()[0];
-        for (size_t N = 0; N < D_.size() && do_J_; ++N) {
+
+        // Reserve capacity based on enabled matrices
+        if (do_J_) J_ao_.reserve(n_matrices);
+        if (do_K_) K_ao_.reserve(n_matrices);
+        if (do_wK_) wK_ao_.reserve(n_matrices);
+        D_ao_.reserve(n_matrices);  // Always allocated
+
+        for (size_t N = 0; N < n_matrices && do_J_; ++N) {
             std::stringstream s;
             s << "J " << N << " (AO)";
             J_ao_.push_back(std::make_shared<Matrix>(s.str(), nao, nao));
         }
-        for (size_t N = 0; N < D_.size() && do_K_; ++N) {
+        for (size_t N = 0; N < n_matrices && do_K_; ++N) {
             std::stringstream s;
             s << "K " << N << " (AO)";
             K_ao_.push_back(std::make_shared<Matrix>(s.str(), nao, nao));
         }
-        for (size_t N = 0; N < D_.size() && do_wK_; ++N) {
+        for (size_t N = 0; N < n_matrices && do_wK_; ++N) {
             std::stringstream s;
             s << "wK " << N << " (AO)";
             wK_ao_.push_back(std::make_shared<Matrix>(s.str(), nao, nao));
         }
-        for (size_t N = 0; N < D_.size(); ++N) {
+        for (size_t N = 0; N < n_matrices; ++N) {
             std::stringstream s;
             s << "D " << N << " (AO)";
             D_ao_.push_back(std::make_shared<Matrix>(s.str(), nao, nao));
@@ -426,15 +443,20 @@ void JK::USO2AO() {
     }
 
     // Always reallocate C matrices, the occupations are tricky
+    const size_t n_matrices = D_.size();
+
     C_left_ao_.clear();
     C_right_ao_.clear();
-    for (size_t N = 0; N < D_.size(); ++N) {
+    C_left_ao_.reserve(n_matrices);
+    if (!lr_symmetric_) C_right_ao_.reserve(n_matrices);
+
+    for (size_t N = 0; N < n_matrices; ++N) {
         std::stringstream s;
         s << "C Left " << N << " (AO)";
         int ncol = C_left_[N]->colspi().sum();
         C_left_ao_.push_back(std::make_shared<Matrix>(s.str(), AO2USO_->rowspi()[0], ncol));
     }
-    for (size_t N = 0; (N < D_.size()) && (!lr_symmetric_); ++N) {
+    for (size_t N = 0; (N < n_matrices) && (!lr_symmetric_); ++N) {
         std::stringstream s;
         s << "C Right " << N << " (AO)";
         int ncol = C_right_[N]->colspi().sum();

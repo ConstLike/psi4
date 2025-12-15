@@ -32,6 +32,7 @@
 #include "psi4/libpsio/psio.hpp"
 #include "psi4/libfock/v.h"
 #include "hf.h"
+#include "multistate_matrix.h"
 
 namespace psi {
 namespace scf {
@@ -42,6 +43,11 @@ class UHF : public HF {
     SharedMatrix Ga_, Gb_, J_, Ka_, Kb_, wKa_, wKb_;
 
     std::shared_ptr<UV> potential_;
+
+    // Multi-state matrix containers (Da/Db, Fa/Fb, Ga/Gb)
+    std::shared_ptr<MultiStateMatrix> D_multi_;
+    std::shared_ptr<MultiStateMatrix> F_multi_;
+    std::shared_ptr<MultiStateMatrix> G_multi_;
 
     double compute_initial_E() override;
 
@@ -73,6 +79,24 @@ class UHF : public HF {
 
     virtual bool same_a_b_orbs() const { return false; }
     virtual bool same_a_b_dens() const { return false; }
+
+    /// UHF handles 2 states (alpha and beta spins)
+    int n_states() const override { return 2; }
+
+    /// Returns {Ca_occ, Cb_occ} for multi-cycle JK computation
+    /// IMPORTANT: Returns ONLY occupied orbitals
+    /// PERFORMANCE: Cached to avoid repeated deep copies (Phase 1.8 optimization)
+    std::vector<SharedMatrix> get_orbital_matrices() const override {
+        // Fast path: return cached if valid (common for converged wfn)
+        if (orbital_cache_valid_) {
+            return cached_orbital_matrices_;
+        }
+
+        // Slow path: UHF returns 2 matrices (alpha + beta occupied orbitals)
+        cached_orbital_matrices_ = {Ca_subset("SO", "OCC"), Cb_subset("SO", "OCC")};
+        orbital_cache_valid_ = true;
+        return cached_orbital_matrices_;
+    }
 
     void save_density_and_energy() override;
 

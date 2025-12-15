@@ -32,6 +32,7 @@
 #include <vector>
 #include "psi4/libpsio/psio.hpp"
 #include "hf.h"
+#include "multistate_matrix.h"
 
 namespace psi {
 class VBase;
@@ -39,6 +40,11 @@ namespace scf {
 
 class ROHF : public HF {
    protected:
+    // Multi-state matrix containers (Da/Db, Fa/Fb, Ga/Gb)
+    std::shared_ptr<MultiStateMatrix> D_multi_;
+    std::shared_ptr<MultiStateMatrix> F_multi_;
+    std::shared_ptr<MultiStateMatrix> G_multi_;
+
     SharedMatrix moFeff_;
     SharedMatrix soFeff_;
     SharedMatrix Dt_;
@@ -46,8 +52,8 @@ class ROHF : public HF {
     SharedMatrix Db_old_;
     SharedMatrix Dt_old_;
     SharedMatrix Ct_;
-    SharedMatrix Ga_;
-    SharedMatrix Gb_;
+    SharedMatrix Ga_;      // View into G_multi_->get(0)
+    SharedMatrix Gb_;      // View into G_multi_->get(1)
     SharedMatrix Ka_;
     SharedMatrix Kb_;
     SharedMatrix moFa_;
@@ -78,6 +84,29 @@ class ROHF : public HF {
     SharedMatrix moFa() const { return moFa_; }
     SharedMatrix moFb() const { return moFb_; }
     SharedMatrix Ct() const {return Ct_; }
+
+    /// ROHF handles 2 states (alpha and beta with different occupations)
+    int n_states() const override { return 2; }
+
+    /// Returns {Cdocc, Csocc} for multi-cycle JK computation
+    /// IMPORTANT: Returns ONLY occupied orbitals (docc and socc blocks)
+    /// PERFORMANCE: Cached to avoid repeated deep copies (Phase 1.8 optimization)
+    std::vector<SharedMatrix> get_orbital_matrices() const override {
+        // Fast path: return cached if valid (common for converged wfn)
+        if (orbital_cache_valid_) {
+            return cached_orbital_matrices_;
+        }
+
+        // Slow path: ROHF returns 2 matrices (docc + socc blocks)
+        // ROHF needs separate docc and socc blocks (same as form_G())
+        Dimension dim_zero(nirrep_, "Zero Dim");
+        SharedMatrix Cdocc = Ca_->get_block({dim_zero, nsopi_}, {dim_zero, nbetapi_});
+        SharedMatrix Csocc = Ca_->get_block({dim_zero, nsopi_}, {nbetapi_, nalphapi_});
+
+        cached_orbital_matrices_ = {Cdocc, Csocc};
+        orbital_cache_valid_ = true;
+        return cached_orbital_matrices_;
+    }
 
     void save_density_and_energy() override;
 

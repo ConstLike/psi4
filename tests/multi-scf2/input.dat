@@ -1,0 +1,48 @@
+#! Multi-SCF test: RHF singlet + UHF triplet on H2
+#! Tests simultaneous optimization of different spin states
+
+import psi4
+from psi4.driver.procrouting.proc import scf_wavefunction_factory
+from psi4.driver.procrouting.scf_proc.scf_iterator import multi_scf
+
+# Reference values (from sequential SCF calculations with PK integrals)
+ref_rhf_h2_singlet = -1.1287000936  #TEST
+ref_uhf_h2_triplet = -0.7662819412  #TEST
+
+# H2 molecule - we'll modify multiplicity for each wavefunction
+molecule h2 {
+0 1
+H 0 0 0
+H 0 0 0.74
+symmetry c1
+}
+
+set {
+    basis cc-pvdz
+    scf_type pk
+    e_convergence 10
+    d_convergence 8
+}
+
+# Create singlet wavefunction
+wfn_base_s = psi4.core.Wavefunction.build(h2, psi4.core.get_global_option('BASIS'))
+wfn_rhf = scf_wavefunction_factory('hf', wfn_base_s, 'RHF')
+wfn_rhf.set_wfn_name("rhf_singlet")
+
+# Modify molecule to triplet
+h2.set_multiplicity(3)
+
+# Create triplet wavefunction
+wfn_base_t = psi4.core.Wavefunction.build(h2, psi4.core.get_global_option('BASIS'))
+wfn_uhf = scf_wavefunction_factory('hf', wfn_base_t, 'UHF')
+wfn_uhf.set_wfn_name("uhf_triplet")
+
+# Run multi_scf with both wavefunctions
+energies = multi_scf([wfn_rhf, wfn_uhf])
+
+compare_values(ref_rhf_h2_singlet, energies[0], 8, "RHF H2 singlet energy from multi_scf")  #TEST
+compare_values(ref_uhf_h2_triplet, energies[1], 8, "UHF H2 triplet energy from multi_scf")  #TEST
+
+# Calculate singlet-triplet gap
+gap = (energies[1] - energies[0]) * 627.5095  # kcal/mol
+psi4.core.print_out(f"\n  S-T gap: {gap:.2f} kcal/mol\n")
