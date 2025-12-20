@@ -1462,7 +1462,7 @@ int read_options(const std::string &name, Options &options, bool suppress_printi
         options.add_str("WFN", "SCF", "SCF");
         /*- Reference wavefunction type.
         **Cfour Interface:** Keyword translates into |cfour__cfour_reference|. -*/
-        options.add_str("REFERENCE", "RHF", "RHF ROHF UHF CUHF RKS UKS");
+        options.add_str("REFERENCE", "RHF", "RHF ROHF UHF CUHF RKS UKS REKS");
         /*- Primary basis set -*/
         options.add_str("BASIS", "");
         /*- Auxiliary basis set for SCF density fitting computations.
@@ -1657,6 +1657,41 @@ int read_options(const std::string &name, Options &options, bool suppress_printi
         options.add_double("OOO_DIIS_RESTART_FACTOR", 1.0e-4);
         /*- For |globals__orbital_optimizer_package| = `OOO`, use optimal damping when max error bigger than this. -*/
         options.add_double("OOO_OPTIMAL_DAMPING_THRESHOLD", 1.0);
+
+        /*- SUBSECTION REKS (Restricted Ensemble Kohn-Sham) -*/
+
+        /*- Number of active electron pairs for REKS. 1 for REKS(2,2), 2 for REKS(4,4). -*/
+        options.add_int("REKS_PAIRS", 1);
+        /*- Orbital localization method for REKS active orbitals. -*/
+        options.add_str("REKS_LOCALIZATION", "NONE", "NONE BOYS");
+        /*- Iteration number after which to freeze localization. -*/
+        options.add_int("REKS_LOCALIZATION_FREEZE", 0);
+        /*- Do use line search for FON optimization. -*/
+        options.add_bool("REKS_LINE_SEARCH", true);
+        /*- Threshold for SHAKE/rotation convergence in REKS. -*/
+        options.add_double("REKS_SHAKE_THRESHOLD", 1e-6);
+        /*- Threshold for coupling (Wrs) to be considered significant. -*/
+        options.add_double("REKS_COUPLING_THRESHOLD", 0.0);
+        /*- Maximum allowed change in FON per iteration. -*/
+        options.add_double("REKS_FON_MAX_DELTA", 2.0);
+        /*- Initial value for n_a (REKS(4,4)), -1 means automatic. -*/
+        options.add_double("REKS_INITIAL_NA", -1.0);
+        /*- Initial value for n_b (REKS(4,4)), -1 means automatic. -*/
+        options.add_double("REKS_INITIAL_NB", -1.0);
+        /*- Do use trust region for REKS(4,4) FON optimization. -*/
+        options.add_bool("REKS_USE_TRUST_REGION", false);
+        /*- Do use multi-start optimization with different initial FON. -*/
+        options.add_bool("REKS_MULTI_START", false);
+        /*- Criterion for selecting between branches in multi-start. -*/
+        options.add_str("REKS_BRANCH_CRITERION", "AUTO", "AUTO ENERGY DIABATIC");
+        /*- Energy tolerance for considering branches equivalent. -*/
+        options.add_double("REKS_ENERGY_TOLERANCE", 0.01);
+        /*- Do report all found solutions in multi-start. -*/
+        options.add_bool("REKS_REPORT_ALL_SOLUTIONS", false);
+        /*- FON solver level: 0=simple, 1=Newton, 2=advanced. -*/
+        options.add_int("FON_SOLVER", 2);
+        /*- Do enforce symmetry in REKS active space. -*/
+        options.add_bool("REKS_ENFORCE_SYMMETRY", false);
 
         /*- SUBSECTION Fractional Occupation UHF/UKS -*/
 

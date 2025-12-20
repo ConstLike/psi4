@@ -854,7 +854,7 @@ void HF::print_orbitals() {
     outfile->Printf("    Orbital Energies [Eh]\n    ---------------------\n\n");
 
     std::string reference = options_.get_str("REFERENCE");
-    if ((reference == "RHF") || (reference == "RKS")) {
+    if ((reference == "RHF") || (reference == "RKS") || (reference == "REKS")) {
         std::vector<std::pair<double, std::pair<std::string, int> > > occ;
         std::vector<std::pair<double, std::pair<std::string, int> > > vir;
 

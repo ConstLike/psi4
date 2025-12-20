@@ -3,6 +3,8 @@ list(APPEND sources
   frac.cc
   hf.cc
   mom.cc
+  reks.cc
+  reks_active_space.cc
   rhf.cc
   rohf.cc
   sad.cc
