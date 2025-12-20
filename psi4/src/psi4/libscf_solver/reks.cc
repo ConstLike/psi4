@@ -468,49 +468,29 @@ void REKS::build_microstate_focks() {
     // [0..n_base-1]: base densities
     // [n_base]: RHF occupied for G_
 
-    // Support for multi_scf(): use precomputed J/K if available
-    std::vector<SharedMatrix> J_vec, K_vec, wK_vec;
+    std::vector<SharedMatrix>& C_left = jk_->C_left();
+    std::vector<SharedMatrix>& C_right = jk_->C_right();
+    C_left.clear();
+    C_right.clear();
 
-    if (use_precomputed_jk_base_ && !precomputed_J_base_.empty()) {
-        // Use precomputed J/K from multi_scf shared JK
-        if (reks_debug_ >= 1) {
-            outfile->Printf("  build_microstate_focks: using precomputed J/K from multi_scf\n");
-        }
-        J_vec = precomputed_J_base_;
-        K_vec = precomputed_K_base_;
+    for (int p = 0; p < n_base; ++p) {
+        C_left.push_back(C_base_[p]);
+    }
+    C_left.push_back(C_occ);  // Last one for RHF G_
 
-        // Use precomputed wK for LRC functionals
-        if (functional_->is_x_lrc() && !precomputed_wK_base_.empty()) {
-            wK_vec = precomputed_wK_base_;
-        }
+    jk_->compute();
 
-        // Reset flag for next iteration
-        use_precomputed_jk_base_ = false;
-    } else {
-        // Normal path: compute J/K using JK builder
-        std::vector<SharedMatrix>& C_left = jk_->C_left();
-        std::vector<SharedMatrix>& C_right = jk_->C_right();
-        C_left.clear();
-        C_right.clear();
+    // Copy references to results
+    const std::vector<SharedMatrix>& J_ref = jk_->J();
+    const std::vector<SharedMatrix>& K_ref = jk_->K();
+    std::vector<SharedMatrix> J_vec(J_ref.begin(), J_ref.end());
+    std::vector<SharedMatrix> K_vec(K_ref.begin(), K_ref.end());
 
-        for (int p = 0; p < n_base; ++p) {
-            C_left.push_back(C_base_[p]);
-        }
-        C_left.push_back(C_occ);  // Last one for RHF G_
-
-        jk_->compute();
-
-        // Copy references to results
-        const std::vector<SharedMatrix>& J_ref = jk_->J();
-        const std::vector<SharedMatrix>& K_ref = jk_->K();
-        J_vec.assign(J_ref.begin(), J_ref.end());
-        K_vec.assign(K_ref.begin(), K_ref.end());
-
-        // Get wK for LRC (long-range corrected) functionals
-        if (functional_->is_x_lrc()) {
-            const std::vector<SharedMatrix>& wK_ref = jk_->wK();
-            wK_vec.assign(wK_ref.begin(), wK_ref.end());
-        }
+    // Get wK for LRC (long-range corrected) functionals
+    std::vector<SharedMatrix> wK_vec;
+    if (functional_->is_x_lrc()) {
+        const std::vector<SharedMatrix>& wK_ref = jk_->wK();
+        wK_vec.assign(wK_ref.begin(), wK_ref.end());
     }
 
     // Handle special case: pattern 0 with Ncore=0 may have garbage
@@ -3865,119 +3845,8 @@ void REKS::print_SI_energies() const {
 }
 
 // ============================================================================
-// multi_scf() Interface Implementation
+// Utility Methods
 // ============================================================================
-
-int REKS::n_states() const {
-    // REKS needs n_base + 1 J/K matrices:
-    // - n_base matrices for base density patterns (0..n_base-1)
-    // - 1 matrix for RHF density (used for G_ and DIIS)
-    if (!active_space_) {
-        return 1;  // Not initialized yet, return default
-    }
-    return active_space_->n_base_densities() + 1;
-}
-
-std::vector<SharedMatrix> REKS::get_orbital_matrices() const {
-    // Return all C matrices needed for JK computation:
-    // C_base_[0..n_base-1] + C_occ (RHF occupied orbitals)
-    //
-    // Note: C_base_ matrices are populated in build_microstate_focks()
-    // which runs AFTER get_orbital_matrices() is called by multi_scf.
-    // So we need to populate them here based on current Ca_.
-
-    if (!active_space_) {
-        // Not initialized - return RHF default
-        return {Ca_subset("SO", "OCC")};
-    }
-
-    int n_base = active_space_->n_base_densities();
-    int n_active = active_space_->n_orbitals();
-    int nso = nsopi_[0];
-
-    std::vector<SharedMatrix> result;
-    result.reserve(n_base + 1);
-
-    double** Cp = Ca_->pointer(0);
-
-    // Populate C matrices for each base density pattern
-    for (int p = 0; p < n_base; ++p) {
-        int n_occ_in_pattern = __builtin_popcount(p);
-        int n_cols = std::max(1, Ncore_ + n_occ_in_pattern);
-
-        auto C_p = std::make_shared<Matrix>("C_base_" + std::to_string(p), nso, n_cols);
-        double** C_ptr = C_p->pointer(0);
-
-        int col = 0;
-
-        // Copy core orbitals first
-        for (int mu = 0; mu < nso; ++mu) {
-            for (int k = 0; k < Ncore_; ++k) {
-                C_ptr[mu][col + k] = Cp[mu][k];
-            }
-        }
-        col = Ncore_;
-
-        // Add active orbitals based on pattern bits
-        for (int i = 0; i < n_active; ++i) {
-            if (p & (1 << i)) {
-                int mo_idx = active_mo_indices_[i];
-                for (int mu = 0; mu < nso; ++mu) {
-                    C_ptr[mu][col] = Cp[mu][mo_idx];
-                }
-                col++;
-            }
-        }
-
-        // Handle special case: Ncore=0 with pattern 0 (empty density)
-        if (Ncore_ == 0 && p == 0) {
-            C_p->zero();
-        }
-
-        result.push_back(C_p);
-    }
-
-    // Add RHF occupied orbitals (last entry)
-    result.push_back(Ca_subset("SO", "OCC"));
-
-    return result;
-}
-
-void REKS::set_jk_matrices(const std::vector<SharedMatrix>& J_list,
-                           const std::vector<SharedMatrix>& K_list,
-                           const std::vector<SharedMatrix>& wK_list) {
-    // Store precomputed J/K matrices for use in build_microstate_focks()
-    //
-    // Expected layout (matching get_orbital_matrices()):
-    // - J_list[0..n_base-1]: J matrices for base density patterns
-    // - J_list[n_base]: J matrix for RHF density
-    // Same for K_list.
-
-    if (!active_space_) {
-        return;
-    }
-
-    int n_base = active_space_->n_base_densities();
-    int expected_size = n_base + 1;
-
-    if (static_cast<int>(J_list.size()) != expected_size ||
-        static_cast<int>(K_list.size()) != expected_size) {
-        throw PSIEXCEPTION("REKS::set_jk_matrices: expected " + std::to_string(expected_size) +
-                           " J/K matrices, got " + std::to_string(J_list.size()));
-    }
-
-    // Store precomputed matrices for REKS base densities
-    precomputed_J_base_ = J_list;
-    precomputed_K_base_ = K_list;
-    use_precomputed_jk_base_ = true;
-
-    // Store wK for base densities (LRC functionals)
-    precomputed_wK_base_ = wK_list;
-
-    if (reks_debug_ >= 1) {
-        outfile->Printf("  REKS::set_jk_matrices: received %d J/K matrices\n", expected_size);
-    }
-}
 
 std::shared_ptr<REKS> REKS::c1_deep_copy(std::shared_ptr<BasisSet> basis) {
     // Create base wavefunction copy
