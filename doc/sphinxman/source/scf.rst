@@ -1462,29 +1462,38 @@ the ``multi_scf`` function accepts pre-configured wavefunction objects::
 Performance
 ^^^^^^^^^^^
 
-Multi-SCF reduces computation time by sharing the JK integral engine across
-all wavefunctions. The time savings depend on system size, number of wavefunctions,
-and SCF type. Fock matrix construction is batched when possible.
+Multi-SCF reduces computation time by sharing J/K integral computation across
+all wavefunctions. All C matrices are collected and processed in a single
+``jk.compute()`` call per iteration, eliminating redundant integral work.
+The time savings scale with system size and number of wavefunctions.
 
 Supported References
 ^^^^^^^^^^^^^^^^^^^^
 
 - RHF, UHF, ROHF (Hartree-Fock)
-- RKS, UKS, ROKS (DFT with any functional)
+- RKS, UKS, ROKS (DFT)
 
 Compatibility Requirements
 ^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 All wavefunctions in a multi-SCF batch must share:
 
-- The same DFT functional (or all must be pure HF)
 - The same orbital basis set
 - The same |globals__scf_type| (PK, DIRECT, DF)
 - Compatible auxiliary basis sets (for DF)
 
-.. note:: Multi-SCF uses the CORE initial guess by default for batch optimization.
-   You can override this with ``'guess': 'SAD'`` in each wavefunction spec if needed.
-   Note that SAD guess may converge to different local minima for open-shell systems.
+**Functional mixing rules:**
+
+- Hybrid functionals (B3LYP, PBE0, etc.) can be mixed freely
+- Pure DFT functionals can be mixed (but no speedup from shared JK since only J is needed)
+- Range-separated (LRC) functionals require the **same omega parameter**
+  (e.g., wB97X-V cannot be mixed with CAM-B3LYP due to different omega values)
+- LRC and non-LRC functionals cannot be mixed (different JK capabilities)
+
+.. note:: The default |scf__guess| is AUTO (SAD for molecules, CORE for atoms).
+   For ROHF, consider using ``'guess': 'SADNO'`` as SAD density-based guess does
+   not produce proper orbitals for open-shell systems. See :ref:`sec:scfguess` for
+   details on guess options.
 
 .. _`sec:scfrec`:
 

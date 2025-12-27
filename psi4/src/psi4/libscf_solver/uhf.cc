@@ -352,8 +352,6 @@ void UHF::form_C(double shift) {
         Ca_->print("outfile");
         Cb_->print("outfile");
     }
-
-    // Phase 1.8: Invalidate orbital cache after orbitals updated
     orbital_cache_valid_ = false;
 }
 
@@ -374,7 +372,6 @@ void UHF::form_D() {
         double** Da = Da_->pointer(h);
         double** Db = Db_->pointer(h);
 
-        // DGEMM writes directly to Matrix storage
         C_DGEMM('N', 'T', nso, nso, na, 1.0, Ca[0], nmo, Ca[0], nmo, 0.0, Da[0], nso);
         C_DGEMM('N', 'T', nso, nso, nb, 1.0, Cb[0], nmo, Cb[0], nmo, 0.0, Db[0], nso);
     }
@@ -887,7 +884,7 @@ std::vector<SharedMatrix> UHF::cphf_solve(std::vector<SharedMatrix> x_vec, doubl
     // => Header <= //
     if (print_lvl) {
         outfile->Printf("\n");
-        // Use class name() instead of global REFERENCE option for correct multi-SCF output
+        // In multi-SCF, wfn type may differ from global REFERENCE option
         outfile->Printf("   ==> Coupled-Perturbed %s Solver <==\n\n", name().c_str());
         outfile->Printf("    Maxiter             = %11d\n", max_iter);
         outfile->Printf("    Convergence         = %11.3E\n", conv_tol);
@@ -1125,8 +1122,6 @@ int UHF::soscf_update(double soscf_conv, int soscf_min_iter, int soscf_max_iter,
     // => Rotate orbitals <= //
     rotate_orbitals(Ca_, ret_x[0]);
     rotate_orbitals(Cb_, ret_x[1]);
-
-    // Phase 1.8: Invalidate orbital cache after orbital rotation
     orbital_cache_valid_ = false;
 
     return cphf_nfock_builds_;
@@ -1536,7 +1531,7 @@ void UHF::openorbital_scf() {
   };
 
   std::function<void(const std::map<std::string,std::any> &)> callback_function = [&](const std::map<std::string,std::any> & data) {
-    // Use class name() instead of global REFERENCE option for correct multi-SCF output
+    // In multi-SCF, wfn type may differ from global REFERENCE option
     std::string reference = name();
     if(options_.get_str("SCF_TYPE").ends_with("DF"))
       reference = "DF-" + reference;

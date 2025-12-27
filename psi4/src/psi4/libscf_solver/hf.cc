@@ -538,7 +538,7 @@ void HF::print_header() {
     outfile->Printf("                                   SCF\n");
     outfile->Printf("               by Justin Turney, Rob Parrish, Andy Simmonett\n");
     outfile->Printf("                          and Daniel G. A. Smith\n");
-    // Use class name() instead of global REFERENCE option for correct multi-SCF output
+    // In multi-SCF, wfn type may differ from global REFERENCE option
     outfile->Printf("                             %4s Reference\n", name().c_str());
     outfile->Printf("                      %3d Threads, %6ld MiB Core\n", nthread, memory_ / 1048576L);
     outfile->Printf("         ---------------------------------------------------------\n");
@@ -894,7 +894,7 @@ void HF::print_orbitals() {
 
     outfile->Printf("    Orbital Energies [Eh]\n    ---------------------\n\n");
 
-    // Use class name() instead of global REFERENCE option for correct multi-SCF output
+    // In multi-SCF, wfn type may differ from global REFERENCE option
     std::string reference = name();
     if ((reference == "RHF") || (reference == "RKS")) {
         std::vector<std::pair<double, std::pair<std::string, int> > > occ;
@@ -1065,7 +1065,7 @@ void HF::guess() {
     if (guess_Ca_) {
         if (print_) outfile->Printf("  SCF Guess: Orbitals guess was supplied from a previous computation.\n\n");
 
-        // Use class name() instead of global REFERENCE option for correct multi-SCF behavior
+        // In multi-SCF, wfn type may differ from global REFERENCE option
         std::string reference = name();
         bool single_orb = (reference == "RHF");
 
@@ -1324,7 +1324,7 @@ void HF::check_phases() {
 
 void HF::print_occupation() {
     auto labels = molecule_->irrep_labels();
-    // Use class name() instead of global REFERENCE option for correct multi-SCF output
+    // In multi-SCF, wfn type may differ from global REFERENCE option
     auto reference = name();
     outfile->Printf("          ");
     for (int h = 0; h < nirrep_; ++h) outfile->Printf(" %4s ", labels[h].c_str());

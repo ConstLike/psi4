@@ -276,12 +276,7 @@ def _scf_initialize_iteration_state(self, e_conv, d_conv):
     self._scf_e_conv = e_conv
     self._scf_d_conv = d_conv
 
-    # ========================================================================
-    # Cache ALL options from snapshot (ONCE) to avoid scattered lookups
-    # ========================================================================
-    # This consolidates all option reads in ONE place, making code cleaner
-    # and easier to maintain. Previously had 34 scattered get_option_from_snapshot()
-    # calls throughout iteration code.
+    # Cache all options from snapshot once for use throughout iterations
 
     # DIIS options
     self._scf_diis = get_option_from_snapshot(self, 'DIIS')
@@ -1840,19 +1835,9 @@ def multi_scf(wfn_list, e_conv=None, d_conv=None, max_iter=None, verbose=True):
             # Re-initialize JK with DIRECT (recomputes full integrals)
             wfn.initialize_jk(wfn.memory_jk_)
     else:
-        # Normal initialization (no DF guess)
-        # Shared JK pre-initialization reduces memory and computation time.
-        #
-        # Problem: Each wfn.initialize() creates its own JK via _build_jk()
-        #          causing N× redundant 3-index integrals computation.
-        #
-        # Solution: Create single shared JK, then share it with all wfn.
-        #          scf_initialize() is idempotent - reuses JK if already set (line 154-156)
-        #
-        # NOTE: 3-index integrals (Q|μν) depend only on basis + geometry,
-        #       not on reference type (RHF/UHF/ROHF). JK object is generic
-        #       and works with any number of density matrices.
-
+        # Create single shared JK for all wavefunctions to avoid redundant
+        # 3-index integral computation. JK depends only on basis + geometry,
+        # not on reference type (RHF/UHF/ROHF).
         needs_jk_init = any(wfn.jk() is None for wfn in wfn_list)
 
         if needs_jk_init:

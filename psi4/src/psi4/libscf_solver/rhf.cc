@@ -289,8 +289,6 @@ void RHF::form_C(double shift) {
         diagonalize_F(shifted_F, Ca_, epsilon_a_);
     }
     find_occupation();
-
-    // Phase 1.8: Invalidate orbital cache after orbitals updated
     orbital_cache_valid_ = false;
 }
 
@@ -308,7 +306,6 @@ void RHF::form_D() {
         auto Ca = Ca_->pointer(h);
         auto D = Da_->pointer(h);
 
-        // DGEMM writes directly to Matrix storage
         C_DGEMM('N', 'T', nso, nso, na, 1.0, Ca[0], nmo, Ca[0], nmo, 0.0, D[0], nso);
     }
 
@@ -698,7 +695,7 @@ std::vector<SharedMatrix> RHF::cphf_solve(std::vector<SharedMatrix> x_vec, doubl
     // => Header <= //
     if (print_lvl) {
         outfile->Printf("\n");
-        // Use class name() instead of global REFERENCE option for correct multi-SCF output
+        // In multi-SCF, wfn type may differ from global REFERENCE option
         outfile->Printf("   ==> Coupled-Perturbed %s Solver <==\n\n", name().c_str());
         outfile->Printf("    Maxiter             = %11d\n", max_iter);
         outfile->Printf("    Convergence         = %11.3E\n", conv_tol);
@@ -904,8 +901,6 @@ int RHF::soscf_update(double soscf_conv, int soscf_min_iter, int soscf_max_iter,
 
     // => Rotate orbitals <= //
     rotate_orbitals(Ca_, ret_x[0]);
-
-    // Phase 1.8: Invalidate orbital cache after orbital rotation
     orbital_cache_valid_ = false;
 
     return cphf_nfock_builds_;
@@ -1262,7 +1257,7 @@ void RHF::openorbital_scf() {
   };
 
   std::function<void(const std::map<std::string,std::any> &)> callback_function = [&](const std::map<std::string,std::any> & data) {
-    // Use class name() instead of global REFERENCE option for correct multi-SCF output
+    // In multi-SCF, wfn type may differ from global REFERENCE option
     std::string reference = name();
     if(options_.get_str("SCF_TYPE").ends_with("DF"))
       reference = "DF-" + reference;

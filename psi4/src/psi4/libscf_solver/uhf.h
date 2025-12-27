@@ -84,8 +84,6 @@ class UHF : public HF {
     int n_states() const override { return 2; }
 
     /// Returns {Ca_occ, Cb_occ} for multi-cycle JK computation
-    /// IMPORTANT: Returns ONLY occupied orbitals
-    /// PERFORMANCE: Cached to avoid repeated deep copies (Phase 1.8 optimization)
     std::vector<SharedMatrix> get_orbital_matrices() const override {
         // Fast path: return cached if valid (common for converged wfn)
         if (orbital_cache_valid_) {

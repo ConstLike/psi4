@@ -427,8 +427,6 @@ void ROHF::form_C(double shift) {
         outfile->Printf("In ROHF::form_C:\n");
         Ct_->eivprint(epsilon_a_);
     }
-
-    // Phase 1.8: Invalidate orbital cache after orbitals updated
     orbital_cache_valid_ = false;
 }
 
@@ -935,8 +933,6 @@ int ROHF::soscf_update(double soscf_conv, int soscf_min_iter, int soscf_max_iter
     // => Rotate orbitals <= //
     rotate_orbitals(Ca_, x);
     rotate_orbitals(Ct_, x);
-
-    // Phase 1.8: Invalidate orbital cache after orbital rotation
     orbital_cache_valid_ = false;
 
     // // => Cleanup <= //
@@ -969,9 +965,8 @@ void ROHF::form_G() {
         Ga_->subtract(Ka_);
         Gb_->subtract(Kb_);
 
-        // Note: ROHF does not support LRC functionals (no wKa_/wKb_ members)
         if (functional_->is_x_lrc()) {
-            throw PSIEXCEPTION("ROHF does not support LRC functionals in multi_scf()");
+            throw PSIEXCEPTION("ROHF does not support LRC functionals (wB97X, CAM-B3LYP, etc.)");
         }
     } else {
         // Normal path: compute J/K using JK builder
