@@ -57,6 +57,8 @@ dfh.*
 input.log
 
 *.json
+# REKS catalog-blob ABI single source: read at build time (CMake hash step), must ship.
+!psi4/src/psi4/libscf_solver/reks_catalog/reks_layout.json
 
 # Special test cases
 tests/*/iter.dat
@@ -83,6 +85,8 @@ tests/*/grid_esp.dat
 tests/*/grid_field.dat
 tests/*/fsapt/*
 tests/*/plot/*
+ztests/
+check-reks/
 
 # Automatically generated files
 share/python/pcm_placeholder.py
@@ -161,3 +165,6 @@ GRTAGS
 Pipfile.lock
 pytest_output.dat
 pytest_output.log
+
+# Local REKS validation harness (not part of upstream Psi4)
+zvalide/

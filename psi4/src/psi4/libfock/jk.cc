@@ -358,6 +358,9 @@ void JK::allocate_JK() {
             if (D_[N]->symmetry() != J_[N]->symmetry()) same = false;
         }
     }
+    // J_ can match D_ while K_/wK_ are still unallocated; check them independently.
+    if (do_K_ && K_.size() != D_.size()) same = false;
+    if (do_wK_ && wK_.size() != D_.size()) same = false;
 
     if (!same) {
         J_.clear();

@@ -1462,7 +1462,7 @@ int read_options(const std::string &name, Options &options, bool suppress_printi
         options.add_str("WFN", "SCF", "SCF");
         /*- Reference wavefunction type.
         **Cfour Interface:** Keyword translates into |cfour__cfour_reference|. -*/
-        options.add_str("REFERENCE", "RHF", "RHF ROHF UHF CUHF RKS UKS");
+        options.add_str("REFERENCE", "RHF", "RHF ROHF UHF CUHF RKS UKS REKS");
         /*- Primary basis set -*/
         options.add_str("BASIS", "");
         /*- Auxiliary basis set for SCF density fitting computations.
@@ -1515,9 +1515,32 @@ int read_options(const std::string &name, Options &options, bool suppress_printi
         (if set), or else by the name of the output file plus the name of
         the current molecule. -*/
         options.add_bool("MOLDEN_WRITE", false);
+        /*- Write a MOLDEN snapshot every N SCF iterations (0 = disabled). Filename:
+        ``<prefix>.iter_<NNN>.molden``. Uses |scf__molden_with_virtual|. Independent of
+        |scf__molden_write|. Incompatible with ``ORBITAL_OPTIMIZER_PACKAGE=OOO`` -- the
+        OOO C++ loop has no Python-visible per-iteration hook. -*/
+        options.add_int("MOLDEN_WRITE_INTERVAL", 0);
         /*- If true, then repeat the specified guess procedure for the orbitals every time -
         even during a geometry optimization. -*/
         options.add_bool("GUESS_PERSIST", false);
+        /*- Reorder MOs in the READ guess before SCF. Format: comma-separated list of
+        swap pairs; each pair is two whitespace-separated tokens. Tokens may be
+        integer 0-based MO indices, or symbolic ``HOMO`` / ``LUMO`` / ``HOMO-k`` /
+        ``LUMO+k`` resolved against the loaded wavefunction's alpha occupation.
+        Empty disables. ``nirrep=1`` only. Applied to alpha and beta C matrices
+        identically (single set of swap pairs). Example:
+        ``"HOMO-1 HOMO, LUMO+2 LUMO+3"``. -*/
+        options.add_str("GUESS_MO_SWAPS", "");
+        /*- Fill the REKS active MO columns from the READ guess. One token per active
+        orbital, in active-column order: the listed guess MOs are permuted into the
+        columns the active space occupies. Tokens may be integer 0-based MO indices,
+        or symbolic ``HOMO`` / ``LUMO`` / ``HOMO-k`` / ``LUMO+k`` resolved against the
+        loaded wavefunction's alpha occupation. Addresses |scf__reference| ``REKS``
+        runs, which require |scf__guess| ``READ``; other references report the keyword
+        and ignore it. Mutually exclusive with |scf__guess_mo_swaps|.
+        Empty disables. ``nirrep=1`` only. Example for ``reks [4, 4]``:
+        ``["HOMO-1", "HOMO", "LUMO", "LUMO+1"]``. -*/
+        options.add("GUESS_ACTIVE_WINDOW", new ArrayType());
         /*- File name (case sensitive) to which to serialize Wavefunction orbital data. -*/
         options.add_str_i("ORBITALS_WRITE", "");
 
@@ -1658,6 +1681,382 @@ int read_options(const std::string &name, Options &options, bool suppress_printi
         /*- For |globals__orbital_optimizer_package| = `OOO`, use optimal damping when max error bigger than this. -*/
         options.add_double("OOO_OPTIMAL_DAMPING_THRESHOLD", 1.0);
 
+        /*- SUBSECTION REKS (Restricted Ensemble Kohn-Sham) -*/
+
+        /*- REKS active space: exactly 2 entries [N, M] =
+            [active electrons, active orbitals].
+            The molecule multiplicity is always the canonical symmetric-Ms value
+            (even N: 1, odd N: 2). Spin manifolds are selected with
+            SA_REKS_2SPIN / SI_REKS_2SPIN (or the ladder order of nested
+            SA_REKS_CONFIGS / SI_REKS_CONFIGS blocks), never through the molecule
+            multiplicity. The run's sectors are the union of the manifolds
+            declared by SA blocks and SI groups, ordered by ascending 2S; when
+            nothing declares a manifold, the lowest available one runs.
+            The geminal-pairing scheme optimized in SCF is fixed by the generated
+            catalog, not an option; the config pools select by scheme through the
+            SA_REKS_CONFIGS bulk tokens. Example: set reks [4, 4]. -*/
+        options.add("REKS", new ArrayType());
+        /*- SA-REKS configuration pool. Two forms. Flat list = ONE block of
+            config indices or names (e.g. [0, 1, 2] or [PPS1, OSS1]); indices
+            are local to the block's spin manifold, each at most once per block.
+            A string element may also be a bulk token: `full` selects the whole
+            manifold config block, a config-type name (PPS, OSS, DOSS, ...)
+            selects every config of that type in the manifold, `single-scheme:N`
+            selects the configs of geminal-pairing scheme N, and `mixed-scheme:N`
+            selects the SSR state set on scheme N (its single-excitation configs
+            plus every open-shell-singlet config of the manifold).
+            The spin-projected configs are one object over all pairings and belong
+            to no single scheme: they are the manifold's base, which every scheme
+            token carries whole and none repeats. A one-scheme selection therefore
+            has the same size whichever scheme it names. This differs from the
+            catalog generator, whose ByScheme files every spin-projected config
+            under scheme 0 -- an artifact of how it enumerates them -- so
+            `single-scheme:1` here carries the base and `--project single-scheme:1`
+            there does not. `mixed-scheme` matches the generator.
+            A scheme token takes one index or several, whose selections
+            it unions (`mixed-scheme-1-2-3`), each behind `:`, `-`, `_` or `,`,
+            and defaults to scheme 0; a PSithon input cannot use `:`, since the
+            PSithon array parser splits an element there. A scheme token throws
+            when an index repeats, exceeds the catalog's schemes, or the selection
+            is empty. An SA block stays a weighted list: a config it names twice,
+            by hand or through two overlapping tokens, is an input error, so
+            overlapping selections belong in one multi-index token.
+            Nested list-of-lists = one block per inner list ([] allowed).
+            Each block belongs to one spin manifold: in ladder mode
+            (SA_REKS_2SPIN absent) block i maps to the i-th available manifold
+            in ascending 2S, and an empty block [] skips its rung; with
+            SA_REKS_2SPIN, block i belongs to the i-th listed manifold.
+            Absent: one default block (the catalog's sa_default pool, e.g. 2S=0
+            REKS(2,2)=[PPS1,OSS1], REKS(4,4)=[PPS1,OSS1,OSS2],
+            REKS(6,6)=[PPS1,OSS1,OSS2,OSS3]) on the run's lowest manifold, or
+            on manifold x when SA_REKS_2SPIN = [x].
+            Alias: REKS_SA_CONFIGS (specify only one of the two; throws if both set). -*/
+        options.add("SA_REKS_CONFIGS", new ArrayType());
+        /*- Alias for SA_REKS_CONFIGS. Specify only one of the two. -*/
+        options.add("REKS_SA_CONFIGS", new ArrayType());
+        /*- Spin manifolds of the SA blocks: one 2S integer per typed
+            SA_REKS_CONFIGS block (flat form = 1 block), in block order.
+            Entries pairwise distinct, each a manifold of the (N,M) catalog;
+            any 2S order (blocks are permuted into ascending-2S sector order
+            internally). An explicitly labeled empty block [] DECLARES its
+            manifold: that sector participates in the run even with no SA
+            configs. This differs from ladder mode (option absent), where an
+            empty block only skips its rung and declares nothing.
+            With SA_REKS_CONFIGS absent, exactly one label [x] puts the default
+            SA pool on manifold x.
+            Alias: REKS_SA_2SPIN (specify only one of the two; throws if both set). -*/
+        options.add("SA_REKS_2SPIN", new ArrayType());
+        /*- Alias for SA_REKS_2SPIN. Specify only one of the two. -*/
+        options.add("REKS_SA_2SPIN", new ArrayType());
+        /*- SA-REKS weights for the SA pool.
+            Length = total SA configs as typed (blocks concatenated in input
+            order) + len(SA_REKS_EXTRA); config weights first in typed order,
+            then extra-determinant weights. When SA_REKS_2SPIN lists manifolds
+            out of ascending 2S order, configs and their weights are permuted
+            together into ascending-2S sector order; the input convention stays
+            as typed. Values must be non-negative and sum to 1.0 (tolerance 1e-8).
+            If unset, equal distribution 1/n across all pool entries.
+            Alias: REKS_SA_WEIGHTS (specify only one of the two; throws if both set). -*/
+        options.add("SA_REKS_WEIGHTS", new ArrayType());
+        /*- Alias for SA_REKS_WEIGHTS. Specify only one of the two. -*/
+        options.add("REKS_SA_WEIGHTS", new ArrayType());
+        /*- SI-REKS cassettes. Two forms. 2-level [[...], ...]: a list of
+            cassettes forming ONE group; each cassette is a list of config
+            indices (local to the group's manifold) or names (e.g. PPS1, OSS1).
+            A cassette entry may also be a bulk token: `full` fills that cassette
+            with the whole manifold config block (equivalent to listing every
+            index), a config-type name (PPS, OSS, DOSS, ...) fills it with
+            every config of that type, `single-scheme:N` / `mixed-scheme:N` fill it
+            with the scheme selections described under
+            SA_REKS_CONFIGS, `sps` fills it with the spin-projected base, and a
+            pattern holding `*` or `?` with the config names it matches. An entry
+            written `exclude:X` (also `exclude-X` / `exclude_X`) subtracts what X
+            names from everything the cassette adds, whatever their order, X being
+            any of the forms above: `exclude:sps` drops the base, `exclude:OSS1`
+            one config, `exclude:DES` one type, `exclude:*SPS*` a pattern. An SA
+            block takes no `exclude:`, its weights following the typed order.
+            Tokens combine
+            by union within a cassette. A cassette is the basis of one SI subspace
+            and therefore a set: a config selected by more than one entry enters it
+            once, keeping its first position, so overlapping tokens compose freely
+            (unlike an SA block, where a repeat is an error).
+            3-level [[[...]], ...]: one GROUP of cassettes per outer entry
+            ([] entries allowed). Groups map to spin manifolds like SA blocks:
+            in ladder mode (SI_REKS_2SPIN absent) group i maps to the i-th
+            available manifold and an empty group [] skips its rung; with
+            SI_REKS_2SPIN, group i belongs to the i-th listed manifold. The
+            2-level form is legal only with SI_REKS_2SPIN absent (the group
+            lands on the run's lowest manifold) or of length 1. Empty cassettes
+            are skipped. A present list whose entries are all empty means NO SI
+            anywhere (the default does not apply).
+            Absent: one default cassette spanning the full config block of the
+            run's lowest manifold, or of manifold x when SI_REKS_2SPIN = [x].
+            Alias: REKS_SI_CONFIGS (specify only one of the two; throws if both set). -*/
+        options.add("SI_REKS_CONFIGS", new ArrayType());
+        /*- Alias for SI_REKS_CONFIGS. Specify only one of the two. -*/
+        options.add("REKS_SI_CONFIGS", new ArrayType());
+        /*- Spin manifolds of the SI groups: one 2S integer per group, in group
+            order. Entries pairwise distinct, each a manifold of the (N,M)
+            catalog; any 2S order. Length > 1 requires the 3-level
+            SI_REKS_CONFIGS form (one group per label). An explicitly labeled
+            empty group [] DECLARES its manifold (that sector participates,
+            SI-less), while a ladder-mode [] group only skips its rung and
+            declares nothing. With SI_REKS_CONFIGS absent, exactly one label
+            [x] puts the default SI cassette on manifold x.
+            Alias: REKS_SI_2SPIN (specify only one of the two; throws if both set). -*/
+        options.add("SI_REKS_2SPIN", new ArrayType());
+        /*- Alias for SI_REKS_2SPIN. Specify only one of the two. -*/
+        options.add("REKS_SI_2SPIN", new ArrayType());
+        /*- Cap on the number of SI states reported per SI cassette: one positive
+            integer per cassette, in cassette order (entry i applies to the
+            cassette printed as K=i, ascending spin-manifold order, not
+            necessarily the typed order of SI_REKS_2SPIN). The SI Hamiltonian,
+            overlap and eigenproblem are built at the full cassette dimension
+            with every root found: reported states carry exact uncapped
+            values. The cap limits the state axis of everything downstream of
+            the eigensolve -- the adiabatic 1-RDM, the permanent and transition
+            dipoles, the oscillator strengths, the per-state natural orbitals
+            and the per-state integrity table are computed for the reported
+            states only, not computed in full and then trimmed -- governing
+            run time and memory, not just the printed tables, the per-state
+            array variables and the wfn npy dump. Config-space arrays (SSR
+            HAMILTONIAN, SSR OVERLAP SPARSE, SSR 1-RDM DIABATIC SPARSE) stay
+            at full dimension where they are exported at all, which is from
+            REKS_REPORT_LEVEL 3 up. An entry may not exceed its cassette's
+            dimension. Each array is clamped to the bound of its own axis:
+            the per-state tables and arrays to the physical state count,
+            which a geometry with a rank-deficient overlap may push below
+            the requested cap, and the eigenvector matrix to the
+            configuration dimension. Absent: all states reported.
+            Alias: REKS_SI_REPORT_STATES (specify only one of the two; throws if
+            both set). -*/
+        options.add("SI_REKS_REPORT_STATES", new ArrayType());
+        /*- Alias for SI_REKS_REPORT_STATES. Specify only one of the two. -*/
+        options.add("REKS_SI_REPORT_STATES", new ArrayType());
+        /*- SA-REKS extra determinants: list-of-lists. Each inner list is one
+            Slater determinant's occupation vector [alpha(M) | beta(M)] of length
+            2*M (M = active orbitals), entries 0 or 1, summing to the active
+            electron count. Each enters the SA ensemble (orbital optimization)
+            with a fixed weight from SA_REKS_WEIGHTS but is absent from the SI
+            Hamiltonian. The catalog is unchanged.
+            Alias: REKS_SA_EXTRA (specify only one of the two; throws if both set). -*/
+        options.add("SA_REKS_EXTRA", new ArrayType());
+        /*- Alias for SA_REKS_EXTRA. Specify only one of the two. -*/
+        options.add("REKS_SA_EXTRA", new ArrayType());
+        /*- Interpolation parameter delta of the REKS FON interpolant
+            f(x) = x^(1 - (x+delta)/(2(1+delta))), x = n_p*n_q in [0,1], bridging the closed-shell
+            and open-shell limits of each geminal; must be >= 0. Default 0.4. -*/
+        options.add_double("REKS_FON_INTERP_DELTA", 0.4);
+        /*- Lower bound pinning every active generation-0 (n-geminal) FON in SA-REKS SCF to
+            [REKS_N_FON, 2 - REKS_FON_MICRO_BOUND_MARGIN], the bound itself clamped to 2 - 1e-8
+            with a warning; negative disables. Default -1.0. -*/
+        options.add_double("REKS_N_FON", -1.0);
+        /*- Generation-1 (m-geminal) FON lower bound; semantics as REKS_N_FON.
+            Default -1.0 (disabled). -*/
+        options.add_double("REKS_M_FON", -1.0);
+        /*- Generation-2 (u-geminal) FON lower bound; semantics as REKS_N_FON.
+            Default -1.0 (disabled). -*/
+        options.add_double("REKS_U_FON", -1.0);
+        /*- Generation-3 (v-geminal) FON lower bound; semantics as REKS_N_FON.
+            Default -1.0 (disabled). -*/
+        options.add_double("REKS_V_FON", -1.0);
+        /*- Generation-4 (w-geminal) FON lower bound; semantics as REKS_N_FON.
+            Default -1.0 (disabled). -*/
+        options.add_double("REKS_W_FON", -1.0);
+        /*- Generation-5 (x-geminal) FON lower bound; semantics as REKS_N_FON.
+            Default -1.0 (disabled). -*/
+        options.add_double("REKS_X_FON", -1.0);
+        /*- Generation-6 (y-geminal) FON lower bound; semantics as REKS_N_FON.
+            Default -1.0 (disabled). -*/
+        options.add_double("REKS_Y_FON", -1.0);
+        /*- Generation-7 (z-geminal) FON lower bound; semantics as REKS_N_FON.
+            Default -1.0 (disabled). -*/
+        options.add_double("REKS_Z_FON", -1.0);
+        /*- Coefficient lambda in Ha of the IPR delocalization penalty
+            E_pen = lambda * sum_i sum_A p_A(i)^2 on the REKS active orbitals, p_A(i) being the
+            atomic population of active MO i on atom A. Default 0.0 (penalty off). -*/
+        options.add_double("REKS_DELOC_IPR_PENALTY", 0.0);
+        /*- Population analysis used by the IPR penalty: LOWDIN (S^{1/2} transformation) or
+            MULLIKEN. Default LOWDIN. -*/
+        options.add_str("REKS_DELOC_IPR_METHOD", "LOWDIN", "LOWDIN MULLIKEN");
+        /*- Consecutive IPR-basin-guard fires without a net IPR decrease after which the guard
+            disables itself for the rest of the SCF. Default 10. -*/
+        options.add_int("REKS_DELOC_IPR_GUARD_STREAK_LIMIT", 10);
+        /*- Newton-Raphson iteration cap of the FON micro-solver, per geminal block and SCF
+            iteration. Default 20. -*/
+        options.add_int("REKS_FON_MICRO_MAX_NR_ITER", 20);
+        /*- Golden-ratio line-search iteration cap inside one FON micro-solver Newton step.
+            Default 20. -*/
+        options.add_int("REKS_FON_MICRO_MAX_LS_ITER", 20);
+        /*- Step-norm convergence threshold ||dFON|| of the FON micro-solver. Default 1e-12. -*/
+        options.add_double("REKS_FON_MICRO_CONV_TOL", 1e-12);
+        /*- Eigenvalue floor of the FON micro-solver Hessian in line-search mode, below which
+            modes are lifted. Default 1e-8. -*/
+        options.add_double("REKS_FON_MICRO_MIN_EIGENVALUE", 1e-8);
+        /*- Interior margin of the FON micro-solver box: the solver optimizes FONs over
+            [margin, 2 - margin] rather than the closed [0, 2], a generation floor (REKS_N_FON
+            and siblings) overriding its lower end. Default 1e-8. -*/
+        options.add_double("REKS_FON_MICRO_BOUND_MARGIN", 1e-8);
+        /*- Boundary skin of the generation-0 FON multi-start scan: a converged seed whose FONs
+            come within this distance of 0 or 2 counts as boundary-trapped and loses to an
+            interior minimum. Default 0.05. -*/
+        options.add_double("REKS_FON_MICRO_BOUNDARY_SKIN", 0.05);
+        /*- Verbosity of the REKS report: 1 = fatal diagnostics only, 2 = the run report
+            (setup, pools, SCF trace, states, properties; the 15 lowest microstate
+            energies), 3 = extended, plus the full microstate list and the wavefunction
+            arrays over the config axis (SSR COEFFICIENTS, SSR HAMILTONIAN,
+            SSR OVERLAP SPARSE, SSR 1-RDM DIABATIC SPARSE, which are quadratic in the
+            cassette dimension), 4 = per-iteration traces, pool maps, solver internals
+            and SI matrices wider than 150 configs, 5 = matrices over the config,
+            microstate and orbital axes. Default 2. -*/
+        options.add_int("REKS_REPORT_LEVEL", 2);
+        /*- Enable the Trust-Region Augmented Hessian solver, which optimizes orbital rotations
+            and FONs jointly by a trust-region step. Alone (REKS_GVB_DIIS off) it runs the whole
+            SCF; with REKS_GVB_DIIS also on (its default), TRAH is the warmup and the SCF
+            switches to GVB-DIIS once REKS_GVB_DIIS_START and the formulation's activation gate
+            are met. Default false. -*/
+        options.add_bool("REKS_USE_TRAH", false);
+        /*- Use the GVB-DIIS accelerator for REKS orbital optimization, in the formulation
+            selected by REKS_DIIS_FORMULATION. Default true. -*/
+        options.add_bool("REKS_GVB_DIIS", true);
+        /*- Artificial shell gap of the GVB-DIIS multishell Fock F^g (diagonal
+            F^g[i][i] = i * gap, off-diagonal (i,j) scaled by (j - i) * gap), read only when
+            REKS_DIIS_FORMULATION=CFM. Default 1.0. -*/
+        options.add_double("REKS_GVB_LEVEL_SHIFT", 1.0);
+        /*- Adaptive REKS staircase level shift. When true (default), the pair-aware staircase
+            shift decays toward a floor when orbital mixing is small and grows back toward the
+            user LEVEL_SHIFT when scrambling is detected. When false, the staircase is held
+            fixed at the user LEVEL_SHIFT for every SCF iteration. -*/
+        options.add_bool("LEVEL_SHIFT_ADAPT", true);
+        /*- SCF iteration at which GVB-DIIS starts; earlier iterations run TRAH when
+            REKS_USE_TRAH is on, otherwise the plain F_reks burn-in. Default 3. -*/
+        options.add_int("REKS_GVB_DIIS_START", 3);
+        /*- Orbital-gradient threshold ||g_orb||_F below which the CFM formulation activates
+            GVB-DIIS once REKS_GVB_DIIS_START is reached, inert without REKS_USE_TRAH and ignored
+            by the ORBITAL formulation. Default 1e-3. -*/
+        options.add_double("REKS_DIIS_CFM_ACTIVATION_GORB", 1e-3);
+        /*- Enable the post-hoc acceptance verdict on extrapolated GVB-DIIS steps, whose trip
+            ratio is REKS_DIIS_MON_VERDICT_RHO. Default true. -*/
+        options.add_bool("REKS_GVB_ROBUST_VERDICT", true);
+        /*- DIIS formulation used by REKS_GVB_DIIS: CFM extrapolates the composite multishell
+            Fock matrix, ORBITAL extrapolates skew-symmetric kappa generators in the MO basis and
+            bypasses Fock diagonalization. Default ORBITAL. -*/
+        options.add_str("REKS_DIIS_FORMULATION", "ORBITAL", "CFM ORBITAL");
+        /*- Enable the angle filter with stale-drop in the GVB-DIIS conditioning chain, which is
+            the identity on a well-conditioned Gram. Default true. -*/
+        options.add_bool("REKS_DIIS_COND_ANGLE_FILTER", true);
+        /*- Angle-filter tolerance c_s: minimum sin(angle) of a candidate error vector to the
+            kept span for the vector to be retained. Default 0.1. -*/
+        options.add_double("REKS_DIIS_COND_ANGLE_TOL", 0.1);
+        /*- Stale-drop threshold delta of the GVB-DIIS angle filter, dropping any error vector
+            whose norm exceeds (1/sqrt(delta)) times the newest error norm, 0 = off.
+            Default 1e-4 (drop at 100 times the newest norm). -*/
+        options.add_double("REKS_DIIS_COND_STALE_DELTA", 1e-4);
+        /*- Bypass boundary on the condition number of the raw GVB-DIIS error matrix: at or below
+            it the solve is the bare bordered-B, above it the engaged SVD-on-F path runs.
+            Default 1e9. -*/
+        options.add_double("REKS_DIIS_COND_KAPPA_BYPASS", 1e9);
+        /*- Singular-value truncation rcond for the engaged SVD-on-F GVB-DIIS solve. Default
+            1e-8. -*/
+        options.add_double("REKS_DIIS_COND_SVD_RCOND", 1e-8);
+        /*- Upper bound on the GVB-DIIS coefficient length |c|^2, applied on every solve path; a
+            trip escalates to the engaged angle-filter + SVD-on-F re-solve, then transient
+            survivor removal, then the raw base map. Default 1e3. -*/
+        options.add_double("REKS_DIIS_COND_COEFF_NORM_MAX", 1e3);
+        /*- Enable the Tikhonov ridge on the engaged GVB-DIIS SVD path. Default true. -*/
+        options.add_bool("REKS_DIIS_COND_TIKHONOV", true);
+        /*- Tikhonov ridge magnitude delta of the engaged GVB-DIIS SVD solve, read only when
+            REKS_DIIS_COND_TIKHONOV is true and disabling the ridge exactly at 0.0.
+            Default 0.0. -*/
+        options.add_double("REKS_DIIS_COND_TIKHONOV_SCALE", 0.0);
+        /*- Verdict trip ratio for GVB-DIIS: an extrapolated step is rewound to the best iterate
+            when its orbital gradient norm exceeds this multiple of the nonmonotone reference
+            max(gorb over the last REKS_DIIS_MON_NONMONOTONE_M iterates). Default 1.5. -*/
+        options.add_double("REKS_DIIS_MON_VERDICT_RHO", 1.5);
+        /*- Consecutive verdict rewinds without a new best iterate after which the GVB-DIIS
+            verdict monitor escalates to a base-map restart from best. Default 3. -*/
+        options.add_int("REKS_DIIS_MON_VERDICT_STREAK", 3);
+        /*- Iterations after an executed GVB-DIIS rewind, restart or switch during which the
+            verdict is suspended. Default 3. -*/
+        options.add_int("REKS_DIIS_MON_SUPPRESS_WINDOW", 3);
+        /*- Depth M of the nonmonotone references shared by both GVB-DIIS progress channels, the
+            verdict's max(gorb over the last M iterates) and the no-progress monitor's
+            min(E_SA over the last M observations), 1 making both monotone. Default 3. -*/
+        options.add_int("REKS_DIIS_MON_NONMONOTONE_M", 3);
+        /*- Consecutive iterations on which both |dE| < E_CONVERGENCE and ||g_orb||_F / nmo <
+            D_CONVERGENCE must hold before GVB-DIIS grants SCF convergence, 1 accepting the first
+            crossing. Default 2. -*/
+        options.add_int("REKS_GVB_GATE_STREAK", 2);
+        /*- Consecutive basin-false iterations after which the GVB-DIIS OutcomeGuard clears its
+            basin latch. Default 3. -*/
+        options.add_int("REKS_DIIS_GUARD_LATCH_GRACE", 3);
+        /*- Curvature B of the GVB-DIIS OutcomeGuard adjudication band
+            band = max(E_CONVERGENCE, g_best^2 / (2 B)), below which an energy departure is not a
+            verdict. Default 0.1. -*/
+        options.add_double("REKS_DIIS_GUARD_BAND_B", 0.1);
+        /*- Relative tolerance of the GVB-DIIS rewind-landing fingerprint match: a landing repeats
+            when the best SA energy and the best orbital gradient norm both reproduce the recorded
+            landing to within it. Default 1e-12. -*/
+        options.add_double("REKS_DIIS_GUARD_LANDING_RTOL", 1e-12);
+        /*- Sufficient-decrease fraction eps of the GVB-DIIS monitors, an iterate counting as
+            progress only if gorb <= (1 - eps) * best_gorb. Default 1e-2. -*/
+        options.add_double("REKS_DIIS_MON_PROGRESS_EPS", 1e-2);
+        /*- Max-norm FON displacement theta_f at or above which the GVB-DIIS outcome guard reads
+            an energy departure below the best iterate's band as a basin transition rather than a
+            localization signature. Default 0.1. -*/
+        options.add_double("REKS_DIIS_FON_BRANCH_TOL", 0.1);
+        /*- Monitor-driven GVB-DIIS restarts without sufficient improvement of the best iterate
+            allowed before the monitors quiesce to telemetry and rewind to best once.
+            Default 2. -*/
+        options.add_int("REKS_DIIS_RESTART_BUDGET", 2);
+        /*- Enable the GVB-DIIS no-progress / cap-streak monitor, which restarts the base map on a
+            re-anchored best frame in the CFM and ORBITAL formulations alike. Default true. -*/
+        options.add_bool("REKS_DIIS_MON_CYCLE", true);
+        /*- Iterations without a new best gorb before the GVB-DIIS cycle monitor restarts the base
+            map from best. Default 12. -*/
+        options.add_int("REKS_DIIS_MON_CYCLE_WINDOW", 12);
+        /*- Consecutive ORBITAL step-cap fires before the GVB-DIIS cycle monitor restarts.
+            Default 3. -*/
+        options.add_int("REKS_DIIS_MON_CYCLE_CAP_STREAK", 3);
+        /*- Damping factor alpha of the ORBITAL GVB-DIIS re-anchored base-map step after a restart
+            (alpha * Newton on the re-anchored frame). Default 0.6. -*/
+        options.add_double("REKS_DIIS_ORB_BASE_MAP_DAMP", 0.6);
+        /*- Enable the miniTRAH episode inside GVB-DIIS: a bounded matrix-free Newton-Krylov
+            solve of the reduced orbital-gradient equations g(kappa) = 0, entered on the stall
+            signature and left with the DIIS history re-anchored. Default true. -*/
+        options.add_bool("REKS_GVB_NK", true);
+        /*- Length of the flat-stall streak that opens a miniTRAH episode: consecutive GVB-DIIS
+            iterations on which the applied orbital step collapses geometrically while the
+            orbital gradient does not and the D-gate is unmet. Default 4. -*/
+        options.add_int("REKS_GVB_NK_TRIGGER", 4);
+        /*- Rollback landings that open a miniTRAH episode, the second entry signature.
+            Default 3. -*/
+        options.add_int("REKS_GVB_NK_MIN_LANDINGS", 3);
+        /*- Rejected macro-iterations, counted over the whole episode, that end a miniTRAH
+            episode. Default 1. -*/
+        options.add_int("REKS_GVB_NK_MAX_REJECT", 1);
+        /*- FON Newton steps taken inside one miniTRAH gradient evaluation, stopping early once
+            the FONs stop moving. Default 1. -*/
+        options.add_int("REKS_GVB_NK_FON_MICRO", 1);
+        /*- Require a strictly active FON bound, meaning a KKT multiplier of at least 1e-3, to
+            open a miniTRAH episode; false admits an episode with no active bound but still
+            blocks one carrying a weakly active bound. Default false. -*/
+        options.add_bool("REKS_GVB_NK_REQUIRE_ACTIVE_FON", false);
+        /*- Primary miniTRAH budget: reduced-gradient evaluations per episode, each costing about
+            one SA-Fock build. Default 150. -*/
+        options.add_int("REKS_GVB_NK_MAX_GRAD", 150);
+        /*- Secondary miniTRAH ceiling: outer Newton (macro) iterations per episode.
+            Default 10. -*/
+        options.add_int("REKS_GVB_NK_MAX_MACRO", 10);
+        /*- Lanczos steps per miniTRAH macro-iteration, one operator application each.
+            Default 20. -*/
+        options.add_int("REKS_GVB_NK_MAX_INNER", 20);
+        /*- Finite-difference step of the miniTRAH Hessian action, measured at episode entry from
+            the gradient noise and the second-derivative scale when zero. Default 0.0. -*/
+        options.add_double("REKS_GVB_NK_FD_H", 0.0);
+        /*- miniTRAH success exit: leave the episode once ||g_orb||_F / nmo falls below this
+            multiple of D_CONVERGENCE. Default 0.5. -*/
+        options.add_double("REKS_GVB_NK_EXIT_FACTOR", 0.5);
         /*- SUBSECTION Fractional Occupation UHF/UKS -*/
 
         /*- The iteration to start fractionally occupying orbitals (or 0 for no fractional occupation) -*/

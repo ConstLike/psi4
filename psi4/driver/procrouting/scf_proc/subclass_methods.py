@@ -127,6 +127,10 @@ core.RHF.diis = _RHF_diis
 core.UHF.diis = core.CUHF.diis = _UHF_diis
 core.ROHF.diis = _ROHF_diis
 
+# REKS inherits from HF (not RHF), so needs these methods explicitly
+core.REKS.compute_orbital_gradient = _RHF_orbital_gradient
+core.REKS.diis = _RHF_diis
+
 def _UHF_stability_analysis(self):
     # => Validate options <=
     # TODO: Stability analysis is supported for any functional UKS functional where its one-

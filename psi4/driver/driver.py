@@ -80,6 +80,45 @@ def _filter_renamed_methods(compute, method):
     pass
 
 
+def _stage_restart_npy(molecule, restart_file, caller):
+    """Stage a user orbital .npy into the checkpoint the first SCF reads, set GUESS=READ.
+
+    findif points run as separate tasks that bypass energy()'s restart_file path, so
+    the file is copied to <prefix>.180.npy under the active WRITER_FILE_LABEL (caller
+    pins it). Non-.npy items ignored.
+    """
+    restart_items = restart_file
+    if not isinstance(restart_items, (list, tuple)):
+        restart_items = (restart_items, )
+    psi_scratch = core.IOManager.shared_object().get_default_path()
+    prefix = os.path.split(os.path.abspath(core.get_writer_file_prefix(molecule.name())))[1]
+    for item in restart_items:
+        is_numpy_file = (os.path.isfile(item) and item.endswith(".npy")) or os.path.isfile(item + ".npy")
+        if not is_numpy_file:
+            continue
+        src = item if item.endswith(".npy") else item + ".npy"
+        shutil.copy(src, os.path.join(psi_scratch, prefix + ".180.npy"))
+        core.set_local_option('SCF', 'GUESS', 'READ')
+        core.print_out(f"  {caller}: seeding orbital guess from {src} (GUESS set to READ).\n")
+
+
+def _clear_guess_mo_swaps(caller):
+    """Clear the SCF READ-guess MO reorderings, GUESS_MO_SWAPS and GUESS_ACTIVE_WINDOW.
+
+    Both are one-time permutations applied on GUESS=READ; left set, they
+    re-permute already-ordered orbitals and flip-flop the active space at
+    every findif point.
+    """
+    if core.get_global_option('GUESS_MO_SWAPS').strip():
+        core.print_out(f"  {caller}: clearing SCF GUESS_MO_SWAPS "
+                       "(orbitals are reused already-ordered each point).\n")
+        core.set_local_option('SCF', 'GUESS_MO_SWAPS', '')
+    if core.get_global_option('GUESS_ACTIVE_WINDOW'):
+        core.print_out(f"  {caller}: clearing SCF GUESS_ACTIVE_WINDOW "
+                       "(orbitals are reused already-ordered each point).\n")
+        core.set_local_option('SCF', 'GUESS_ACTIVE_WINDOW', [])
+
+
 def energy(name, **kwargs):
     r"""Function to compute the single-point electronic energy.
 
@@ -506,7 +545,8 @@ def energy(name, **kwargs):
                 core.print_out(" Found user provided orbital data. Setting orbital guess to READ")
                 fname = os.path.split(os.path.abspath(core.get_writer_file_prefix(molecule.name())))[1]
                 psi_scratch = core.IOManager.shared_object().get_default_path()
-                file_num = item.split('.')[-2] if "180" in item else "180"
+                # .npy orbital restart is always the SCF MO dump (psi4 file 180).
+                file_num = "180"
                 targetfile = os.path.join(psi_scratch, fname + "." + file_num + ".npy")
                 if not item.endswith(".npy"):
                     item = item + ".npy"
@@ -603,6 +643,23 @@ def gradient(name, **kwargs):
     userbas = core.get_global_option('BASIS') or kwargs.get('basis')
     if lowername in integrated_basis_methods and userbas is None:
         kwargs['basis'] = '(auto)'
+
+    # * Analytic gradient segfaults on a REKS wavefunction; force finite differences.
+    if core.get_global_option('REFERENCE') == 'REKS' and str(kwargs.get('dertype')) != '0':
+        raise ValidationError(
+            f"gradient: REKS has no analytic gradient yet. Use 'dertype=0' (finite differences):\n"
+            "\n"
+            f"    psi4.optimize('{lowername}', dertype=0)\n"
+            f"    psi4.gradient('{lowername}', dertype=0)")
+
+    # Orbital restart for finite differences: stage the user file before planning so
+    # every displacement reads it. Pin the label so the points resolve the staged
+    # checkpoint. Skipped for many-body (BSSE) per-fragment checkpoints.
+    if kwargs.get('bsse_type') is None and 'restart_file' in kwargs:
+        if core.get_global_option('WRITER_FILE_LABEL') == '':
+            core.set_global_option('WRITER_FILE_LABEL', molecule.name() or 'gradient')
+        _stage_restart_npy(molecule, kwargs['restart_file'], 'gradient')
+        _clear_guess_mo_swaps('gradient')
 
     # Are we planning?
     plan = task_planner.task_planner("gradient", lowername, molecule, **kwargs)
@@ -1189,7 +1246,10 @@ def optimize(name, **kwargs):
         ['FINDIF', 'HESSIAN_WRITE'],
         ['OPTKING', 'CART_HESS_READ'],
         ['SCF', 'GUESS_PERSIST'],  # handle on behalf of cbs()
-        ['SCF', 'GUESS'])
+        ['SCF', 'GUESS'],
+        ['SCF', 'GUESS_MO_SWAPS'],
+        ['SCF', 'GUESS_ACTIVE_WINDOW'],
+        ['WRITER_FILE_LABEL'])
 
     n = kwargs.get('opt_iter', 1)
 
@@ -1205,6 +1265,22 @@ def optimize(name, **kwargs):
         molecule.fix_orientation(True)
         molecule.fix_com(True)
     molecule.update_geometry()
+
+    # Orbital reuse across optimization steps and their findif points. Skipped for
+    # many-body (BSSE) runs: those decompose into different-sized fragments that need
+    # distinct checkpoints, but a set WRITER_FILE_LABEL makes get_writer_file_prefix
+    # ignore the per-call molecule name, collapsing all fragments onto one file (a
+    # monomer's orbitals read into a dimer -> dgemm dimension mismatch). The opt loop
+    # below sets GUESS=READ at n>1, so pin the label every run, not only when seeding.
+    if kwargs.get('bsse_type') is None:
+        if core.get_global_option('WRITER_FILE_LABEL') == '':
+            core.set_global_option('WRITER_FILE_LABEL', molecule.name() or 'opt')
+        # Consume the seed once; the loop's n>1 GUESS=READ chains step to step. Leaving
+        # it in kwargs would re-stage the initial file at every per-step gradient().
+        if 'restart_file' in kwargs:
+            _stage_restart_npy(molecule, kwargs.pop('restart_file'), 'optimize')
+
+    _clear_guess_mo_swaps('optimize')
 
     if core.get_option('OPTKING', 'OPT_RESTART'):
         # Recreate all of optking's internal classes to restart an optimization
@@ -1428,6 +1504,23 @@ def hessian(name, **kwargs):
     userbas = core.get_global_option('BASIS') or kwargs.get('basis')
     if lowername in integrated_basis_methods and userbas is None:
         kwargs['basis'] = '(auto)'
+
+    # * Analytic hessian crashes on a REKS wavefunction; force finite differences.
+    if core.get_global_option('REFERENCE') == 'REKS' and str(kwargs.get('dertype')) != '0':
+        raise ValidationError(
+            f"hessian: REKS has no analytic hessian yet. Use 'dertype=0' (finite differences):\n"
+            "\n"
+            f"    psi4.frequencies('{lowername}', dertype=0)\n"
+            f"    psi4.hessian('{lowername}', dertype=0)")
+
+    # Orbital restart for finite differences: stage the user file before planning so
+    # every displacement reads it. Pin the label so the points resolve the staged
+    # checkpoint. Skipped for many-body (BSSE) per-fragment checkpoints.
+    if kwargs.get('bsse_type') is None and 'restart_file' in kwargs:
+        if core.get_global_option('WRITER_FILE_LABEL') == '':
+            core.set_global_option('WRITER_FILE_LABEL', molecule.name() or 'hessian')
+        _stage_restart_npy(molecule, kwargs['restart_file'], 'hessian')
+        _clear_guess_mo_swaps('hessian')
 
     # Are we planning?
     plan = task_planner.task_planner("hessian", lowername, molecule, **kwargs)

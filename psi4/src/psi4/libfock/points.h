@@ -32,6 +32,7 @@
 #include "psi4/libmints/typedefs.h"
 #include "psi4/pragma.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <map>
 #include <unordered_map>
@@ -143,6 +144,12 @@ class PointFunctions : public BasisFunctions {
     /// force_compute forces basis function values at points to be re-computed.
     virtual void compute_points(std::shared_ptr<BlockOPoints> block, bool force_compute = true) = 0;
 
+    /// Populate phi (and gradient slots, if ansatz_ >= 1) for `block`, either via cache
+    /// hit or a fresh BasisFunctions::compute_functions call. Skips rho/grad/tau build.
+    /// Use when caller will overwrite point_values per its own density (e.g. REKS
+    /// per-microstate V_xc evaluator).
+    void prepare_basis_only(std::shared_ptr<BlockOPoints> block, bool force_compute = false);
+
     // => Accessors <= //
 
     std::shared_ptr<Vector> point_value(const std::string& key);
@@ -158,9 +165,10 @@ class PointFunctions : public BasisFunctions {
 
     // => Setters <= //
 
+    /// deriv_ never exceeds 1 regardless of ansatz: second derivatives serve no energy path.
     void set_ansatz(int ansatz) {
         ansatz_ = ansatz;
-        deriv_ = ansatz;
+        deriv_ = std::min(ansatz, 1);
         allocate();
     }
     virtual void set_pointers(SharedMatrix Da_occ_AO) = 0;
@@ -182,7 +190,7 @@ class SAPFunctions : public PointFunctions {
 
     /// Buffer for half-transform
     SharedMatrix temp_;
-    /// Build temporary work arrays
+    /// Build the half-transform buffer, on first use.
     void build_temps();
     /// Allocate registers
     void allocate() override;
@@ -217,7 +225,7 @@ class RKSFunctions : public PointFunctions {
     /// Local D matrix
     SharedMatrix D_local_;
 
-    /// Build temporary work arrays
+    /// Build the half-transform and local-density work arrays, on first use.
     void build_temps();
     /// Allocate registers
     void allocate() override;
@@ -274,7 +282,7 @@ class UKSFunctions : public PointFunctions {
     /// Local D matrix
     SharedMatrix Db_local_;
 
-    /// Build temporary work arrays
+    /// Build the half-transform and local-density work arrays, on first use.
     void build_temps();
     /// Allocate registers
     void allocate() override;
@@ -296,9 +304,6 @@ class UKSFunctions : public PointFunctions {
 
     void set_pointers(SharedMatrix Da_occ_AO) override;
     void set_pointers(SharedMatrix Da_occ_AO, SharedMatrix Db_occ_AO) override;
-    void set_cache_map(std::unordered_map<size_t, std::map<std::string, SharedMatrix>>* cache_map) {
-        cache_map_ = cache_map;
-    }
 
     /// Compute the needed DFT intermediates at the points in the block.
     /// "Which DFT intermediates are needed?" is determined from ansatz_.

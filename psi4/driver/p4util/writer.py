@@ -338,6 +338,10 @@ def _write_molden(
             occupation_b = self.reference_wavefunction().occupation_b()
         epsilon_a = self.epsilon_a()
         epsilon_b = self.epsilon_b()
+        # Use FON as occupation if fon_occupation is defined.
+        if hasattr(self, "fon_occupation"):
+            occupation_a = self.fon_occupation()
+            occupation_b = occupation_a
 
 
     # Convert C matrices to AO MO basis. Ca_subset costs information about which symmetry an orbital originally had, which is why we can't use it.

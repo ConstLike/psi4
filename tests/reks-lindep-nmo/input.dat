@@ -1,0 +1,54 @@
+#! REKS on a rank-reduced basis (Nmo < Nso). Canonical orthogonalization removes a
+#! near-linearly-dependent MO (raised S_TOLERANCE forces the drop on a light basis),
+#! so the retained MO count Nmo is less than the AO count Nso. REKS must run in the
+#! Nmo space the way RKS/UKS do, instead of assuming Nmo == Nso in the Fock build.
+
+molecule h2 {
+  0 1
+  H 0.0 0.0 0.0
+  H 0.0 0.0 0.7
+  symmetry c1
+  no_com
+  no_reorient
+}
+
+set basis aug-cc-pVDZ
+set scf_type pk
+set s_tolerance 1.0e-3       # drop the near-null overlap combination -> Nmo < Nso
+
+reks_opts = {
+    'reference':          'reks',
+    'reks':               [2, 2],
+    'reks_sa_weights':    [0.5, 0.5],
+    'dft_grid_name':      'SG1',
+    'level_shift':        0.6,
+    'level_shift_cutoff': 0.0,
+    'level_shift_adapt':  True,
+    'reks_use_trah':      True,
+    'reks_gvb_diis':      False,
+    'df_scf_guess':       False,
+    'scf_initial_accelerator': 'NONE',
+    'diis':               False,
+    'soscf':              False,
+    'fail_on_maxiter':    False,
+    'maxiter':            150,
+    'd_convergence':      6,
+    'e_convergence':      8,
+    'guess':              'sad',
+}
+psi4.set_options(reks_opts)
+
+E, wfn = psi4.energy('bhhlyp', return_wfn=True)
+
+# The retained-MO count must be strictly below the AO count: this is the code
+# path (Nmo < Nso) that the fix targets. If canonical orthogonalization did not
+# drop a combination, the test would not exercise the bug at all.
+nso = wfn.nso()
+nmo = wfn.nmo()
+compare_integers(1, int(nmo < nso), "Nmo < Nso (rank-reduced basis exercised)")  #TEST
+compare_integers(18, nso, "Nso (aug-cc-pVDZ H2)")                                #TEST
+compare_integers(17, nmo, "Nmo (one combination removed)")                       #TEST
+
+# SA-REKS energy in the reduced-MO space (regression lock).
+ref_E_sa = -0.9246013607
+compare_values(ref_E_sa, float(E), 6, "SA-REKS energy at Nmo < Nso")  #TEST

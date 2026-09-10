@@ -1,0 +1,149 @@
+#! REKS(2,2)/H2 with meta-GGA M06-L -- exercises the live `is_gga()&&x_alpha<0.01`
+#! virtual-virtual fix branch in reks.cc:4712-4726 AND meta-GGA tau path in
+#! UV::compute_V (ansatz==2). Confirms REKS supports meta-GGA at runtime.
+import os
+import shutil
+
+TEST_NAME  = 'h2_g0_2sa_3si_m06l'
+R_VALUES   = [0.80, 0.85]
+N_ATOMS    = 2
+OUT_DIR    = os.getcwd()
+OPTS       = {'basis': '6-31g(d)', 'scf_type': 'pk', 'reference': 'reks', 'df_scf_guess': False, 'maxiter': 150, 'e_convergence': 8, 'd_convergence': 6, 'dft_grid_name': 'SG1', 'scf_initial_accelerator': 'NONE', 'scf_initial_start_diis_transition': 0.1, 'scf_initial_finish_diis_transition': 0.0001, 'diis': False, 'diis_start': 1, 'diis_max_vecs': 10, 'diis_rms_error': True, 'soscf': False, 'soscf_start_convergence': 0.01, 'damping_percentage': 0.0, 'level_shift_cutoff': 0.0, 'reks_report_level': 4, 'fail_on_maxiter': False, 'level_shift': 0.6, 'level_shift_adapt': True, 'reks_use_trah': True, 'reks_gvb_diis': False, 'guess': 'SAD', 'reks': [2, 2], 'reks_sa_weights': [0.5, 0.5]}
+FUNCTIONAL = 'm06-l'
+MODES      = ["cold", "read"]
+
+ATOL_E   = 1e-07
+ATOL_FON = 1e-05
+
+REF = {'cold': {'R=0.8000': {'E_sa': -0.9120063921672089, 'n_iter': 13, 'fon': {'n0_0_1': 1.999979435314068}, 'E_si': {'K0_S0': -1.166278864182866, 'K0_S1': -0.6577339201515584, 'K0_S2': -0.1864394530185277}}, 'R=0.8500': {'E_sa': -0.9193046065282936, 'n_iter': 13, 'fon': {'n0_0_1': 1.9999646153472386}, 'E_si': {'K0_S0': -1.1626819070973866, 'K0_S1': -0.6759273059606751, 'K0_S2': -0.24091866247134266}}}, 'read': {'R=0.8500': {'E_sa': -0.9193046065131587, 'n_iter': 9, 'fon': {'n0_0_1': 1.99996461632889}, 'E_si': {'K0_S0': -1.1626816604948504, 'K0_S1': -0.6759275525314912, 'K0_S2': -0.2409173857261852}}}}
+
+
+def make_mol(R):
+    lines = ["0 1"]
+    for i in range(N_ATOMS):
+        lines.append(f"H  0.0  0.0  {i * R:.6f}")
+    lines.append("symmetry c1")
+    return psi4.geometry("\n".join(lines))
+
+
+def _si_K_list(wfn):
+    if not wfn.has_array_variable("SSR SI LIST"):
+        return []
+    return [int(round(x)) for x in wfn.array_variable("SSR SI LIST").np.flatten()]
+
+
+def _read_fon_block(wfn, val_name, meta_name, prefix):
+    if not wfn.has_array_variable(val_name):
+        return {}
+    vals = wfn.array_variable(val_name).np.flatten()
+    if not wfn.has_array_variable(meta_name):
+        return {f"{prefix}_g{g}": float(vals[g]) for g in range(len(vals))}
+    meta = wfn.array_variable(meta_name).np  # (3, N)
+    out = {}
+    for g in range(len(vals)):
+        scheme = int(round(meta[0, g]))
+        p = int(round(meta[1, g]))
+        q = int(round(meta[2, g]))
+        out[f"{prefix}{scheme}_{p}_{q}"] = float(vals[g])
+    return out
+
+
+def _collect_fons(wfn):
+    fon = {}
+    fon.update(_read_fon_block(wfn, "REKS FON",   "REKS FON META",   "n"))
+    fon.update(_read_fon_block(wfn, "REKS M_FON", "REKS M_FON META", "m"))
+    for K in _si_K_list(wfn):
+        fon.update(_read_fon_block(
+            wfn, f"REKS FON K={K}",   f"REKS FON META K={K}",   "n"
+        ))
+        fon.update(_read_fon_block(
+            wfn, f"REKS M_FON K={K}", f"REKS M_FON META K={K}", "m"
+        ))
+    return fon
+
+
+def _collect_e_si(wfn):
+    out = {}
+    for K in _si_K_list(wfn):
+        name = f"SSR ENERGIES K={K}"
+        if not wfn.has_array_variable(name):
+            continue
+        E = wfn.array_variable(name).np.flatten()
+        for I in range(len(E)):
+            out[f"K{K}_S{I}"] = float(E[I])
+    return out
+
+
+def run_point(R, mode, prev_backup):
+    psi4.core.set_output_file(
+        os.path.join(OUT_DIR, f"{mode}_R{R:.4f}.out"), False
+    )
+    mol = make_mol(R)
+    opts = dict(OPTS)
+    if mode == "read" and prev_backup is not None:
+        prefix = psi4.core.get_writer_file_prefix(mol.name())
+        fname = os.path.basename(os.path.abspath(prefix))
+        scratch = psi4.core.IOManager.shared_object().get_default_path()
+        shutil.copy2(prev_backup, os.path.join(scratch, fname + ".180.npy"))
+        opts["guess"] = "read"
+    else:
+        opts["guess"] = "sad"
+    psi4.set_options(opts)
+    E, wfn = psi4.energy(FUNCTIONAL, return_wfn=True)
+    rec = {
+        "E_sa":   float(E),
+        "n_iter": int(wfn.iteration_),
+        "fon":    _collect_fons(wfn),
+        "E_si":   _collect_e_si(wfn),
+    }
+    src_npy = wfn.get_scratch_filename(180) + ".npy"
+    backup = None
+    if os.path.exists(src_npy):
+        backup = os.path.join(OUT_DIR, f"backup_R{R:.4f}.180.npy")
+        shutil.copy2(src_npy, backup)
+    return rec, backup
+
+
+def _check(prefix, rec, ref):
+    if "E_sa" in ref:
+        compare_values(ref["E_sa"], rec["E_sa"], ATOL_E, f"{prefix} E_sa")  #TEST
+    if "n_iter" in ref and rec["n_iter"] > ref["n_iter"] + 10:
+        raise AssertionError(
+            f"{prefix} n_iter regression: {rec['n_iter']} > ref {ref['n_iter']} + 10"
+        )
+    for k, v in ref.get("fon", {}).items():
+        got = rec["fon"].get(k)
+        if got is None:
+            raise AssertionError(f"{prefix} fon[{k}] missing")
+        compare_values(v, got, ATOL_FON, f"{prefix} fon[{k}]")  #TEST
+    for k, v in ref.get("E_si", {}).items():
+        got = rec["E_si"].get(k)
+        if got is None:
+            raise AssertionError(f"{prefix} E_si[{k}] missing")
+        compare_values(v, got, ATOL_E, f"{prefix} E_si[{k}]")  #TEST
+
+
+def main():
+    prev_backup = None
+    run_cold = "cold" in MODES
+    run_read = "read" in MODES
+    for i, R in enumerate(R_VALUES):
+        R_key = f"R={R:.4f}"
+        backup = None
+        if run_cold:
+            psi4.core.clean()
+            rec, backup = run_point(R, "cold", None)
+            cold_ref = REF.get("cold", {}).get(R_key)
+            if cold_ref is not None:
+                _check(f"cold/{R_key}", rec, cold_ref)
+        if run_read and i > 0 and prev_backup is not None:
+            psi4.core.clean()
+            rec2, _ = run_point(R, "read", prev_backup)
+            read_ref = REF.get("read", {}).get(R_key)
+            if read_ref is not None:
+                _check(f"read/{R_key}", rec2, read_ref)
+        prev_backup = backup
+    psi4.core.clean()
+
+
+main()

@@ -89,7 +89,8 @@ foreach(test_name aediis-1
                   pywrap-checkrun-rohf pywrap-checkrun-uhf pywrap-db1
                   pywrap-db3
                   pywrap-molecule rasci-c2-active rasci-h2o
-                  rasci-ne rasscf-sp sad-scf-type sad1 sapt1 sapt2 sapt3 sapt4 sapt5 sapt6 sapt-dft-api sapt-dft-lrc
+                  rasci-ne rasscf-sp
+                  sad-scf-type sad1 sapt1 sapt2 sapt3 sapt4 sapt5 sapt6 sapt-dft-api sapt-dft-lrc
                   remp-energy1 remp-energy2
                   sapt-exch-disp-inf sapt-exch-ind-inf sapt-exch-ind30-inf
                   sapt7 sapt8 scf-bz2 scf-dipder scf-guess scf-guess-read1 scf-upcast-custom-basis
@@ -107,6 +108,121 @@ foreach(test_name aediis-1
                   dft-pruning freq-masses sapt9 sapt10 sapt11 scf-uhf-grad-nobeta
                   linK-1 linK-2 linK-3
                   cbs-xtpl-energy-conv ddd-deriv nbody-he-4b ddd-function-kwargs dfmp2f12-1
+                  # === ZVALIDE BEGIN ===
+                  reks-h2-debug_g0_2sa_3si
+                  reks-h2_g0_2sa_3si
+                  reks-h2_g0_3sa_3si
+                  reks-h2_g1_2sa_3si
+                  reks-h2_g1_2sa_3si_gvbdiis
+                  reks-h2_g1_2sa_3si_scfcd
+                  reks-h2_g1_2sa_3si_scfdf
+                  reks-h2_g1_2sa_3si_scfdirect
+                  reks-h2_g1_2sa_3si_scfmemdf
+                  reks-h2_g1_2sa_3si_scfooc
+                  reks-h2_g1_3sa_3si
+                  reks-h2_g2_2sa_3si
+                  reks-h2_g2_3sa_3si
+                  reks-h4-2cass_g0_3sa_2cass_ab
+                  reks-h4-2cass_g0_3sa_2cass_ba
+                  reks-h4-debug_g0_3sa_18si
+                  reks-h4-names_g0_3sa_9si_names
+                  reks-h4-revorder_g0_3sa_18si_rev
+                  reks-h4-revorder_g0_3sa_9si_rev
+                  reks-h4-subset_g0_3sa_18si_subset_9like
+                  reks-h4_g0_3sa_18si
+                  reks-h4_g0_3sa_9si
+                  reks-h4_g0_4sa_18si
+                  reks-h4_g0_4sa_9si
+                  reks-h4_g1_3sa_18si
+                  reks-h4_g1_3sa_18si_gvbdiis
+                  reks-h4_g1_3sa_18si_scfcd
+                  reks-h4_g1_3sa_18si_scfdf
+                  reks-h4_g1_3sa_18si_scfdirect
+                  reks-h4_g1_3sa_18si_scfmemdf
+                  reks-h4_g1_3sa_18si_scfooc
+                  reks-h4_g1_3sa_9si
+                  reks-h4_g1_4sa_18si
+                  reks-h4_g1_4sa_9si
+                  reks-h4_g2_3sa_18si
+                  reks-h4_g2_3sa_9si
+                  reks-h4_g2_4sa_18si
+                  reks-h4_g2_4sa_9si
+                  reks-h4_g3_3sa_18si
+                  reks-h4_g3_3sa_9si
+                  reks-hf_h2_1sa_1si_2s2_trah
+                  reks-hf_h2_2sa_3si_csam_df
+                  reks-hf_h2_2sa_3si_csam_pk
+                  reks-hf_h2_2sa_3si_density_dfdirj_link
+                  reks-hf_h2_2sa_3si_density_direct
+                  reks-hf_h2_2sa_3si_gvbdiis_cfm
+                  reks-hf_h2_2sa_3si_gvbdiis_orb
+                  reks-hf_h2_2sa_3si_trah
+                  reks-hf_h4_1sa_1si_2s4_trah
+                  reks-hf_h4_2sa_11si_2s2_trah
+                  reks-hf_h4_3sa_18si_csam_df
+                  reks-hf_h4_3sa_18si_csam_pk
+                  reks-hf_h4_3sa_18si_density_dfdirj_link
+                  reks-hf_h4_3sa_18si_density_direct
+                  reks-hf_h4_3sa_18si_gvbdiis_cfm
+                  reks-hf_h4_3sa_18si_gvbdiis_orb
+                  reks-hf_h4_3sa_18si_trah
+                  reks-hf_h4_3sa_9si_gvbdiis_cfm
+                  reks-hf_h4_3sa_9si_gvbdiis_orb
+                  reks-hf_h4_3sa_9si_trah
+                  reks-hf_h4_3sa_si10_gvbdiis_orb
+                  reks-hf_h4_3sa_si10rev_gvbdiis_orb
+                  reks-hf_h4_3sa_si12_gvbdiis_orb
+                  reks-hf_h4_3sa_si12rev_gvbdiis_orb
+                  reks-hf_h4_3sa_si16_gvbdiis_orb
+                  reks-hf_h4_3sa_si16rev_gvbdiis_orb
+                  reks-hf_h4_3sa_si18_gvbdiis_orb
+                  reks-hf_h4_3sa_si18rev_gvbdiis_orb
+                  reks-hf_h4_3sa_si2hi_gvbdiis_orb
+                  reks-hf_h4_3sa_si2hirev_gvbdiis_orb
+                  reks-hf_h4_3sa_si2lo_gvbdiis_orb
+                  reks-hf_h4_3sa_si2lorev_gvbdiis_orb
+                  reks-hf_h4_3sa_si3a_gvbdiis_orb
+                  reks-hf_h4_3sa_si3arev_gvbdiis_orb
+                  reks-hf_h4_3sa_si3b_gvbdiis_orb
+                  reks-hf_h4_3sa_si3brev_gvbdiis_orb
+                  reks-hf_h4_3sa_si4a_gvbdiis_orb
+                  reks-hf_h4_3sa_si4arev_gvbdiis_orb
+                  reks-hf_h4_3sa_si4b_gvbdiis_orb
+                  reks-hf_h4_3sa_si4brev_gvbdiis_orb
+                  reks-hf_h4_3sa_si5_gvbdiis_orb
+                  reks-hf_h4_3sa_si5rev_gvbdiis_orb
+                  reks-hf_h4_3sa_si6_gvbdiis_orb
+                  reks-hf_h4_3sa_si6rev_gvbdiis_orb
+                  reks-hf_h4_3sa_si8_gvbdiis_orb
+                  reks-hf_h4_3sa_si8rev_gvbdiis_orb
+                  reks-hf_h6_1sa_1si_2s6_trah
+                  reks-hf_h6_3sa_153si_2s2_trah
+                  reks-hf_h6_4sa_27si_gvbdiis_cfm
+                  reks-hf_h6_4sa_27si_trah
+                  reks-sec22_02_si
+                  reks-sec22_extrasonly
+                  reks-sec44_02
+                  reks-sec44_02_si
+                  reks-sec44_02_sionly
+                  reks-sec44_defaultpool_2s2
+                  reks-sec44_gdd
+                  reks-sec44_perm
+                  reks-sec66_02
+                  # === ZVALIDE END ===
+                  reks-h2_g0_2sa_3si_blyp
+                  reks-h2_g0_2sa_3si_m06l
+                  reks-rv-uv-equivalence
+                  reks-guess-reorder
+                  reks-inputval
+                  reks-lindep-nmo
+                  reks-diis-gate-units
+                  reks-read-geom
+                  reks-read-basis
+                  reks-read-geom-basis
+                  reks-hf_h6_4sa_27si_gvbdiis_orb
+                  reks-n2-gvbdiis-orb
+                  reks-lrc-wpbe
+                  reks-pbe-gvbdiis
                   )
     add_subdirectory(${test_name})
 endforeach()

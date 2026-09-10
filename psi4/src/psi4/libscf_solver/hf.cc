@@ -854,7 +854,7 @@ void HF::print_orbitals() {
     outfile->Printf("    Orbital Energies [Eh]\n    ---------------------\n\n");
 
     std::string reference = options_.get_str("REFERENCE");
-    if ((reference == "RHF") || (reference == "RKS")) {
+    if ((reference == "RHF") || (reference == "RKS") || (reference == "REKS")) {
         std::vector<std::pair<double, std::pair<std::string, int> > > occ;
         std::vector<std::pair<double, std::pair<std::string, int> > > vir;
 
@@ -1068,9 +1068,33 @@ void HF::guess() {
             nbeta_ = nbetapi_.sum();
         }
 
+        // Seed Fa_ / Fb_ from the saved wavefunction; skip on shape mismatch.
+        if (guess_Fa_ && Fa_
+            && guess_Fa_->nirrep() == nirrep_
+            && guess_Fa_->rowspi() == nsopi_
+            && guess_Fa_->colspi() == nsopi_) {
+            Fa_->copy(guess_Fa_);
+            if (single_orb) {
+                Fb_ = Fa_;
+            } else if (Fb_) {
+                if (guess_Fb_
+                    && guess_Fb_->nirrep() == nirrep_
+                    && guess_Fb_->rowspi() == nsopi_
+                    && guess_Fb_->colspi() == nsopi_) {
+                    Fb_->copy(guess_Fb_);
+                } else {
+                    Fb_->copy(guess_Fa_);
+                }
+            }
+        }
+
+        if (options_.get_int("DEBUG") >= 1) {
+            outfile->Printf("  [READ_DBG] HF::guess READ: Ca_cols=%d Cb=%s nalphapi[0]=%d nbetapi[0]=%d Fa_seed=%s\n",
+                            guess_Ca_->colspi()[0], guess_Cb_ ? "set" : "null",
+                            nalphapi_[0], nbetapi_[0], guess_Fa_ ? "yes" : "no");
+        }
         format_guess();
         form_D();
-
         // This is a guess iteration: orbital occupations may be reset in SCF
         iteration_ = -1;
         guess_E = compute_initial_E();

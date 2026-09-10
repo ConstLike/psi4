@@ -101,6 +101,8 @@ class PSI_API VBase {
     double vv10_nlc(SharedMatrix D, SharedMatrix ret);
     SharedMatrix vv10_nlc_gradient(SharedMatrix D);
 
+    /// Rebuild the per-thread point workers if a subclass drops them; a no-op by default.
+    virtual void ensure_point_workers() {}
     /// Set things up
     void common_init();
 
@@ -116,6 +118,9 @@ class PSI_API VBase {
     std::shared_ptr<SuperFunctional> functional() const { return functional_; }
     std::vector<std::shared_ptr<PointFunctions>> properties() const { return point_workers_; }
     std::shared_ptr<DFTGrid> grid() const { return grid_; }
+    /// Adopt a grid built for the same molecule, basis and options instead of building one.
+    /// Must be called before initialize(), which only builds a grid when none is set.
+    void set_grid(std::shared_ptr<DFTGrid> grid) { grid_ = grid; }
     std::shared_ptr<BlockOPoints> get_block(int block);
     size_t nblocks();
     std::map<std::string, double>& quadrature_values() { return quad_values_; }
@@ -123,6 +128,8 @@ class PSI_API VBase {
     // Creates a collocation cache map based on stride
     void build_collocation_cache(size_t memory);
     void clear_collocation_cache() { cache_map_.clear(); }
+
+    void share_collocation_cache_from(VBase& source);
 
     // Set the D matrix, get it back if needed
     void set_D(std::vector<SharedMatrix> Dvec);
@@ -165,7 +172,13 @@ class SAP : public VBase {
 
 class RV : public VBase {
    protected:
+    /// Build one RKSFunctions per thread over the current grid extents.
+    void build_point_workers();
+    void ensure_point_workers() override { if (point_workers_.empty()) build_point_workers(); }
+
    public:
+    /// Drop the per-thread point workers; every RV sweep rebuilds them if they are gone.
+    void release_point_workers() { point_workers_.clear(); }
     RV(std::shared_ptr<SuperFunctional> functional, std::shared_ptr<BasisSet> primary, Options& options);
     ~RV() override;
 
@@ -193,6 +206,53 @@ class RV : public VBase {
 
 class UV : public VBase {
    protected:
+    /// Per-thread scratch, retained across calls and rebuilt only when Shape changes.
+    /// Buffers are zeroed before use; retention alone does not clear them.
+    struct MicrostateScratch {
+        /// Every extent the buffers depend on. A mismatch rebuilds the whole set.
+        struct Shape {
+            int nbf = -1;
+            int nmo = -1;
+            int n_p = -1;
+            int nact = -1;
+            int n_micro = -1;
+            int n_strings = -1;
+            int max_points = -1;
+            int max_functions = -1;
+            int chunk = -1;
+            int ansatz = -1;
+            int num_threads = -1;
+            int need_diag = -1;
+            int acc_w = -1;      ///< second axis of the weighted active-row accumulator
+            int project_in_block = -1;  ///< 1 when MO window == active block; TapWide is then one slice wide, not several
+            bool operator==(const Shape& o) const {
+                return nbf == o.nbf && nmo == o.nmo && n_p == o.n_p && nact == o.nact &&
+                       n_micro == o.n_micro && n_strings == o.n_strings && max_points == o.max_points &&
+                       max_functions == o.max_functions && chunk == o.chunk && ansatz == o.ansatz &&
+                       num_threads == o.num_threads && need_diag == o.need_diag &&
+                       acc_w == o.acc_w && project_in_block == o.project_in_block;
+            }
+        };
+        /// One thread's buffers.
+        struct Thread {
+            SharedMatrix Cloc, chi, chix, chiy, chiz;
+            SharedMatrix Sd, TapAcc_a, TapAcc_b, Vloc, MbpT;
+            SharedMatrix SDrho, SDgx, SDgy, SDgz, SDgam, SDtau;
+            SharedMatrix TapWide, TAwide, M1w, M2S, M3, Vcof;
+            std::map<std::string, SharedVector> bin;
+            std::shared_ptr<SuperFunctional> bworker;
+            std::vector<double> diA, diB, trA, trB, exc, stauA, stauB;
+            /// MO-diagonal staging: point-local products, and the per-slice diagonal.
+            std::vector<double> Zd, Dd;
+        };
+        Shape shape;
+        std::vector<Thread> threads;
+        /// Call-level scratch shared by every thread: weighted-AO active rows per spin,
+        /// written under one lock per microstate, and the MO-projection buffer.
+        std::vector<double> wa_a_all, wa_b_all, proj;
+    };
+    MicrostateScratch ms_scratch_;
+
    public:
     UV(std::shared_ptr<SuperFunctional> functional, std::shared_ptr<BasisSet> primary, Options& options);
     ~UV() override;
@@ -201,13 +261,43 @@ class UV : public VBase {
     void finalize() override;
 
     void compute_V(std::vector<SharedMatrix> ret) override;
-    /// Compute the orbital derivative of the KS potential, contract against Dx, and
-    /// putting the result in ret. ret[i] is Vx where x = Dx[i].
-    /// ret[2n], ret[2n+1] are alpha and beta Vx where x concatenates Dx[2n] (α) and Dx[2n+1] (β).
+    /// Orbital derivative of the KS potential, contracted against Dx.
+    /// ret[i] is Vx where x = Dx[i].
+    /// ret[2n], ret[2n+1] are alpha and beta Vx where x concatenates Dx[2n] (alpha) and Dx[2n+1] (beta).
     void compute_Vx(const std::vector<SharedMatrix> Dx, std::vector<SharedMatrix> ret) override;
     std::vector<SharedMatrix> compute_fock_derivatives() override;
     SharedMatrix compute_gradient() override;
     SharedMatrix compute_hessian() override;
+
+    /// Grid-direct microstate XC. For K microstates sharing the MO basis Ca_full
+    /// (all nmo columns), computes WITHOUT materializing a per-microstate AO V_xc:
+    ///   - E_xc[L], tr_a[L]=tr(rho^L_a V_xc^L_a), tr_b[L]   (self-trace, grid form);
+    ///   - arows_{a,b}[L] [n_active x mo_width]: active MO rows of C^T V_xc^L C over the
+    ///     MO column window [mo_lo, mo_lo + mo_width), mo_width taken from the arows;
+    ///   - diag_{a,b}[L]  [nmo]: diagonal of C^T V_xc^L C, only when need_diag; left
+    ///     empty otherwise;
+    ///   - V_acc_{a,b} [nbf x nbf]: ONE C_L-weighted AO back-projection Sum_L C_L V_xc^L_{a,b},
+    ///     skipped entirely when the pair is null;
+    ///   - quad_values_["RHO_A"/"RHO_B"] = quadrature integral of the C_L-weighted
+    ///     total density (grid-electron diagnostic, closed-shell RHO convention).
+    /// occ over the first n_p = Ncore+n_active columns (active contiguous: active_mo[i]=Ncore+i).
+    void compute_V_microstates_mo(SharedMatrix Ca_full,
+                                  int Ncore, int n_active,
+                                  const std::vector<int>& active_mo,
+                                  const std::vector<std::vector<double>>& occ_alpha,
+                                  const std::vector<std::vector<double>>& occ_beta,
+                                  const std::vector<double>& C_L,
+                                  std::vector<SharedMatrix>& arows_a,
+                                  std::vector<SharedMatrix>& arows_b,
+                                  std::vector<std::vector<double>>& diag_a,
+                                  std::vector<std::vector<double>>& diag_b,
+                                  std::vector<double>& tr_a,
+                                  std::vector<double>& tr_b,
+                                  std::vector<double>& E_xc,
+                                  SharedMatrix V_acc_a,
+                                  SharedMatrix V_acc_b,
+                                  bool need_diag,
+                                  int mo_lo = 0);
 
     void print_header() const override;
 };

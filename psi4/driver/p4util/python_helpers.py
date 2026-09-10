@@ -423,6 +423,58 @@ def _core_wavefunction_to_file(wfn: core.Wavefunction, filename: str = None) -> 
 
 core.Wavefunction.to_file = _core_wavefunction_to_file
 
+
+# ============================================================================
+# REKS multi-SI helpers
+# ============================================================================
+#
+# REKS wavefunctions produced with SI_REKS_CONFIGS run one SA-REKS SCF
+# followed by several independent SI post-SCF computations, one per
+# edit_list in the input list. Each SI module persists its eigensystem and
+# state properties under keys "<BASE> K=<K>" in wfn.array_variables(), where
+# K is the module's position in SI_REKS_CONFIGS (0, 1, ..., addressable by
+# list index, unique by construction). The primary alias (K=0, the first
+# edit_list) is also exposed under the base names without a suffix for
+# backward compatibility.
+#
+# After wfn.to_file()/from_file(), the wavefunction is no longer a REKS
+# object, so the C++ methods wfn.SI_energies()/SI_hamiltonian()/... are
+# unavailable. These Python helpers give uniform access via array_variables.
+
+def _wfn_si_list(wfn: core.Wavefunction) -> list:
+    """Return the ordered list of SI module indices available in this wavefunction.
+
+    Each index is the module's position in SI_REKS_CONFIGS (0, 1, ...), matching
+    the "<BASE> K=<K>" array-variable suffix. Returns an empty list if no SI
+    post-SCF was performed (SA-only or non-REKS wavefunction). Reads the
+    'SSR SI LIST' array variable.
+    """
+    if not wfn.has_array_variable("SSR SI LIST"):
+        return []
+    arr = wfn.array_variable("SSR SI LIST").to_array().flatten()
+    return [int(round(x)) for x in arr]
+
+
+def _wfn_si(wfn: core.Wavefunction, base: str, K: Optional[int] = None) -> core.Matrix:
+    """Fetch a REKS multi-SI array variable.
+
+    Parameters
+    ----------
+    base : str
+        Base name, e.g. "SSR ENERGIES", "SSR HAMILTONIAN", "SSR PERMANENT DIPOLES".
+    K : int, optional
+        SI module index (its position in SI_REKS_CONFIGS, 0-based), as returned
+        by wfn.si_list(). When None, returns the primary alias (the first
+        edit_list, K=0).
+    """
+    key = base if K is None else f"{base} K={K}"
+    return wfn.array_variable(key)
+
+
+core.Wavefunction.si_list = _wfn_si_list
+core.Wavefunction.si = _wfn_si
+
+
 ## Python JK helps
 
 
@@ -577,16 +629,14 @@ def set_options(options_dict: Dict[str, Any], verbose: int = 1):
         option = mobj.group('option').upper()
 
         if module:
-            if ((module, option, v) not in [('SCF', 'GUESS', 'READ')]) and ((module, option) not in [('PCM', 'INPUT')]):
-                # TODO guess/read exception is for distributed driver. should be handled differently.
+            if (module, option) != ("PCM", "INPUT"):
                 try:
                     core.set_local_option(module, option, v)
                 except RuntimeError as err:
                     rejected[k] = (v, err)
                 if verbose > 1:
                     print('Setting: core.set_local_option', module, option, v)
-
-            if (module, option) == ("PCM", "INPUT"):
+            else:
                 pcm_helper(v)
 
         else:
@@ -1611,5 +1661,85 @@ def _core_triplet(A, B, C, transA, transB, transC):
 # removed in v1.10 to reduce API footprint. deprecated 1.4 and no-op since 1.9
 core.Matrix.doublet = staticmethod(_core_doublet)
 core.Matrix.triplet = staticmethod(_core_triplet)
+
+
+_MO_TOKEN_RE = re.compile(r'^(HOMO|LUMO)([+-]\d+)?$')
+
+
+def _parse_mo_token(token: str, n_alpha: int, opt: str = 'GUESS_MO_SWAPS') -> int:
+    """Resolve a single MO token to a 0-based MO index."""
+    tok = token.strip().upper()
+    if tok.lstrip('-').isdigit():
+        return int(tok)
+    m = _MO_TOKEN_RE.match(tok)
+    if not m:
+        raise ValidationError(f"{opt} bad token: {token!r}")
+    base = (n_alpha - 1) if m.group(1) == 'HOMO' else n_alpha
+    return base + (int(m.group(2)) if m.group(2) else 0)
+
+
+def _parse_mo_swaps(spec: str, n_alpha: int) -> List[Tuple[int, int]]:
+    """Parse GUESS_MO_SWAPS spec string into list of (i, j) pairs."""
+    swaps: List[Tuple[int, int]] = []
+    for chunk in (c for c in spec.split(',') if c.strip()):
+        parts = chunk.split()
+        if len(parts) != 2:
+            raise ValidationError(
+                f"GUESS_MO_SWAPS chunk {chunk!r}: expected exactly 2 whitespace-separated tokens")
+        i = _parse_mo_token(parts[0], n_alpha)
+        j = _parse_mo_token(parts[1], n_alpha)
+        swaps.append((i, j))
+    return swaps
+
+
+def _window_to_swaps(window: List, dest: List[int], n_alpha: int, nmo: int) -> List[Tuple[int, int]]:
+    """Resolve a GUESS_ACTIVE_WINDOW spec into the swap pairs that move the listed
+    MOs into columns `dest`, in the listed order."""
+    if len(window) != len(dest):
+        raise ValidationError(
+            f"GUESS_ACTIVE_WINDOW lists {len(window)} orbitals but the active space holds "
+            f"{len(dest)}: {list(window)}")
+    src = [_parse_mo_token(str(tok), n_alpha, 'GUESS_ACTIVE_WINDOW') for tok in window]
+    for tok, i in zip(window, src):
+        if not (0 <= i < nmo):
+            raise ValidationError(
+                f"GUESS_ACTIVE_WINDOW entry {tok!r} resolves to MO {i}, outside the {nmo} "
+                "orbitals of the guess wavefunction")
+    repeated = sorted({i for i in src if src.count(i) > 1})
+    if repeated:
+        raise ValidationError(
+            f"GUESS_ACTIVE_WINDOW names MO {repeated} more than once: {list(window)}")
+    if dest and dest[-1] >= nmo:
+        raise ValidationError(
+            f"GUESS_ACTIVE_WINDOW: active columns reach {dest[-1]}, past the {nmo} orbitals "
+            "of the guess wavefunction")
+
+    cur = list(range(nmo))  # cur[k] = guess MO currently in column k
+    swaps: List[Tuple[int, int]] = []
+    for p, i in zip(dest, src):
+        k = cur.index(i)
+        if k == p:
+            continue
+        swaps.append((p, k))
+        cur[p], cur[k] = cur[k], cur[p]
+    return swaps
+
+
+def _apply_mo_swaps(C: core.Matrix, swaps: List[Tuple[int, int]]) -> None:
+    """Swap MO columns in-place. nirrep=1 only."""
+    if C.nirrep() != 1:
+        raise ValidationError("MO column swap: nirrep>1 not supported")
+    nmo = C.coldim()[0]
+    nso = C.rowdim()[0]
+    for i, j in swaps:
+        if not (0 <= i < nmo and 0 <= j < nmo):
+            raise ValidationError(
+                f"MO column swap index out of range: ({i},{j}), nmo={nmo}")
+        if i == j:
+            continue
+        for mu in range(nso):
+            tmp = C.get(0, mu, i)
+            C.set(0, mu, i, C.get(0, mu, j))
+            C.set(0, mu, j, tmp)
 
 

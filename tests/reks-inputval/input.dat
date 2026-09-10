@@ -1,0 +1,218 @@
+#! REKS input-surface validation: every malformed REKS/SA/SI option deck must
+#! fail CLOSED with its specific diagnostic (never crash, never silently run).
+#! Covers the [N,M] grammar, SA_REKS_2SPIN / SI_REKS_2SPIN labeling (explicit,
+#! ladder, absent, empty), nesting-depth probes, removed-option rejection,
+#! alias conflicts, weights arity, the canonical-multiplicity gate, and the
+#! per-cassette reported-state cap.
+
+import psi4
+
+BASE = {
+    'basis': '6-31g(d)', 'scf_type': 'pk', 'reference': 'reks',
+    'reks_report_level': 2, 'guess': 'sad', 'reks_use_trah': True,
+}
+
+# (label, opts, wanted substrings, n_atoms, mult)
+CASES = [
+    # migrated legacy negative decks: old-style 3-element REKS with typed SA
+    ("01_threelem_multisa",
+     {'reks': [4, 4, 0], 'sa_reks_configs': [[0, 1, 2], [0, 1]],
+      'sa_reks_weights': [0.2] * 5},
+     ["the spin element was removed"], 4, 1),
+    # flat SA (one block) against a 2-label axis
+    ("02_flat_sa_two_labels",
+     {'reks': [4, 4], 'sa_reks_configs': [0, 1, 2],
+      'sa_reks_2spin': [0, 2], 'sa_reks_weights': [0.2] * 3},
+     ["2 label(s) for 1 typed SA block(s)"], 4, 1),
+    # three SA blocks against a 2-label axis
+    ("03_three_blocks_two_labels",
+     {'reks': [4, 4], 'sa_reks_configs': [[0, 1, 2], [0, 1], [0]],
+      'sa_reks_2spin': [0, 2], 'sa_reks_weights': [0.2] * 6},
+     ["2 label(s) for 3 typed SA block(s)"], 4, 1),
+    # unavailable manifold on the SA axis; resolved-mapping trace required
+    ("04_sa_missing_manifold",
+     {'reks': [4, 4], 'sa_reks_configs': [[0, 1, 2], []],
+      'sa_reks_2spin': [0, 10], 'sa_reks_weights': [0.2] * 3},
+     ["has no 2S=10 spin manifold (available 2S: 0, 2, 4)",
+      "SA block 0 -> 2S=0 (explicit)"], 4, 1),
+    # canonical-Ms gate, multi-block shape
+    ("05_mult_mismatch_h4",
+     {'reks': [4, 4], 'sa_reks_configs': [[0, 1, 2], [0, 1]],
+      'sa_reks_weights': [0.2] * 5},
+     ["N=4 implies molecule multiplicity 1"], 4, 3),
+    # three SI groups against a 2-label axis
+    ("06_si_three_groups_two_labels",
+     {'reks': [4, 4], 'sa_reks_configs': [[0, 1, 2], [0, 1]],
+      'sa_reks_weights': [0.2] * 5,
+      'si_reks_configs': [[[0, 1, 2]], [[0, 1]], [[0]]],
+      'si_reks_2spin': [0, 2]},
+     ["2 label(s) for 3 SI group(s)"], 4, 1),
+    # SI config index beyond the sector-local range
+    ("07_si_index_range",
+     {'reks': [4, 4], 'sa_reks_configs': [[0, 1, 2], [0, 1]],
+      'sa_reks_weights': [0.2] * 5,
+      'si_reks_configs': [[[0, 1, 2]], [[0, 100]]]},
+     ["config index (local) 100 is out of range [0, 11) for SI group 1 (2S=2)"], 4, 1),
+    # global-index habit: first out-of-block index of sector 0
+    ("08_si_cross_sector_idx",
+     {'reks': [4, 4], 'sa_reks_configs': [[0, 1, 2], [0, 1]],
+      'sa_reks_weights': [0.2] * 5,
+      'si_reks_configs': [[[0, 1, 2, 18]], [[0, 1]]]},
+     ["config index (local) 18 is out of range [0, 18) for SI group 0 (2S=0)"], 4, 1),
+    # REKS arity 0 / 1 / >3
+    ("09a_arity0", {'reks': []},
+     ["must have exactly 2 elements [N, M], got 0"], 4, 1),
+    ("09b_arity1", {'reks': [4]},
+     ["must have exactly 2 elements [N, M], got 1"], 4, 1),
+    ("09c_arity4", {'reks': [4, 4, 0, 0]},
+     ["must have exactly 2 elements [N, M], got 4"], 4, 1),
+    # 3-element REKS: removal error must carry the migration hint
+    ("10_threelem_hint", {'reks': [4, 4, 2]},
+     ["the spin element was removed", "sa_reks_2spin [2]"], 4, 1),
+    # removed options are unknown to liboptions
+    ("11_reks_sectors", {'reks': [4, 4], 'reks_sectors': [0, 2]},
+     ["REKS_SECTORS is not a valid option"], 4, 1),
+    ("12_initial_m_fon", {'reks': [4, 4], 'reks_initial_m_fon': [[0, 1]]},
+     ["REKS_INITIAL_M_FON is not a valid option"], 4, 1),
+    # SA 2SPIN length mismatch (labels > blocks)
+    ("13_sa_len_mismatch",
+     {'reks': [4, 4], 'sa_reks_configs': [[0, 1, 2], [0, 1]],
+      'sa_reks_2spin': [0, 2, 4], 'sa_reks_weights': [0.2] * 5},
+     ["3 label(s) for 2 typed SA block(s)"], 4, 1),
+    # SI 2SPIN length mismatch (labels > groups)
+    ("14_si_len_mismatch",
+     {'reks': [4, 4], 'si_reks_configs': [[[0, 1, 2]], [[0, 1]]],
+      'si_reks_2spin': [0, 2, 4]},
+     ["3 label(s) for 2 SI group(s)"], 4, 1),
+    # duplicate label within one axis
+    ("15_dup_label",
+     {'reks': [4, 4], 'sa_reks_configs': [[0, 1, 2], [0, 1]],
+      'sa_reks_2spin': [2, 2], 'sa_reks_weights': [0.2] * 5},
+     ["pairwise distinct; 2S=2 is repeated"], 4, 1),
+    # unavailable manifold on the SI axis
+    ("16_si_missing_manifold",
+     {'reks': [4, 4], 'si_reks_configs': [[[0, 1]]], 'si_reks_2spin': [6]},
+     ["has no 2S=6 spin manifold (available 2S: 0, 2, 4)"], 4, 1),
+    # mixed nesting depth among SA elements
+    ("17_mixed_depth", {'reks': [4, 4], 'sa_reks_configs': [[0, 1], [[2]]]},
+     ["SA_REKS_CONFIGS: mixed nesting depth: element 0 has depth 1 but element 1 has depth 2"], 4, 1),
+    # ladder overrun, SA: more blocks than manifolds; ladder self-diagnosis
+    ("18_sa_ladder_overrun",
+     {'reks': [4, 4], 'sa_reks_configs': [[0], [0], [0], [0]]},
+     ["has 3 spin manifolds, got 4 SA blocks",
+      "Ladder mode maps block i to the i-th available manifold"], 4, 1),
+    # ladder overrun, SI
+    ("19_si_ladder_overrun",
+     {'reks': [4, 4], 'si_reks_configs': [[[0]], [[0]], [[0]], [[0]]]},
+     ["has 3 spin manifolds, got 4 SI groups"], 4, 1),
+    # 2SPIN len>1 while configs are absent (single default block/cassette)
+    ("20a_sa_2spin_no_configs", {'reks': [4, 4], 'sa_reks_2spin': [0, 2]},
+     ["2 labels but SA_REKS_CONFIGS is absent"], 4, 1),
+    ("20b_si_2spin_no_configs", {'reks': [4, 4], 'si_reks_2spin': [0, 2]},
+     ["2 labels but SI_REKS_CONFIGS is absent"], 4, 1),
+    # typed-empty configs [] + 2SPIN: near-miss hint to the legal default form
+    ("21a_sa_empty_plus_2spin",
+     {'reks': [4, 4], 'sa_reks_configs': [], 'sa_reks_2spin': [2]},
+     ["1 label(s) for 0 typed SA block(s)",
+      "OMIT sa_reks_configs and set sa_reks_2spin [x]"], 4, 1),
+    ("21b_si_empty_plus_2spin",
+     {'reks': [4, 4], 'si_reks_configs': [], 'si_reks_2spin': [2]},
+     ["1 label(s) for 0 SI group(s)",
+      "OMIT si_reks_configs and set si_reks_2spin [x]"], 4, 1),
+    # SI 2SPIN len>1 demands the 3-level form: depth error, not length error
+    ("22_si_depth_2level",
+     {'reks': [4, 4], 'si_reks_configs': [[0, 1], [0]],
+      'si_reks_2spin': [0, 2]},
+     ["got a 2-level list of cassettes"], 4, 1),
+    # scalar entry inside a 3-level group: cassette must be a list
+    ("23a_scalar_in_group",
+     {'reks': [4, 4], 'si_reks_configs': [[[0, 1], 2], [[0]]]},
+     ["must be a list of SI cassettes"], 4, 1),
+    # mixed depth among SI outer entries
+    ("23b_si_mixed_depth",
+     {'reks': [4, 4], 'si_reks_configs': [[[0, 1]], [0]]},
+     ["SI_REKS_CONFIGS: mixed nesting depth: element 0 has depth 2 but element 1 has depth 1"], 4, 1),
+    # alias pairs may not both be set
+    ("24a_sa_alias_both",
+     {'reks': [4, 4], 'sa_reks_configs': [[0, 1, 2]],
+      'sa_reks_2spin': [0], 'reks_sa_2spin': [0]},
+     ["Specify only one of 'SA_REKS_2SPIN' and 'REKS_SA_2SPIN'"], 4, 1),
+    ("24b_si_alias_both",
+     {'reks': [4, 4], 'si_reks_configs': [[[0, 1]]],
+      'si_reks_2spin': [0], 'reks_si_2spin': [0]},
+     ["Specify only one of 'SI_REKS_2SPIN' and 'REKS_SI_2SPIN'"], 4, 1),
+    # weights arity against typed configs + extras
+    ("25_weights_len",
+     {'reks': [4, 4], 'sa_reks_configs': [0, 1, 2],
+      'sa_reks_weights': [0.5, 0.5]},
+     ["expected 3 weights (SA_REKS_CONFIGS=3 + SA_REKS_EXTRA=0), got 2"], 4, 1),
+    # typed-empty SA, no extras, no SI: empty ensemble
+    ("26_empty_ensemble", {'reks': [4, 4], 'sa_reks_configs': []},
+     ["The REKS SA ensemble is empty"], 4, 1),
+    # 2SPIN set-but-empty []
+    ("27a_sa_2spin_empty",
+     {'reks': [4, 4], 'sa_reks_configs': [0, 1, 2], 'sa_reks_2spin': []},
+     ["SA_REKS_2SPIN: set but empty; omit it or list one 2S value per block/group"], 4, 1),
+    ("27b_si_2spin_empty",
+     {'reks': [4, 4], 'si_reks_configs': [[0, 1]], 'si_reks_2spin': []},
+     ["SI_REKS_2SPIN: set but empty"], 4, 1),
+    # canonical-Ms gate, minimal (2,2) shape
+    ("28_mult_mismatch_h2", {'reks': [2, 2]},
+     ["N=2 implies molecule multiplicity 1",
+      "Do not set the multiplicity to 2S+1"], 2, 3),
+    # report-states cap: set but empty []
+    ("29_report_empty",
+     {'reks': [4, 4], 'si_reks_configs': [[[0, 1]]], 'si_reks_report_states': []},
+     ["SI_REKS_REPORT_STATES: set but empty"], 4, 1),
+    # report-states cap with no SI cassette at all
+    ("30_report_no_cassettes",
+     {'reks': [4, 4], 'si_reks_configs': [], 'si_reks_report_states': [1]},
+     ["SI_REKS_REPORT_STATES: set but the run has no SI cassettes"], 4, 1),
+    # one value per cassette: two values against one cassette
+    ("31_report_len",
+     {'reks': [4, 4], 'si_reks_configs': [[[0, 1]]], 'si_reks_report_states': [1, 1]},
+     ["2 value(s) for 1 SI cassette(s); list exactly one per cassette"], 4, 1),
+    # entry below the floor
+    ("32_report_zero",
+     {'reks': [4, 4], 'si_reks_configs': [[[0, 1]]], 'si_reks_report_states': [0]},
+     ["entry 0 is 0; each value must be at least 1"], 4, 1),
+    # entry above the cassette dimension
+    ("33_report_over_dim",
+     {'reks': [4, 4], 'si_reks_configs': [[[0, 1]]], 'si_reks_report_states': [3]},
+     ["entry 0 is 3 but SI cassette 0 has dimension 2"], 4, 1),
+    # alias pair may not both be set
+    ("34_report_alias_both",
+     {'reks': [4, 4], 'si_reks_configs': [[[0, 1]]],
+      'si_reks_report_states': [1], 'reks_si_report_states': [1]},
+     ["Specify only one of 'SI_REKS_REPORT_STATES' and 'REKS_SI_REPORT_STATES'"], 4, 1),
+]
+
+
+def run_case(label, opts, wants, n_atoms, mult):
+    psi4.core.clean()
+    psi4.core.clean_options()
+    lines = [f"0 {mult}"] + [f"H 0.0 0.0 {i * 1.6:.6f}" for i in range(n_atoms)] + ["symmetry c1"]
+    psi4.geometry("\n".join(lines))
+    o = dict(BASE)
+    o.update(opts)
+    try:
+        psi4.set_options(o)
+        psi4.energy('hf')
+        print(f"@@ {label}: NO ERROR RAISED (fail-open)")
+        compare_integers(1, 0, f"{label}: raises")  #TEST
+        return
+    except Exception as e:
+        msg = str(e)
+        low = msg.lower()
+        for want in wants:
+            hit = want.lower() in low
+            if not hit:
+                flat = " | ".join(msg.strip().splitlines())
+                print(f"@@ {label}: MISSING SUBSTRING {want!r} in: {flat[:400]}")
+            compare_integers(1, int(hit), f"{label}: message carries {want!r}")  #TEST
+
+
+for label, opts, wants, n_atoms, mult in CASES:
+    run_case(label, opts, wants, n_atoms, mult)
+
+compare_integers(41, len(CASES), "all 41 negative cases exercised")  #TEST

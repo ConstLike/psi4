@@ -55,6 +55,7 @@ from ..p4util.exceptions import (
     ValidationError,
     docs_table_link,
 )
+from ..p4util.python_helpers import _parse_mo_swaps, _apply_mo_swaps, _window_to_swaps
 
 #from psi4.driver.molutil import *
 from ..qcdb.basislist import corresponding_basis
@@ -1423,6 +1424,177 @@ def build_functional_and_disp(name, restricted, save_pairwise_disp=False, **kwar
     else:
         return superfunc, None
 
+def _reks_block_basis_projection(Ca_in, old_wfn, scf_wfn):
+    """Block-wise Werner-Knowles projection preserving REKS orbital pair structure.
+
+    The standard single-call basis_projection (Polly, R. et al. Mol. Phys. 2004,
+    102, 2311) applies a global Lowdin T^{-1/2} across ALL MOs at once. For REKS
+    that mixes active MOs from different GVB pairs and destroys the pair structure
+    the FON solver depends on.
+
+    The block projection used here keeps the [core | active | virtual] partition
+    (and the per-pair structure inside active) intact:
+
+      1. Per-block Werner projection: each of {core, active, virtual} projects on
+         its own, so the Lowdin within a block cannot mix orbitals across blocks.
+      2. Hierarchical Gram-Schmidt + within-block Lowdin in Werner-Knowles 1985
+         Sec. II.B order (active against core, then virtual against [core,
+         active]) -- restores cross-block orthogonality exactly.
+      3. Per-pair Procrustes inside active: builds a per-pair Werner reference and
+         rotates the current active onto it via the closest unitary, recovering the
+         GVB pair character that orthonormalizing the active block as a whole mixes.
+
+    GVB pair layout (G=2): pair_k = (active_MO_k, active_MO_{M-1-k})
+      REKS(2,2): pair 0 = (0, 1)
+      REKS(4,4): pair 0 = (0, 3), pair 1 = (1, 2)
+      REKS(6,6): pair 0 = (0, 5), pair 1 = (1, 4), pair 2 = (2, 3)
+
+    Works for any REKS(N,M) active space with G=2 in C1 symmetry.
+    """
+    reks_spec = core.get_option("SCF", "REKS")
+    N_act_e   = int(round(reks_spec[0]))
+    n_act     = int(round(reks_spec[1]))
+    G         = 2  # GVB(2): orbitals per geminal pair (structural invariant)
+    nelectron = old_wfn.nalpha() + old_wfn.nbeta()
+    Ncore     = (nelectron - N_act_e) // 2
+    nmo       = old_wfn.nmopi()[0]
+    n_virt    = nmo - Ncore - n_act
+    n_pairs   = n_act // G
+
+    old_basis = old_wfn.basisset()
+    new_basis = scf_wfn.basisset()
+    nso_old   = Ca_in.rows()
+    nso_new   = new_basis.nbf()
+
+    Ca_np = np.asarray(Ca_in)
+    active_cols = list(range(Ncore, Ncore + n_act))
+
+    if core.get_option("SCF", "REKS_REPORT_LEVEL") >= 4:
+        core.print_out(
+            f"  REKS block projection: Ncore={Ncore} n_active={n_act} n_pairs={n_pairs} "
+            f"n_virtual={n_virt}\n")
+
+    # Per-block Werner projection (core / active / virtual) through
+    # Wavefunction.basis_projection (Polly, R. et al. Mol. Phys. 2004, 102, 2311).
+    # Each block projects on its own, so the Lowdin T^{-1/2} inside it cannot mix
+    # orbitals across blocks: only in-block orthonormality holds after this loop.
+    blocks = []
+    if Ncore > 0:
+        blocks.append(list(range(0, Ncore)))
+    blocks.append(active_cols)
+    if n_virt > 0:
+        blocks.append(list(range(Ncore + n_act, nmo)))
+
+    C_proj = np.zeros((nso_new, nmo))
+    for cols in blocks:
+        ncol = len(cols)
+        block_mat = core.Matrix.from_array(Ca_np[:, cols].copy())
+        dim_col = core.Dimension([ncol])
+        pblock = scf_wfn.basis_projection(block_mat, dim_col, old_basis, new_basis)
+        C_proj[:, cols] = np.asarray(pblock)
+
+    # Hierarchical Gram-Schmidt + within-block Lowdin (Werner, H.-J.; Knowles, P. J.
+    # J. Chem. Phys. 1985, 82, 5053, Sec. II.B): successive symmetric orthogonalization
+    # within ordered subspaces, core > active > virtual. The order is mandatory --
+    # correcting active against core first makes [core, active] jointly orthonormal,
+    # which is what makes the virtual subtraction below exact.
+    mints = core.MintsHelper(new_basis)
+    S_new = np.asarray(mints.ao_overlap())
+
+    # Active <- project out core, then in-block Lowdin.
+    if Ncore > 0:
+        core_cols = list(range(0, Ncore))
+        C_core = C_proj[:, core_cols]
+        overlap = C_core.T @ S_new @ C_proj[:, active_cols]
+        C_proj[:, active_cols] -= C_core @ overlap
+        C_blk = C_proj[:, active_cols].copy()
+        T_blk = C_blk.T @ S_new @ C_blk
+        eigvals, eigvecs = np.linalg.eigh(T_blk)
+        eigvals = np.maximum(eigvals, 1e-10)
+        T_mhalf = eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ eigvecs.T
+        C_proj[:, active_cols] = C_blk @ T_mhalf
+
+    # Virtual <- project out (core + active), then in-block Lowdin.
+    if n_virt > 0:
+        occ_act_cols = list(range(0, Ncore + n_act))
+        virt_cols = list(range(Ncore + n_act, nmo))
+        C_oa = C_proj[:, occ_act_cols]
+        overlap = C_oa.T @ S_new @ C_proj[:, virt_cols]
+        C_proj[:, virt_cols] -= C_oa @ overlap
+        C_blk = C_proj[:, virt_cols].copy()
+        T_blk = C_blk.T @ S_new @ C_blk
+        eigvals, eigvecs = np.linalg.eigh(T_blk)
+        eigvals = np.maximum(eigvals, 1e-10)
+        T_mhalf = eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ eigvecs.T
+        C_proj[:, virt_cols] = C_blk @ T_mhalf
+
+    # Procrustes within the active block. Orthonormalizing the active block as a
+    # whole (n_act x n_act) mixes orbitals across GVB pairs, so the reference is
+    # built by Werner-projecting each pair's 2 columns separately, its per-pair 2x2
+    # Lowdin preserving pair character. R = V U^T from M = C_act^T S C_ref =
+    # U Sigma V^T is the closest unitary; unitary within the active subspace, it
+    # leaves orthogonality to core and virtual intact.
+    C_ref_act = np.zeros((nso_new, n_act))
+    for p in range(n_pairs):
+        i_bond = Ncore + p
+        i_anti = Ncore + (n_act - 1 - p)
+        cols = [i_bond] if i_bond == i_anti else [i_bond, i_anti]
+        block_mat = core.Matrix.from_array(Ca_np[:, cols].copy())
+        dim_col = core.Dimension([len(cols)])
+        pblock = np.asarray(scf_wfn.basis_projection(block_mat, dim_col, old_basis, new_basis))
+        for k, c in enumerate(cols):
+            C_ref_act[:, c - Ncore] = pblock[:, k]
+
+    C_g_act = C_proj[:, active_cols]
+    M = C_g_act.T @ S_new @ C_ref_act
+    U_svd, sigma, Vt_svd = np.linalg.svd(M)
+    R_procrustes = Vt_svd.T @ U_svd.T
+    C_proj[:, active_cols] = C_g_act @ R_procrustes
+
+    if core.get_option("SCF", "REKS_REPORT_LEVEL") >= 4:
+        max_offdiag = np.max(np.abs(R_procrustes - np.diag(np.diag(R_procrustes))))
+        core.print_out(
+            f"  REKS Procrustes: max|R_offdiag| = {max_offdiag:.6e} "
+            f"sigma = [{' '.join(f'{s:.8f}' for s in sigma)}]\n")
+
+    return core.Matrix.from_array(C_proj)
+
+
+def _geometry_follow_projection(Ca_in, target_wfn, n_low=None):
+    """Diabatic transport: fixed MO coefficients, block Lowdin vs new S.
+
+        C_low  -> C_low (C_low^T S_new C_low)^{-1/2}
+        C_virt -> orthonormal complement of C_low in S_new
+
+    Lowdin is confined to [0, n_low) so near-linearly-dependent diffuse
+    virtuals (large AO coefficients) cannot mix into the low orbitals.
+
+    Args:
+      Ca_in:      MO coefficients (nso x nmo), current basis
+      target_wfn: wavefunction supplying S() as AO metric
+      n_low:      size of the occupied+active block; None applies Lowdin globally
+    """
+    S_new = np.asarray(target_wfn.S())
+    C = np.asarray(Ca_in)
+    nmo = C.shape[1]
+    if n_low is None or n_low <= 0 or n_low >= nmo:
+        n_low = nmo
+
+    def _sym_lowdin(block):
+        T = block.T @ S_new @ block
+        w, V = np.linalg.eigh(T)
+        w = np.maximum(w, 1e-10)
+        return block @ (V @ np.diag(1.0 / np.sqrt(w)) @ V.T)
+
+    C_low = _sym_lowdin(C[:, :n_low])
+    if n_low >= nmo:
+        return core.Matrix.from_array(C_low)
+    C_virt = C[:, n_low:]
+    C_virt = C_virt - C_low @ (C_low.T @ S_new @ C_virt)
+    C_virt = _sym_lowdin(C_virt)
+    return core.Matrix.from_array(np.hstack([C_low, C_virt]))
+
+
 def scf_wavefunction_factory(name, ref_wfn, reference, **kwargs):
     """Builds the correct (R/U/RO/CU HF/KS) wavefunction from the
     provided information, sets relevant auxiliary basis sets on it,
@@ -1430,7 +1602,7 @@ def scf_wavefunction_factory(name, ref_wfn, reference, **kwargs):
 
     """
     # Figure out functional and dispersion
-    superfunc, _disp_functor = build_functional_and_disp(name, restricted=(reference in ["RKS", "RHF"]), **kwargs)
+    superfunc, _disp_functor = build_functional_and_disp(name, restricted=(reference in ["RKS", "RHF", "REKS"]), **kwargs)
 
     # Build the wavefunction
     core.prepare_options_for_module("SCF")
@@ -1442,6 +1614,8 @@ def scf_wavefunction_factory(name, ref_wfn, reference, **kwargs):
         wfn = core.UHF(ref_wfn, superfunc)
     elif reference == "CUHF":
         wfn = core.CUHF(ref_wfn, superfunc)
+    elif reference == "REKS":
+        wfn = core.REKS(ref_wfn, superfunc)
     else:
         raise ValidationError("SCF: Unknown reference (%s) when building the Wavefunction." % reference)
 
@@ -1565,6 +1739,11 @@ def scf_helper(name, post_scf=True, **kwargs):
         ['SCF', 'GUESS'],
         ['SCF', 'DF_INTS_IO'],
         ['SCF', 'ORBITALS_WRITE'],
+        ['SCF', 'DIIS'],
+        ['SCF', 'SOSCF'],
+        ['SCF', 'SCF_INITIAL_ACCELERATOR'],
+        ['SCF', 'LEVEL_SHIFT'],
+        ['SCF', 'LEVEL_SHIFT_CUTOFF'],
         ['SCF_TYPE'],  # Hack: scope gets changed internally with the Andy trick
     )
 
@@ -1577,6 +1756,21 @@ def scf_helper(name, post_scf=True, **kwargs):
 
     # Make sure we grab the correctly scoped integral threshold for SCF
     core.set_global_option('INTS_TOLERANCE', core.get_option('SCF', 'INTS_TOLERANCE'))
+
+    # REKS drives orbital/FON optimization with its own solver (GVB-DIIS or TRAH).
+    # The base SCF accelerators operate on the single-determinant Fock and would
+    # corrupt the REKS multishell update, so force them off for a REKS reference.
+    if core.get_option('SCF', 'REFERENCE') == "REKS":
+        core.set_local_option("SCF", "DIIS", False)
+        core.set_local_option("SCF", "SOSCF", False)
+        core.set_local_option("SCF", "SCF_INITIAL_ACCELERATOR", "NONE")
+        # REKS needs the level shift held through convergence; the base SCF iterator
+        # drops it once Dnorm <= LEVEL_SHIFT_CUTOFF, destabilizing the FON/orbital
+        # update near convergence. Default the shift on with no cutoff (overridable).
+        if not core.has_option_changed("SCF", "LEVEL_SHIFT"):
+            core.set_local_option("SCF", "LEVEL_SHIFT", 0.6)
+        if not core.has_option_changed("SCF", "LEVEL_SHIFT_CUTOFF"):
+            core.set_local_option("SCF", "LEVEL_SHIFT_CUTOFF", 0.0)
 
     # Grab a few kwargs
     use_c1 = kwargs.get('use_c1', False)
@@ -1771,35 +1965,254 @@ def scf_helper(name, post_scf=True, **kwargs):
     # The wfn from_file routine adds the npy suffix if needed, but we add it here so that
     # we can use os.path.isfile to query whether the file exists before attempting to read
     read_filename = scf_wfn.get_scratch_filename(180) + '.npy'
+    # The active window addresses REKS runs; anything else reports and ignores it.
+    if core.get_option('SCF', 'GUESS_ACTIVE_WINDOW'):
+        if not isinstance(scf_wfn, core.REKS):
+            core.print_out("  GUESS_ACTIVE_WINDOW ignored: it fills a REKS active space and "
+                           f"this run is {core.get_option('SCF', 'REFERENCE')}.\n")
+        elif core.get_option('SCF', 'GUESS') != 'READ':
+            raise ValidationError(
+                "GUESS_ACTIVE_WINDOW reorders the orbitals taken from the READ guess and needs "
+                f"GUESS READ; this REKS run guesses with {core.get_option('SCF', 'GUESS')}, "
+                "which builds its orbitals inside the SCF and leaves nothing to reorder.")
     if ((core.get_option('SCF', 'GUESS') == 'READ') and os.path.isfile(read_filename)):
         old_wfn = core.Wavefunction.from_file(read_filename)
 
-        Ca_occ = old_wfn.Ca_subset("SO", "OCC")
-        Cb_occ = old_wfn.Cb_subset("SO", "OCC")
+        # REKS needs the full MO set (active virtuals carry occupation); other
+        # targets keep the historical OCC subset.
+        reks_guess = isinstance(scf_wfn, core.REKS)
+        old_is_reks = (old_wfn.name() == "REKS")
+        subset_label = "ALL" if reks_guess else "OCC"
+
+        Ca_in = old_wfn.Ca_subset("SO", subset_label)
+        Cb_in = old_wfn.Cb_subset("SO", subset_label)
+
+        swaps_spec = core.get_option('SCF', 'GUESS_MO_SWAPS').strip()
+        window = core.get_option('SCF', 'GUESS_ACTIVE_WINDOW') if reks_guess else []
+        if window and swaps_spec:
+            raise ValidationError(
+                "GUESS_ACTIVE_WINDOW and GUESS_MO_SWAPS are both set; the READ guess takes "
+                "one reordering. Keep the window and drop the swaps, or the reverse.")
+        if window:
+            dest = scf_wfn.get_active_mo_indices()
+            swaps = _window_to_swaps(window, dest, old_wfn.nalpha(), Ca_in.coldim()[0])
+            _apply_mo_swaps(Ca_in, swaps)
+            if Cb_in is not Ca_in:
+                _apply_mo_swaps(Cb_in, swaps)
+            core.print_out(f"  GUESS READ: active window {list(window)} -> MO columns {dest} "
+                           f"(swaps {swaps})\n")
+        elif swaps_spec:
+            swaps = _parse_mo_swaps(swaps_spec, old_wfn.nalpha())
+            _apply_mo_swaps(Ca_in, swaps)
+            if Cb_in is not Ca_in:
+                _apply_mo_swaps(Cb_in, swaps)
+            core.print_out(f"  GUESS READ: applied MO column swaps {swaps}\n")
 
         if old_wfn.molecule().schoenflies_symbol() != scf_molecule.schoenflies_symbol():
             raise ValidationError("Cannot compute projection of different symmetries.")
 
-        if old_wfn.basisset().name() == scf_wfn.basisset().name():
+        # Direct copy only when basis name and geometry match; otherwise
+        # use Werner basis_projection to re-orthonormalize against new S.
+        same_basis_name = (old_wfn.basisset().name() == scf_wfn.basisset().name())
+        old_geom = np.asarray(old_wfn.molecule().geometry())
+        new_geom = np.asarray(scf_molecule.geometry())
+        same_geometry = (old_geom.shape == new_geom.shape
+                         and np.allclose(old_geom, new_geom, atol=1e-12, rtol=0.0))
+
+        # Dispatch on (same basis?, same geometry?) x REKS: copy, transport, project, or both.
+        if same_basis_name and same_geometry:
             core.print_out(f"  Reading orbitals from file {read_filename}, no projection.\n\n")
-            scf_wfn.guess_Ca(Ca_occ)
-            scf_wfn.guess_Cb(Cb_occ)
+            pCa, pCb = Ca_in, Cb_in
+
+        elif reks_guess and old_is_reks and same_basis_name and not same_geometry:
+            core.print_out(
+                f"  Reading orbitals from file {read_filename}, following orbitals to the new\n"
+                "  geometry (diabatic transport: fixed MO coefficients + block Lowdin).\n\n")
+            core.timer_on("REKS: guess geometry follow")
+            n_low = scf_wfn.get_Ncore() + scf_wfn.n_active_orbitals()
+            pCa = _geometry_follow_projection(Ca_in, scf_wfn, n_low)
+            core.timer_off("REKS: guess geometry follow")
+            pCb = pCa
+
+        elif reks_guess and old_is_reks and same_geometry:
+            # Pair-preserving Werner projection.
+            core.print_out(
+                f"  Reading orbitals from file {read_filename}, projecting to new basis.\n")
+            core.print_out("  Computing basis projection from %s to %s\n\n" % (
+                old_wfn.basisset().name(), scf_wfn.basisset().name()))
+            core.timer_on("REKS: guess basis projection")
+            pCa = _reks_block_basis_projection(Ca_in, old_wfn, scf_wfn)
+            core.timer_off("REKS: guess basis projection")
+            pCb = pCa
+
+        elif reks_guess and old_is_reks:
+            # Project at old geometry, then transport.
+            core.print_out(
+                f"  Reading orbitals from file {read_filename}, projecting to new basis then\n"
+                "  following to new geometry.\n\n")
+            core.timer_on("REKS: guess basis+geometry projection")
+            old_geom_new_basis = core.Wavefunction.build(
+                old_wfn.molecule(), core.get_global_option('BASIS'))
+            pCa_old_geom = _reks_block_basis_projection(Ca_in, old_wfn, old_geom_new_basis)
+            n_low = scf_wfn.get_Ncore() + scf_wfn.n_active_orbitals()
+            pCa = _geometry_follow_projection(pCa_old_geom, scf_wfn, n_low)
+            core.timer_off("REKS: guess basis+geometry projection")
+            pCb = pCa
+
         else:
-            core.print_out(f"  Reading orbitals from file {read_filename}, projecting to new basis.\n\n")
-            core.print_out("  Computing basis projection from %s to %s\n\n" % (old_wfn.basisset().name(), scf_wfn.basisset().name()))
+            if not same_basis_name:
+                core.print_out(
+                    f"  Reading orbitals from file {read_filename}, projecting to new basis.\n")
+                core.print_out("  Computing basis projection from %s to %s\n\n" % (
+                    old_wfn.basisset().name(), scf_wfn.basisset().name()))
+            else:
+                core.print_out(
+                    f"  Reading orbitals from file {read_filename}, projecting to new geometry.\n")
+                core.print_out(
+                    "  Same basis name but atoms moved; cross-geometry basis_projection\n"
+                    "  (Polly et al., Mol. Phys. 102, 2311 (2004)).\n\n")
+            # REKS: full MO set; else OCC subset.
+            if reks_guess:
+                noccpi_a = old_wfn.nmopi()
+                noccpi_b = old_wfn.nmopi()
+            else:
+                noccpi_a = old_wfn.nalphapi()
+                noccpi_b = old_wfn.nbetapi()
+            pCa = scf_wfn.basis_projection(Ca_in, noccpi_a, old_wfn.basisset(), scf_wfn.basisset())
+            pCb = scf_wfn.basis_projection(Cb_in, noccpi_b, old_wfn.basisset(), scf_wfn.basisset())
 
-            pCa = scf_wfn.basis_projection(Ca_occ, old_wfn.nalphapi(), old_wfn.basisset(), scf_wfn.basisset())
-            pCb = scf_wfn.basis_projection(Cb_occ, old_wfn.nbetapi(), old_wfn.basisset(), scf_wfn.basisset())
-            scf_wfn.guess_Ca(pCa)
-            scf_wfn.guess_Cb(pCb)
+        scf_wfn.guess_Ca(pCa)
+        scf_wfn.guess_Cb(pCb)
 
-        # Strip off headers to only get R, RO, U, CU
+        # Seed Fa_/Fb_ for same-reference reads.
+        old_ref_for_fock = old_wfn.name().replace("KS", "").replace("HF", "")
+        new_ref_for_fock = scf_wfn.name().replace("KS", "").replace("HF", "")
+        if old_ref_for_fock == new_ref_for_fock:
+            try:
+                old_Fa = old_wfn.Fa()
+                if old_Fa is not None:
+                    scf_wfn.guess_Fa(old_Fa)
+                if new_ref_for_fock in ("U", "CU", "RO"):
+                    old_Fb = old_wfn.Fb()
+                    if old_Fb is not None:
+                        scf_wfn.guess_Fb(old_Fb)
+            except Exception as _fa_err:
+                core.print_out(f"  GUESS READ: Fa transport skipped: {_fa_err}\n")
+
+        # REKS -> REKS hot restart: transport FON / m-FON / epsilon.
+        if reks_guess and old_is_reks:
+            try:
+                old_fon_mat = old_wfn.array_variable("REKS FON")
+            except Exception:
+                old_fon_mat = None
+            if old_fon_mat is not None:
+                try:
+                    old_n_e = int(round(old_wfn.scalar_variable("REKS N ACTIVE ELECTRONS")))
+                    old_n_o = int(round(old_wfn.scalar_variable("REKS N ACTIVE ORBITALS")))
+                    new_reks_spec = core.get_option("SCF", "REKS")
+                    new_n_e = int(round(new_reks_spec[0]))
+                    new_n_o = int(round(new_reks_spec[1]))
+                    if (old_n_e, old_n_o) == (new_n_e, new_n_o):
+                        # FON transport is sector-major. Files written by the old
+                        # code carry no "REKS N SECTORS" scalar and restore as one
+                        # implicit sector 0 (unqualified names); sector s > 0 uses
+                        # "REKS SECTOR s <tail>" names (matches sector_psivar_name).
+                        try:
+                            n_sectors = int(round(old_wfn.scalar_variable("REKS N SECTORS")))
+                        except Exception:
+                            n_sectors = 1
+                        if n_sectors < 1:
+                            n_sectors = 1
+
+                        def _sec_psivar(s, reks_name):
+                            # reks_name starts with "REKS "; sector 0 keeps it, s > 0
+                            # inserts "SECTOR s " after the "REKS " prefix.
+                            if s == 0:
+                                return reks_name
+                            tail = reks_name[5:] if reks_name.startswith("REKS ") else reks_name
+                            return f"REKS SECTOR {s} {tail}"
+
+                        for s in range(n_sectors):
+                            # Sector 0 keeps the byte-stable single-sector debug labels.
+                            sec_tag = "" if s == 0 else f"sector {s} "
+                            try:
+                                sec_fon = old_wfn.array_variable(_sec_psivar(s, "REKS FON"))
+                            except Exception:
+                                sec_fon = None
+                            if sec_fon is not None:
+                                scf_wfn.guess_fon(sec_fon, s)
+                                if core.get_option("SCF", "REKS_REPORT_LEVEL") >= 4:
+                                    fon_flat = sec_fon.to_array().flatten().tolist()
+                                    core.print_out(
+                                        f"  REKS READ: transporting {sec_tag}FON {fon_flat} "
+                                        f"from saved wavefunction\n")
+                            # Higher FON generations (m, u, v, w): each restored if
+                            # present. Absent for older .npy or pools that activate no
+                            # geminals in that generation.
+                            for gen, name in ((1, "REKS M_FON"), (2, "REKS U_FON"),
+                                              (3, "REKS V_FON"), (4, "REKS W_FON")):
+                                try:
+                                    upper_mat = old_wfn.array_variable(_sec_psivar(s, name))
+                                except Exception:
+                                    upper_mat = None
+                                if upper_mat is not None:
+                                    scf_wfn.guess_fon_upper(gen, upper_mat, s)
+                                    if core.get_option("SCF", "REKS_REPORT_LEVEL") >= 4:
+                                        upper_flat = upper_mat.to_array().flatten().tolist()
+                                        core.print_out(
+                                            f"  REKS READ: transporting {sec_tag}{name} {upper_flat} "
+                                            f"from saved wavefunction\n")
+                    else:
+                        core.print_out(
+                            f"  REKS READ: active space mismatch "
+                            f"({old_n_e},{old_n_o}) -> ({new_n_e},{new_n_o}); "
+                            f"FON not restored, falling back to default\n")
+                except Exception as _fon_err:
+                    core.print_out(
+                        f"  REKS READ: FON metadata missing ({_fon_err}); "
+                        f"falling back to default\n")
+            else:
+                core.print_out(
+                    "  REKS READ: saved wavefunction has no FON slot; "
+                    "falling back to default (cold-start convergence expected)\n")
+
+        # Cross-reference reads need reset_occ_=True so HF::guess does not
+        # overwrite nalphapi_ from the OCC column count.
         old_ref = old_wfn.name().replace("KS", "").replace("HF", "")
         new_ref = scf_wfn.name().replace("KS", "").replace("HF", "")
         if old_ref != new_ref:
             scf_wfn.reset_occ_ = True
 
     elif (core.get_option('SCF', 'GUESS') == 'READ') and not os.path.isfile(read_filename):
+        if isinstance(scf_wfn, core.REKS):
+            raise ValidationError(
+                f"REKS GUESS=READ: no saved orbitals to read.\n"
+                f"  looked for: {read_filename}\n"
+                "Pick one:\n"
+                "\n"
+                "# A. two calls in one run: 1st saves, 2nd reads\n"
+                "    psi4.set_options({'guess': 'sad'})\n"
+                f"    psi4.energy('{name}')\n"
+                "    psi4.set_options({'guess': 'read'})\n"
+                f"    psi4.energy('{name}')\n"
+                "\n"
+                "# B. save to a file, restart in a later run\n"
+                "    psi4.set_options({'guess': 'sad'})\n"
+                f"    e, wfn = psi4.energy('{name}', return_wfn=True)\n"
+                "    wfn.to_file('orbitals.npy')\n"
+                f"    psi4.energy('{name}', restart_file='orbitals.npy')\n"
+                "\n"
+                "# C. Psithon input deck\n"
+                "    set guess sad\n"
+                f"    energy('{name}')\n"
+                "    set guess read\n"
+                f"    energy('{name}')\n"
+                "\n"
+                "# D. optimization from the file saved in B\n"
+                f"    psi4.optimize('{name}', restart_file='orbitals.npy')\n"
+                "\n"
+                "# Tip. Reorder MOs into the active space\n"
+                "    psi4.set_options({'guess_mo_swaps': 'LUMO LUMO+1'})")
         core.print_out(f"\n !!!  Unable to find file {read_filename}, defaulting to SAD guess. !!!\n\n")
         core.set_local_option('SCF', 'GUESS', 'SAD')
         sad_basis_list = core.BasisSet.build(scf_wfn.molecule(), "ORBITAL",
@@ -1915,20 +2328,12 @@ def scf_helper(name, post_scf=True, **kwargs):
     if core.get_option("SCF", "MOLDEN_WRITE"):
         filename = core.get_writer_file_prefix(scf_molecule.name()) + ".molden"
         dovirt = bool(core.get_option("SCF", "MOLDEN_WITH_VIRTUAL"))
-
-        occa = scf_wfn.occupation_a()
-        occb = scf_wfn.occupation_a()
-
-        mw = core.MoldenWriter(scf_wfn)
-        mw.write(filename, scf_wfn.Ca(), scf_wfn.Cb(), scf_wfn.epsilon_a(),
-                 scf_wfn.epsilon_b(), scf_wfn.occupation_a(),
-                 scf_wfn.occupation_b(), dovirt)
+        scf_wfn.write_molden(filename, dovirt, False)
 
     # Write checkpoint file (orbitals and basis); Can be disabled, e.g., for findif displacements
     if write_checkpoint_file and isinstance(_chkfile, str):
         filename = kwargs['write_orbitals']
         scf_wfn.to_file(filename)
-        # core.set_local_option("SCF", "ORBITALS_WRITE", filename)
     elif write_checkpoint_file:
         filename = scf_wfn.get_scratch_filename(180)
         scf_wfn.to_file(filename)

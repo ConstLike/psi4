@@ -88,8 +88,8 @@ OrbitalSpace OrbitalSpace::transform(const OrbitalSpace &A, const std::shared_pt
     SharedMatrix SBB = overlap(B, B);
     SBB->set_name("SBB");
 
-    // Follows Werner's method from Mol. Phys. 102, 21-22, 2311
-    // just like HF::dualBasisProjection
+    // Follows Werner's method: R. Polly, H.-J. Werner, F. R. Manby, P. J. Knowles,
+    // Mol. Phys. 102 (21-22), 2311-2321 (2004).
 
     // 1. Invert SBB
     SBB->invert();

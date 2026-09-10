@@ -48,6 +48,8 @@
 #include "psi4/libpsi4util/process.h"
 
 #include <cstdlib>
+#include <map>
+#include <mutex>
 #include <numeric>
 #include <sstream>
 #include <string>
@@ -175,8 +177,10 @@ void VBase::set_D(std::vector<SharedMatrix> Dvec) {
 }
 void VBase::initialize() {
     timer_on("V: Grid");
-    grid_ = std::make_shared<DFTGrid>(primary_->molecule(), primary_, options_);
+    if (!grid_) grid_ = std::make_shared<DFTGrid>(primary_->molecule(), primary_, options_);
     timer_off("V: Grid");
+
+    nbf_ = primary_->nbf();
 
     for (size_t i = 0; i < num_threads_; i++) {
         // Need a functional worker per thread
@@ -734,15 +738,22 @@ void VBase::print_header() const {
 std::shared_ptr<BlockOPoints> VBase::get_block(int block) { return grid_->blocks()[block]; }
 size_t VBase::nblocks() { return grid_->blocks().size(); }
 void VBase::finalize() { grid_.reset(); }
+void VBase::share_collocation_cache_from(VBase& source) {
+    ensure_point_workers();
+    for (auto& pworker : point_workers_) {
+        pworker->set_cache_map(&source.cache_map_);
+    }
+}
 void VBase::build_collocation_cache(size_t memory) {
     // Figure out many blocks to skip
 
     size_t collocation_size = grid_->collocation_size();
-    if (functional_->ansatz() == 1) {
-        collocation_size *= 4;  // For gradients
-    }
-    if (functional_->ansatz() == 2) {
-        collocation_size *= 10;  // For gradients and Hessians
+    ensure_point_workers();
+    cache_map_deriv_ = point_workers_[0]->deriv();
+    if (cache_map_deriv_ >= 2) {
+        collocation_size *= 10;  // values, gradients and Hessians
+    } else if (cache_map_deriv_ >= 1) {
+        collocation_size *= 4;  // values and gradients
     }
 
     // Figure out stride as closest whole number to amount we need
@@ -759,7 +770,7 @@ void VBase::build_collocation_cache(size_t memory) {
         return;
     }
 
-    cache_map_deriv_ = point_workers_[0]->deriv();
+    timer_on("V: Collocation cache");
     auto saved_size_rank = std::vector<size_t>(num_threads_, 0);
     auto ncomputed_rank = std::vector<size_t>(num_threads_, 0);
 
@@ -810,6 +821,7 @@ void VBase::build_collocation_cache(size_t memory) {
     if (print_) {
         outfile->Printf("  Cached %.1lf%% of DFT collocation blocks in %.3lf [GiB].\n\n", fraction, gib_saved);
     }
+    timer_off("V: Collocation cache");
 }
 void VBase::prepare_vv10_cache(DFTGrid& nlgrid, SharedMatrix D,
                                std::vector<std::map<std::string, SharedVector>>& vv10_cache,
@@ -825,6 +837,7 @@ void VBase::prepare_vv10_cache(DFTGrid& nlgrid, SharedMatrix D,
         // Need a points worker per thread, only need RKS-like terms
         auto point_tmp = std::make_shared<RKSFunctions>(primary_, max_points, max_functions);
         point_tmp->set_ansatz(ansatz);
+        if (ansatz >= 2) point_tmp->set_deriv(2);
         point_tmp->set_pointers(D);
         nl_point_workers.push_back(point_tmp);
     }
@@ -1244,10 +1257,11 @@ void SAP::compute_V(std::vector<SharedMatrix> ret) {
 RV::RV(std::shared_ptr<SuperFunctional> functional, std::shared_ptr<BasisSet> primary, Options& options)
     : VBase(functional, primary, options) {}
 RV::~RV() {}
-void RV::initialize() {
-    VBase::initialize();
-    int max_points = grid_->max_points();
-    int max_functions = grid_->max_functions();
+void RV::build_point_workers() {
+    if (!grid_) throw PSIEXCEPTION("RV: the grid is gone; initialize() before any sweep.");
+    const int max_points = grid_->max_points();
+    const int max_functions = grid_->max_functions();
+    point_workers_.clear();
     for (size_t i = 0; i < num_threads_; i++) {
         // Need a points worker per thread
         auto point_tmp = std::make_shared<RKSFunctions>(primary_, max_points, max_functions);
@@ -1256,11 +1270,16 @@ void RV::initialize() {
         point_workers_.push_back(point_tmp);
     }
 }
+void RV::initialize() {
+    VBase::initialize();
+    build_point_workers();
+}
 void RV::finalize() { VBase::finalize(); }
 void RV::print_header() const { VBase::print_header(); }
 void RV::compute_V(std::vector<SharedMatrix> ret) {
     // => Validate object <=
     timer_on("RV: Form V");
+    ensure_point_workers();
     
     if ((D_AO_.size() != 1) || (ret.size() != 1)) {
         throw PSIEXCEPTION("V: RKS should have only one D/V Matrix");
@@ -1434,6 +1453,7 @@ void RV::compute_V(std::vector<SharedMatrix> ret) {
 
 std::vector<SharedMatrix> RV::compute_fock_derivatives() {
     timer_on("RV: Form Fx");
+    ensure_point_workers();
 
     int natoms = primary_->molecule()->natom();
     std::vector<SharedMatrix> Vx(3*natoms);
@@ -1674,6 +1694,7 @@ std::vector<SharedMatrix> RV::compute_fock_derivatives() {
 
 void RV::compute_Vx_full(std::vector<SharedMatrix> Dx, std::vector<SharedMatrix> ret, bool singlet) {
     timer_on("RV: Form Vx");
+    ensure_point_workers();
 
     // => Validate object / inputs <=
     if (D_AO_.size() != 1) {
@@ -1966,6 +1987,7 @@ void RV::compute_Vx_full(std::vector<SharedMatrix> Dx, std::vector<SharedMatrix>
 }
 SharedMatrix RV::compute_gradient() {
     // => Validation <= //
+    ensure_point_workers();
     if ((D_AO_.size() != 1)) throw PSIEXCEPTION("V: RKS should have only one D Matrix");
 
     if (functional_->needs_vv10()) {
@@ -2092,6 +2114,7 @@ SharedMatrix RV::compute_gradient() {
 
 SharedMatrix RV::compute_hessian() {
     // => Validation <=
+    ensure_point_workers();
     if (functional_->is_gga() || functional_->is_meta())
         throw PSIEXCEPTION("Hessians for GGA and meta GGA functionals are not yet implemented.");
 
@@ -2590,7 +2613,10 @@ void UV::initialize() {
         point_workers_.push_back(point_tmp);
     }
 }
-void UV::finalize() { VBase::finalize(); }
+void UV::finalize() {
+    ms_scratch_ = MicrostateScratch();
+    VBase::finalize();
+}
 void UV::print_header() const { VBase::print_header(); }
 void UV::compute_V(std::vector<SharedMatrix> ret) {
     // => Validate object <=
@@ -2918,6 +2944,956 @@ void UV::compute_V(std::vector<SharedMatrix> ret) {
     }
     timer_off("UV: Form V");
 }
+namespace {
+
+// Project C_subset onto the block's local AO rows and form chi = phi @ Cloc (value, and for
+// ansatz>=1 the three gradient tensors). Shared by the UV and RV microstate kernels.
+void build_microstate_chi(int npoints, int nlocal, int n_p, int ansatz, int coll_funcs,
+                          double** C_subset_p, const std::vector<int>& function_map,
+                          double** phi, double** phix, double** phiy, double** phiz,
+                          double** Cloc, double** chi, double** chix, double** chiy, double** chiz) {
+    for (int ml = 0; ml < nlocal; ++ml) {
+        const int mg = function_map[ml];
+        for (int p = 0; p < n_p; ++p) Cloc[ml][p] = C_subset_p[mg][p];
+    }
+    C_DGEMM('N', 'N', npoints, n_p, nlocal, 1.0, phi[0], coll_funcs, Cloc[0], n_p, 0.0, chi[0], n_p);
+    if (ansatz >= 1) {
+        C_DGEMM('N', 'N', npoints, n_p, nlocal, 1.0, phix[0], coll_funcs, Cloc[0], n_p, 0.0, chix[0], n_p);
+        C_DGEMM('N', 'N', npoints, n_p, nlocal, 1.0, phiy[0], coll_funcs, Cloc[0], n_p, 0.0, chiy[0], n_p);
+        C_DGEMM('N', 'N', npoints, n_p, nlocal, 1.0, phiz[0], coll_funcs, Cloc[0], n_p, 0.0, chiz[0], n_p);
+    }
+}
+
+// One channel's per-point grid sums over the MO columns of a contiguous range: density, its
+// gradient, the same-spin gamma_ss = |grad|^2, and the square-gradient sum behind tau. As a
+// seed, tau carries that sum raw, before the 0.5 that turns it into tau.
+struct MicrostateChannelSums {
+    double* rho = nullptr;
+    double* gx = nullptr;
+    double* gy = nullptr;
+    double* gz = nullptr;
+    double* gamma = nullptr;
+    double* tau = nullptr;
+};
+
+// One spin channel's grid density from the chi tensor and occupations over columns [p0, n_p):
+// rho, and for higher ansatz the gradient (rho_{x,y,z}), the same-spin gamma_ss = |grad|^2, and
+// tau. Every accumulator opens at its seed entry, the partial sum over [0, p0), and runs on from
+// there in ascending p; a null seed member opens it at zero. occ_scale multiplies the
+// occupations: 1.0 for the per-spin (UKS) convention, 2.0 for the total-density (RKS) convention
+// the restricted functional expects (rho_total = 2 rho_alpha, closed shell). tau_factor scales
+// the square-gradient sum: 0.5 yields tau, 1.0 leaves the sum raw for use as a seed.
+void accumulate_microstate_rho_channel(int npoints, int p0, int n_p, int ansatz, double occ_scale,
+                                       double tau_factor, const double* occ,
+                                       double** chi, double** chix, double** chiy, double** chiz,
+                                       const MicrostateChannelSums& seed,
+                                       const MicrostateChannelSums& out) {
+    for (int P = 0; P < npoints; ++P) {
+        double r = seed.rho ? seed.rho[P] : 0.0;
+        const double* chi_row = chi[P];
+        for (int p = p0; p < n_p; ++p) {
+            const double c2 = chi_row[p] * chi_row[p];
+            r += occ_scale * occ[p] * c2;
+        }
+        out.rho[P] = r;
+    }
+    if (ansatz >= 1) {
+        for (int P = 0; P < npoints; ++P) {
+            double rx = seed.gx ? seed.gx[P] : 0.0;
+            double ry = seed.gy ? seed.gy[P] : 0.0;
+            double rz = seed.gz ? seed.gz[P] : 0.0;
+            const double* c = chi[P];
+            const double* cx = chix[P];
+            const double* cy = chiy[P];
+            const double* cz = chiz[P];
+            for (int p = p0; p < n_p; ++p) {
+                const double tw = 2.0 * occ_scale * occ[p] * c[p];
+                rx += tw * cx[p];
+                ry += tw * cy[p];
+                rz += tw * cz[p];
+            }
+            out.gx[P] = rx;
+            out.gy[P] = ry;
+            out.gz[P] = rz;
+            out.gamma[P] = rx * rx + ry * ry + rz * rz;
+        }
+    }
+    if (ansatz >= 2) {
+        for (int P = 0; P < npoints; ++P) {
+            double t = seed.tau ? seed.tau[P] : 0.0;
+            const double* cx = chix[P];
+            const double* cy = chiy[P];
+            const double* cz = chiz[P];
+            for (int p = p0; p < n_p; ++p)
+                t += occ_scale * occ[p] * (cx[p] * cx[p] + cy[p] * cy[p] + cz[p] * cz[p]);
+            out.tau[P] = tau_factor * t;
+        }
+    }
+}
+
+}  // namespace
+
+void UV::compute_V_microstates_mo(SharedMatrix Ca_full,
+                                  int Ncore, int n_active,
+                                  const std::vector<int>& active_mo,
+                                  const std::vector<std::vector<double>>& occ_alpha,
+                                  const std::vector<std::vector<double>>& occ_beta,
+                                  const std::vector<double>& C_L,
+                                  std::vector<SharedMatrix>& arows_a,
+                                  std::vector<SharedMatrix>& arows_b,
+                                  std::vector<std::vector<double>>& diag_a,
+                                  std::vector<std::vector<double>>& diag_b,
+                                  std::vector<double>& tr_a,
+                                  std::vector<double>& tr_b,
+                                  std::vector<double>& E_xc,
+                                  SharedMatrix V_acc_a,
+                                  SharedMatrix V_acc_b,
+                                  bool need_diag,
+                                  int mo_lo) {
+    timer_on("UV: Form V mo");
+
+    const int n_micro = static_cast<int>(occ_alpha.size());
+    if (n_micro == 0) { timer_off("UV: Form V mo"); return; }
+    if (AO2USO_) throw PSIEXCEPTION("UV::compute_V_microstates_mo: symmetry (AO2USO_) not supported; REKS runs C1.");
+    if (functional_->needs_grac()) throw PSIEXCEPTION("UV::compute_V_microstates_mo: GRAC not supported.");
+
+    const int nmo   = Ca_full->colspi()[0];
+    const int n_p   = Ncore + n_active;        // occupied+active columns participating in rho
+    const int nact  = n_active;
+    const int ansatz = functional_->ansatz();
+    const int max_functions = grid_->max_functions();
+    const int max_points = grid_->max_points();
+    if (Ca_full->rowspi()[0] != nbf_)
+        throw PSIEXCEPTION("UV::compute_V_microstates_mo: Ca_full row count must equal nbf.");
+    // V_acc_a/V_acc_b are shared nbf x nbf AO back-projection accumulators; a null pair
+    // drops the whole E1 chain.
+    const bool want_e1 = (V_acc_a != nullptr);
+    if ((V_acc_a == nullptr) != (V_acc_b == nullptr))
+        throw PSIEXCEPTION("UV::compute_V_microstates_mo: V_acc_a and V_acc_b must both be "
+                           "given or both be null.");
+    if (want_e1 && (V_acc_a->rowspi()[0] != nbf_ || V_acc_a->colspi()[0] != nbf_ ||
+                    V_acc_b->rowspi()[0] != nbf_ || V_acc_b->colspi()[0] != nbf_))
+        throw PSIEXCEPTION("UV::compute_V_microstates_mo: V_acc must be nbf x nbf.");
+    // Projection window: the arows carry MO columns [mo_lo, mo_lo + mo_width).
+    const int mo_width = n_micro > 0 ? arows_a[0]->colspi()[0] : 0;
+    if (mo_lo < 0 || mo_width < 0 || mo_lo + mo_width > nmo)
+        throw PSIEXCEPTION("UV::compute_V_microstates_mo: MO window [" + std::to_string(mo_lo) +
+                           ", " + std::to_string(mo_lo + mo_width) + ") outside [0, " +
+                           std::to_string(nmo) + ").");
+    if (need_diag && mo_width != nmo)
+        throw PSIEXCEPTION("UV::compute_V_microstates_mo: the MO diagonal is defined over all "
+                           "nmo columns, so need_diag requires the full-row window.");
+    // project_in_block: the MO window equals the active block, so the weighted-AO rows
+    // accumulate directly in the nact-wide active basis instead of the nbf_-wide AO buffer.
+    const bool project_in_block = (mo_lo == Ncore && mo_width == nact);
+    const int  acc_w = project_in_block ? nact : nbf_;
+    for (int L = 0; L < n_micro; ++L) {
+        if ((int)occ_alpha[L].size() != n_p || (int)occ_beta[L].size() != n_p)
+            throw PSIEXCEPTION("UV::compute_V_microstates_mo: occupation length must equal Ncore+n_active.");
+        // arows is overwritten wholesale by the MO projection; it must match this shape exactly.
+        if (arows_a[L]->rowspi()[0] != nact || arows_a[L]->colspi()[0] != mo_width ||
+            arows_b[L]->rowspi()[0] != nact || arows_b[L]->colspi()[0] != mo_width)
+            throw PSIEXCEPTION("UV::compute_V_microstates_mo: every arows must be "
+                               "n_active x mo_width.");
+    }
+    // The active-row contraction reads chi columns [Ncore, Ncore+n_active); that requires
+    // the active MOs to be exactly the contiguous block after the core.
+    for (int i = 0; i < n_active; ++i)
+        if (active_mo[i] != Ncore + i)
+            throw PSIEXCEPTION("UV::compute_V_microstates_mo: active MOs must be contiguous (active_mo[i]==Ncore+i).");
+
+    // Distinct spin strings: a channel density depends only on its occupation vector.
+    // Each string's density is accumulated once per block and shared by every microstate
+    // channel that carries it.
+    std::vector<std::vector<double>> string_occ;
+    std::vector<int> str_a(n_micro), str_b(n_micro);
+    {
+        std::map<std::vector<double>, int> string_id;
+        auto intern = [&](const std::vector<double>& o) {
+            auto it = string_id.find(o);
+            if (it != string_id.end()) return it->second;
+            const int id = static_cast<int>(string_occ.size());
+            string_id.emplace(o, id);
+            string_occ.push_back(o);
+            return id;
+        };
+        for (int L = 0; L < n_micro; ++L) {
+            str_a[L] = intern(occ_alpha[L]);
+            str_b[L] = intern(occ_beta[L]);
+        }
+    }
+    const int n_strings = static_cast<int>(string_occ.size());
+
+    // The core columns carry the same partial sum in every string, accumulated once per block
+    // and seeded into each string; that requires unit core occupations.
+    for (int s = 0; s < n_strings; ++s)
+        for (int i = 0; i < Ncore; ++i)
+            if (string_occ[s][i] != 1.0)
+                throw PSIEXCEPTION("UV::compute_V_microstates_mo: core occupations must be 1.0.");
+    const std::vector<double> core_occ(Ncore, 1.0);
+
+    // Closed-shell microstate (occ_alpha==occ_beta): beta XC channel equals alpha. Compute alpha
+    // only and mirror beta; skips the redundant beta Tap build, arows GEMMs, and diagonal.
+    std::vector<char> closed_ms(n_micro);
+    for (int L = 0; L < n_micro; ++L) closed_ms[L] = (str_a[L] == str_b[L]) ? 1 : 0;
+
+    // Microstate chunk: one batched functional call and one batched active-row GEMM set per
+    // chunk (up to 2 channel slices per microstate). Cap keeps per-thread Tap scratch bounded.
+    int chunk = static_cast<int>((8ull << 20) / ((size_t)max_points * max_functions * 8 * 2));
+    chunk = std::max(4, std::min(chunk, 32));
+    chunk = std::min(chunk, n_micro);
+    const int max_slices = 2 * chunk;
+    // Slices held in TapWide/TAwide before their active-row GEMMs run. The chunk above is
+    // sized for one batched functional call, whose buffers scale with the point count alone;
+    // TapWide carries an AO row per point per slice, so its width takes its own budget.
+    int stage = static_cast<int>((2ull << 20) / ((size_t)max_points * max_functions * 8));
+    stage = std::max(2, std::min(stage, max_slices));
+
+    // Zero outputs and E1 accumulators.
+    for (int L = 0; L < n_micro; ++L) {
+        diag_a[L].assign(need_diag ? nmo : 0, 0.0);
+        diag_b[L].assign(need_diag ? nmo : 0, 0.0);
+        tr_a[L] = tr_b[L] = E_xc[L] = 0.0;
+    }
+    if (want_e1) { V_acc_a->zero(); V_acc_b->zero(); }
+
+    // Weighted-AO active rows (already the active MO block when project_in_block), reduced
+    // over threads and moved into arows once after the sweep.
+    ms_scratch_.wa_a_all.assign((size_t)n_micro * nact * acc_w, 0.0);
+    ms_scratch_.wa_b_all.assign((size_t)n_micro * nact * acc_w, 0.0);
+    std::vector<double>& wa_a_all = ms_scratch_.wa_a_all;
+    std::vector<double>& wa_b_all = ms_scratch_.wa_b_all;
+
+    // MO columns the chi tensor carries: the full MO range only when the MO diagonal is wanted,
+    // otherwise the core+active window [0, n_p) that feeds rho and the active rows.
+    const int nchi = need_diag ? nmo : n_p;
+    const int bpts = chunk * max_points;
+    // Tap coefficients per point: the phi multiplier and the three gradient multipliers.
+    const int ncof = 4;
+    // Points staged at a time when forming the MO diagonal.
+    constexpr int kZChunk = 64;
+
+    MicrostateScratch::Shape shape;
+    shape.nbf = nbf_;
+    shape.nmo = nmo;
+    shape.n_p = n_p;
+    shape.nact = nact;
+    shape.n_micro = n_micro;
+    shape.n_strings = n_strings;
+    shape.max_points = max_points;
+    shape.max_functions = max_functions;
+    shape.chunk = chunk;
+    shape.ansatz = ansatz;
+    shape.num_threads = num_threads_;
+    shape.need_diag = need_diag ? 1 : 0;
+    shape.acc_w = acc_w;
+    shape.project_in_block = project_in_block ? 1 : 0;
+
+    // Thread scratch, rebuilt only when the shape changes. The per-call zeroing of the
+    // accumulators happens inside the parallel region, each thread on its own buffers.
+    MicrostateScratch& sc = ms_scratch_;
+    if (!(sc.shape == shape)) {
+        sc.threads.clear();
+        sc.threads.resize(num_threads_);
+        sc.shape = shape;
+        for (int t = 0; t < num_threads_; ++t) {
+            auto& ts = sc.threads[t];
+            ts.Cloc = std::make_shared<Matrix>("Cloc", max_functions, nchi);
+            ts.chi = std::make_shared<Matrix>("chi", max_points, nchi);
+            ts.TapAcc_a = std::make_shared<Matrix>("TapAcc_a", max_points, max_functions);
+            ts.TapAcc_b = std::make_shared<Matrix>("TapAcc_b", max_points, max_functions);
+            ts.Vloc = std::make_shared<Matrix>("Vloc", max_functions, max_functions);  // E1 back-proj
+            if (ansatz >= 2) ts.MbpT = std::make_shared<Matrix>("MbpT", max_points, max_functions);
+            if (ansatz >= 1) {
+                ts.chix = std::make_shared<Matrix>("chix", max_points, nchi);
+                ts.chiy = std::make_shared<Matrix>("chiy", max_points, nchi);
+                ts.chiz = std::make_shared<Matrix>("chiz", max_points, nchi);
+            }
+            if (ansatz >= 2) {
+                ts.Sd = std::make_shared<Matrix>("Sd", max_points, nact);
+                // Holds either an AO-local row (nlocal) or the projected active block (nact).
+                ts.M3 = std::make_shared<Matrix>("M3", n_active, std::max(max_functions, nact));
+            }
+            // Distinct-string channel densities (row = string): rho, grad, gamma_ss, tau. Row
+            // n_strings holds the core partial sums the strings are seeded from.
+            const int nsd = n_strings + 1;
+            ts.SDrho = std::make_shared<Matrix>("SDrho", nsd, max_points);
+            if (ansatz >= 1) {
+                ts.SDgx = std::make_shared<Matrix>("SDgx", nsd, max_points);
+                ts.SDgy = std::make_shared<Matrix>("SDgy", nsd, max_points);
+                ts.SDgz = std::make_shared<Matrix>("SDgz", nsd, max_points);
+                ts.SDgam = std::make_shared<Matrix>("SDgam", nsd, max_points);
+            }
+            if (ansatz >= 2) ts.SDtau = std::make_shared<Matrix>("SDtau", nsd, max_points);
+            // Staging scratch, stage slices wide: TAwide holds the staged channel slices
+            // projected onto the active MO basis (slice j at column offset j*nact). Outside
+            // project_in_block, TapWide holds the same slices side by side in local AO (slice
+            // j at column offset j*nlocal), and M1w/M2S hold the results of the staged
+            // active-row GEMMs, which stop at the local AO index:
+            //   wa_s(L)[i][nu] = sum_P chi_act[P][i] TapWide_s(L)[P][nu]
+            //                  + sum_P TAwide_s(L)[P][i] phi[P][nu]
+            // Cloc holds the local AO rows of Ca; wa_s(L) accumulates in global AO there and is
+            // projected to MO (multiplied by Ca) after the block loop. project_in_block instead
+            // accumulates the active block directly from chi_act and TAwide (M2S unused; see the
+            // GEMM below), reusing one TapWide column block per point since each Tap row is
+            // consumed by the E1 accumulator in the same loop.
+            ts.TapWide = std::make_shared<Matrix>("TapWide", max_points,
+                                                  max_functions * (project_in_block ? 1 : stage));
+            // Row per channel slice: the four Tap coefficients (a0, ax, ay, az) of each point.
+            // Vcof rows: chunk-wide (max_slices), or block-wide (2*n_micro) for the MO
+            // diagonal, which re-reads every slice of the block in one GEMM.
+            ts.Vcof = std::make_shared<Matrix>("Vcof", need_diag ? 2 * n_micro : max_slices,
+                                               ncof * max_points);
+            ts.TAwide = std::make_shared<Matrix>("TAwide", max_points, n_active * stage);
+            // Per slice, M1w holds either an AO-local row (nlocal) or the projected active
+            // block (nact).
+            ts.M1w = std::make_shared<Matrix>("M1w", n_active,
+                                              std::max(max_functions, nact) * stage);
+            ts.M2S = std::make_shared<Matrix>("M2S", n_active * stage, max_functions);
+            // Batched functional evaluation: one compute_functional call per chunk over stacked
+            // per-microstate point slices (slot j at offset j*npoints).
+            auto& bin = ts.bin;
+            bin["RHO_A"] = std::make_shared<Vector>("RHO_A", bpts);
+            bin["RHO_B"] = std::make_shared<Vector>("RHO_B", bpts);
+            if (ansatz >= 1) {
+                bin["GAMMA_AA"] = std::make_shared<Vector>("GAMMA_AA", bpts);
+                bin["GAMMA_AB"] = std::make_shared<Vector>("GAMMA_AB", bpts);
+                bin["GAMMA_BB"] = std::make_shared<Vector>("GAMMA_BB", bpts);
+            }
+            if (ansatz >= 2) {
+                bin["TAU_A"] = std::make_shared<Vector>("TAU_A", bpts);
+                bin["TAU_B"] = std::make_shared<Vector>("TAU_B", bpts);
+            }
+            ts.bworker = functional_->build_worker();
+            ts.bworker->set_max_points(bpts);
+            ts.bworker->allocate();
+            // Per-L MO diagonal (flat, n_micro*nmo), unallocated when no diagonal is wanted.
+            if (need_diag) {
+                ts.diA.resize((size_t)n_micro * nmo);
+                ts.diB.resize((size_t)n_micro * nmo);
+            }
+            ts.trA.resize(n_micro);
+            ts.trB.resize(n_micro);
+            ts.exc.resize(n_micro);
+            if (need_diag) {
+                ts.Zd.assign((size_t)ncof * kZChunk * nmo, 0.0);
+                ts.Dd.resize((size_t)2 * n_micro * nmo);
+            }
+            if (ansatz >= 2) { ts.stauA.resize(max_points); ts.stauB.resize(max_points); }  // meta E1 per-point
+        }
+    }
+    std::vector<double> nqT(num_threads_, 0.0);  // C_L-weighted quadrature electron count
+
+    double** Ca_p = Ca_full->pointer();
+    double** V_acc_a_p = want_e1 ? V_acc_a->pointer() : nullptr;
+    double** V_acc_b_p = want_e1 ? V_acc_b->pointer() : nullptr;
+
+    // One lock per microstate: threads scatter their block contributions straight into the
+    // shared weighted-AO rows, and only same-microstate writes collide. std::mutex rather
+    // than omp_lock_t: omp_lock_t is an opaque struct whose size must match the OpenMP
+    // runtime that is linked, and an include path may hand this file a foreign omp.h.
+    std::vector<std::mutex> wa_lock(n_micro);
+    auto wa_set = [&wa_lock](int L) { wa_lock[L].lock(); };
+    auto wa_unset = [&wa_lock](int L) { wa_lock[L].unlock(); };
+
+    const char* t_grid = need_diag ? "REKS: xc_grid[full]" : "REKS: xc_grid[probe]";
+    const char* t_proj = need_diag ? "REKS: xc_proj[full]" : "REKS: xc_proj[probe]";
+
+    timer_on(t_grid);
+#pragma omp parallel num_threads(num_threads_)
+    {
+        int rank = 0;
+#ifdef _OPENMP
+        rank = omp_get_thread_num();
+#endif
+        auto pworker = point_workers_[rank];
+        auto& ts = sc.threads[rank];
+
+        // Per-call reset of this thread's accumulators. Every other buffer is written in full
+        // before it is read, either by a beta=0 GEMM or by an explicit per-block fill.
+        std::fill(ts.diA.begin(), ts.diA.end(), 0.0);
+        std::fill(ts.diB.begin(), ts.diB.end(), 0.0);
+        std::fill(ts.trA.begin(), ts.trA.end(), 0.0);
+        std::fill(ts.trB.begin(), ts.trB.end(), 0.0);
+        std::fill(ts.exc.begin(), ts.exc.end(), 0.0);
+
+        auto bworker = ts.bworker;
+        double** Cloc = ts.Cloc->pointer();
+        double** chi  = ts.chi->pointer();
+        double** chix = (ansatz >= 1) ? ts.chix->pointer() : nullptr;
+        double** chiy = (ansatz >= 1) ? ts.chiy->pointer() : nullptr;
+        double** chiz = (ansatz >= 1) ? ts.chiz->pointer() : nullptr;
+        double** Sd   = (ansatz >= 2) ? ts.Sd->pointer() : nullptr;
+        double** TapAcc_a = ts.TapAcc_a->pointer();
+        double** TapAcc_b = ts.TapAcc_b->pointer();
+        double** Vloc_p   = ts.Vloc->pointer();
+        double** MbpT     = (ansatz >= 2) ? ts.MbpT->pointer() : nullptr;
+        double** SDrho = ts.SDrho->pointer();
+        double** SDgx  = (ansatz >= 1) ? ts.SDgx->pointer() : nullptr;
+        double** SDgy  = (ansatz >= 1) ? ts.SDgy->pointer() : nullptr;
+        double** SDgz  = (ansatz >= 1) ? ts.SDgz->pointer() : nullptr;
+        double** SDgam = (ansatz >= 1) ? ts.SDgam->pointer() : nullptr;
+        double** SDtau = (ansatz >= 2) ? ts.SDtau->pointer() : nullptr;
+        double** TapWide = ts.TapWide->pointer();
+        double** Vcof = ts.Vcof->pointer();
+        double** TAwide  = ts.TAwide->pointer();
+        double** M1w  = ts.M1w->pointer();
+        double** M2S  = ts.M2S->pointer();
+        double** M3   = (ansatz >= 2) ? ts.M3->pointer() : nullptr;
+        // Tap/TapAcc below feed only the E1 back-projection and, outside project_in_block,
+        // the active-row GEMM; skip that per-point AO pass when neither is wanted.
+        const bool need_ao_pass = want_e1 || !project_in_block;
+        const int ld_tw  = max_functions * (project_in_block ? 1 : stage);
+        const int ld_taw = nact * stage;
+        const int ld_m1w = std::max(max_functions, nact) * stage;
+        const int ld_m3  = std::max(max_functions, nact);
+        double* waA = wa_a_all.data();
+        double* waB = wa_b_all.data();
+        double* diA = need_diag ? ts.diA.data() : nullptr;
+        double* diB = need_diag ? ts.diB.data() : nullptr;
+        // MO-diagonal staging: Zd holds kZChunk points' worth of point-local products, Dd the
+        // per-slice diagonal before it is scattered onto the microstates. Rows 1..3 of each
+        // point stay zero for LSDA, where the Tap gradient coefficients are zero.
+        std::vector<double>& Zd = ts.Zd;
+        std::vector<double>& Dd = ts.Dd;
+        double* trAr = ts.trA.data();
+        double* trBr = ts.trB.data();
+        double* excr = ts.exc.data();
+        double* stauA = (ansatz >= 2) ? ts.stauA.data() : nullptr;
+        double* stauB = (ansatz >= 2) ? ts.stauB.data() : nullptr;
+        auto& bin = ts.bin;
+        double* brho_a = bin.at("RHO_A")->pointer();
+        double* brho_b = bin.at("RHO_B")->pointer();
+        double* bgaa = (ansatz >= 1) ? bin.at("GAMMA_AA")->pointer() : nullptr;
+        double* bgab = (ansatz >= 1) ? bin.at("GAMMA_AB")->pointer() : nullptr;
+        double* bgbb = (ansatz >= 1) ? bin.at("GAMMA_BB")->pointer() : nullptr;
+        double* btau_a = (ansatz >= 2) ? bin.at("TAU_A")->pointer() : nullptr;
+        double* btau_b = (ansatz >= 2) ? bin.at("TAU_B")->pointer() : nullptr;
+        std::vector<int> slice_L(2 * n_micro), slice_beta(2 * n_micro);
+        // Channel rows of the per-string density tables; row n_strings carries the core prefix.
+        auto channel_rows = [&](int row) {
+            MicrostateChannelSums c;
+            c.rho = SDrho[row];
+            if (ansatz >= 1) { c.gx = SDgx[row]; c.gy = SDgy[row]; c.gz = SDgz[row]; c.gamma = SDgam[row]; }
+            if (ansatz >= 2) c.tau = SDtau[row];
+            return c;
+        };
+        const MicrostateChannelSums core_sums = channel_rows(n_strings);
+
+#pragma omp for schedule(guided)
+        for (size_t Q = 0; Q < grid_->blocks().size(); ++Q) {
+            auto block = grid_->blocks()[Q];
+            const int npoints = block->npoints();
+            const double* w = block->w();
+            const auto& function_map = block->functions_local_to_global();
+            const int nlocal = static_cast<int>(function_map.size());
+
+            pworker->prepare_basis_only(block, false);
+            auto phi_mat = pworker->basis_value("PHI");
+            const int coll_funcs = phi_mat->ncol();
+            double** phi = phi_mat->pointer();
+            double** phix = nullptr; double** phiy = nullptr; double** phiz = nullptr;
+            if (ansatz >= 1) {
+                phix = pworker->basis_value("PHI_X")->pointer();
+                phiy = pworker->basis_value("PHI_Y")->pointer();
+                phiz = pworker->basis_value("PHI_Z")->pointer();
+            }
+            // chi = phi @ Cloc over the first nchi MO columns (Cloc = local AO rows of Ca_full).
+            build_microstate_chi(npoints, nlocal, nchi, ansatz, coll_funcs, Ca_p, function_map,
+                                 phi, phix, phiy, phiz, Cloc, chi, chix, chiy, chiz);
+
+            // Per-block E1 weighted-AO accumulator (reset).
+            if (need_ao_pass) for (int P = 0; P < npoints; ++P) {
+                std::fill(TapAcc_a[P], TapAcc_a[P] + nlocal, 0.0);
+                std::fill(TapAcc_b[P], TapAcc_b[P] + nlocal, 0.0);
+            }
+            if (want_e1 && ansatz >= 2) { std::fill(stauA, stauA + npoints, 0.0); std::fill(stauB, stauB + npoints, 0.0); }
+
+            // Core partial sums over columns [0, Ncore), once per block, and the distinct-string
+            // channel densities that open on them and run over [Ncore, n_p); every microstate
+            // channel carrying string s reads row s.
+            accumulate_microstate_rho_channel(npoints, 0, Ncore, ansatz, 1.0, 1.0, core_occ.data(),
+                                              chi, chix, chiy, chiz,
+                                              MicrostateChannelSums(), core_sums);
+            for (int s = 0; s < n_strings; ++s) {
+                accumulate_microstate_rho_channel(npoints, Ncore, n_p, ansatz, 1.0, 0.5,
+                                                  string_occ[s].data(), chi, chix, chiy, chiz,
+                                                  core_sums, channel_rows(s));
+            }
+
+            int sbase = 0;  // slices staged so far in this block
+            for (int c0 = 0; c0 < n_micro; c0 += chunk) {
+                const int nc = std::min(chunk, n_micro - c0);
+                // vbase: Vcof rows are addressed block-wide (offset sbase) only for the MO
+                // diagonal; otherwise rows are chunk-local (offset 0).
+                const int vbase = need_diag ? sbase : 0;
+
+                // Pack stacked functional inputs (slot j = microstate c0+j).
+                for (int j = 0; j < nc; ++j) {
+                    const int L = c0 + j;
+                    const size_t off = (size_t)j * npoints;
+                    const double* ra = SDrho[str_a[L]];
+                    const double* rb = SDrho[str_b[L]];
+                    std::copy(ra, ra + npoints, brho_a + off);
+                    std::copy(rb, rb + npoints, brho_b + off);
+                    if (ansatz >= 1) {
+                        std::copy(SDgam[str_a[L]], SDgam[str_a[L]] + npoints, bgaa + off);
+                        std::copy(SDgam[str_b[L]], SDgam[str_b[L]] + npoints, bgbb + off);
+                        const double* gax = SDgx[str_a[L]]; const double* gay = SDgy[str_a[L]]; const double* gaz = SDgz[str_a[L]];
+                        const double* gbx = SDgx[str_b[L]]; const double* gby = SDgy[str_b[L]]; const double* gbz = SDgz[str_b[L]];
+                        double* gab = bgab + off;
+                        for (int P = 0; P < npoints; ++P)
+                            gab[P] = gax[P]*gbx[P] + gay[P]*gby[P] + gaz[P]*gbz[P];
+                    }
+                    if (ansatz >= 2) {
+                        std::copy(SDtau[str_a[L]], SDtau[str_a[L]] + npoints, btau_a + off);
+                        std::copy(SDtau[str_b[L]], SDtau[str_b[L]] + npoints, btau_b + off);
+                    }
+                }
+
+                // One functional evaluation for the whole chunk: the functional is pointwise,
+                // stacked slices give the per-microstate values.
+                auto& bvals = bworker->compute_functional(bin, nc * npoints);
+                double* zk = bvals["V"]->pointer();
+                double* v_rho_a = bvals["V_RHO_A"]->pointer();
+                double* v_rho_b = bvals["V_RHO_B"]->pointer();
+                double* v_gamma_aa=nullptr;double* v_gamma_ab=nullptr;double* v_gamma_bb=nullptr;
+                double* v_tau_a=nullptr;double* v_tau_b=nullptr;
+                if (ansatz >= 1) { v_gamma_aa=bvals["V_GAMMA_AA"]->pointer(); v_gamma_ab=bvals["V_GAMMA_AB"]->pointer(); v_gamma_bb=bvals["V_GAMMA_BB"]->pointer(); }
+                if (ansatz >= 2) { v_tau_a=bvals["V_TAU_A"]->pointer(); v_tau_b=bvals["V_TAU_B"]->pointer(); }
+
+                int ns = 0;  // channel slices opened this chunk; indexes Vcof and slice_L
+                int nw = 0;  // slices currently held in TapWide/TAwide
+                int w0 = 0;  // chunk-relative index of the first slice held
+
+                // Active-row GEMMs of the slices held, then the staging buffers are free again.
+                //   wa_s(L)[i][nu] = (chi_act^T TapWide)[i][nu] + (TAwide^T phi)[i][nu]
+                // Both results carry a local AO index nu, scattered into wa_s(L) at global AO
+                // column function_map[nu].
+                //
+                // Projected onto MO column Ncore+j the two terms collapse onto quantities this
+                // loop already holds: sum_nu TapWide[P][nu] Ca[nu][Ncore+j] is TAwide[P][sj,j]
+                // and sum_nu phi[P][nu] Ca[nu][Ncore+j] is chi[P][Ncore+j], so with
+                //   A(i,j) = sum_P chi_act[P][i] TAwide[P][sj,j]
+                // the MO active block of the slice is A + A^T, and no AO row is ever formed.
+                auto flush_stage = [&]() {
+                    if (nw == 0) return;
+                    // Point-major pass over the slices held, q = Ncore+i:
+                    //   TAwide[P][sj,i] = a0 chi[P][q] + a.grad chi[P][q]
+                    for (int P = 0; P < npoints; ++P) {
+                        const double* ch = chi[P];
+                        const double* cx = (ansatz >= 1) ? chix[P] : nullptr;
+                        const double* cy = (ansatz >= 1) ? chiy[P] : nullptr;
+                        const double* cz = (ansatz >= 1) ? chiz[P] : nullptr;
+                        double* taw = TAwide[P];
+                        for (int sj = 0; sj < nw; ++sj) {
+                            const double* cf = Vcof[vbase + w0 + sj] + (size_t)ncof*P;
+                            double* t = taw + (size_t)sj*nact;
+                            const double a0 = cf[0];
+                            if (ansatz >= 1) {
+                                const double ax = cf[1], ay = cf[2], az = cf[3];
+                                for (int i = 0; i < nact; ++i) {
+                                    const int q = Ncore + i;
+                                    t[i] = a0*ch[q] + ax*cx[q] + ay*cy[q] + az*cz[q];
+                                }
+                            } else {
+                                for (int i = 0; i < nact; ++i) t[i] = a0*ch[Ncore + i];
+                            }
+                        }
+                    }
+                    if (nlocal > 0) {
+                        if (project_in_block) {
+                            C_DGEMM('T','N', nact, nw*nact, npoints, 1.0, &chi[0][Ncore], nchi,
+                                    TAwide[0], ld_taw, 0.0, M1w[0], ld_m1w);
+                            for (int sj = 0; sj < nw; ++sj) {
+                                const int Ls = slice_L[sbase + w0 + sj];
+                                double* tgt = (slice_beta[sbase + w0 + sj] ? waB : waA)
+                                            + (size_t)Ls*nact*nact;
+                                wa_set(Ls);
+                                for (int i = 0; i < nact; ++i) {
+                                    const double* Ai = M1w[i] + (size_t)sj*nact;
+                                    double* trow = tgt + (size_t)i*nact;
+                                    for (int j = 0; j < nact; ++j)
+                                        trow[j] += Ai[j] + M1w[j][(size_t)sj*nact + i];
+                                }
+                                wa_unset(Ls);
+                            }
+                        } else {
+                            C_DGEMM('T','N', nact, nw*nlocal, npoints, 1.0, &chi[0][Ncore], nchi,
+                                    TapWide[0], ld_tw, 0.0, M1w[0], ld_m1w);
+                            C_DGEMM('T','N', nw*nact, nlocal, npoints, 1.0, TAwide[0], ld_taw,
+                                    phi[0], coll_funcs, 0.0, M2S[0], max_functions);
+                            for (int sj = 0; sj < nw; ++sj) {
+                                const int Ls = slice_L[sbase + w0 + sj];
+                                double* tgt = (slice_beta[sbase + w0 + sj] ? waB : waA)
+                                            + (size_t)Ls*nact*nbf_;
+                                wa_set(Ls);
+                                for (int i = 0; i < nact; ++i) {
+                                    const double* r1 = M1w[i] + (size_t)sj*nlocal;
+                                    const double* r2 = M2S[(size_t)sj*nact + i];
+                                    double* trow = tgt + (size_t)i*nbf_;
+                                    for (int k = 0; k < nlocal; ++k) trow[function_map[k]] += r1[k] + r2[k];
+                                }
+                                wa_unset(Ls);
+                            }
+                        }
+                    }
+                    w0 += nw;
+                    nw = 0;
+                };
+
+                for (int j = 0; j < nc; ++j) {
+                    const int L = c0 + j;
+                    const double cl = C_L[L];
+                    const bool closed = closed_ms[L];
+                    const size_t off = (size_t)j * npoints;
+                    const double* ra = SDrho[str_a[L]];
+                    const double* rb = SDrho[str_b[L]];
+                    const double* vra = v_rho_a + off;
+                    const double* vrb = v_rho_b + off;
+                    const double* vgaa = (ansatz >= 1) ? v_gamma_aa + off : nullptr;
+                    const double* vgab = (ansatz >= 1) ? v_gamma_ab + off : nullptr;
+                    const double* vgbb = (ansatz >= 1) ? v_gamma_bb + off : nullptr;
+                    const double* gab = (ansatz >= 1) ? bgab + off : nullptr;
+
+                    excr[L] += C_DDOT(npoints, w, 1, zk + off, 1);
+
+                    // trace tr(D_base^s V_xc^s) = sum_P w[v_rho rho + 2 v_gamma_ss|grad|^2 + v_gamma_os grad.grad + 2 v_tau tau].
+                    // meta factor 2: tau = 0.5 sum_d D phid phid, so tr(D V^tau) = sum_P v_tau w (2 tau).
+                    double ta = 0.0, tb = 0.0;
+                    for (int P = 0; P < npoints; ++P) { ta += w[P]*vra[P]*ra[P]; tb += w[P]*vrb[P]*rb[P]; }
+                    if (ansatz >= 1) {
+                        const double* gaa = SDgam[str_a[L]];
+                        const double* gbb = SDgam[str_b[L]];
+                        for (int P = 0; P < npoints; ++P) {
+                            ta += w[P]*(2.0*vgaa[P]*gaa[P] + vgab[P]*gab[P]);
+                            tb += w[P]*(2.0*vgbb[P]*gbb[P] + vgab[P]*gab[P]);
+                        }
+                    }
+                    if (ansatz >= 2) {
+                        const double* tua = SDtau[str_a[L]];
+                        const double* tub = SDtau[str_b[L]];
+                        const double* vta = v_tau_a + off;
+                        const double* vtb = v_tau_b + off;
+                        for (int P = 0; P < npoints; ++P) { ta += 2.0*w[P]*vta[P]*tua[P]; tb += 2.0*w[P]*vtb[P]*tub[P]; }
+                    }
+                    trAr[L] += ta; trBr[L] += tb;
+
+                    double nq = 0.0;
+                    for (int P = 0; P < npoints; ++P) nq += w[P]*(ra[P] + rb[P]);
+                    nqT[rank] += cl * nq;
+
+                    // Per channel slice, one fused pass over points: the weighted AO potential
+                    //   Tap[P][k] = 0.5 v_rho w phi_k + [w(2 v_gamma_ss grad rho_s + v_gamma_os grad rho_os)].grad phi_k
+                    // written into its TapWide slice, its four point coefficients into the slice's
+                    // Vcof row, and the E1 accumulation TapAcc += C_L Tap, mirrored into the beta
+                    // spin in the same pass for a closed microstate.
+                    const double* gax = (ansatz >= 1) ? SDgx[str_a[L]] : nullptr;
+                    const double* gay = (ansatz >= 1) ? SDgy[str_a[L]] : nullptr;
+                    const double* gaz = (ansatz >= 1) ? SDgz[str_a[L]] : nullptr;
+                    const double* gbx = (ansatz >= 1) ? SDgx[str_b[L]] : nullptr;
+                    const double* gby = (ansatz >= 1) ? SDgy[str_b[L]] : nullptr;
+                    const double* gbz = (ansatz >= 1) ? SDgz[str_b[L]] : nullptr;
+
+                    {  // alpha slice
+                        if (nw == stage) flush_stage();
+                        const size_t scol = project_in_block ? 0 : (size_t)nw * nlocal;
+                        double* cof = Vcof[vbase + ns];
+                        slice_L[sbase + ns] = L; slice_beta[sbase + ns] = 0; ++ns; ++nw;
+                        for (int P = 0; P < npoints; ++P) {
+                            const double a0 = 0.5 * vra[P] * w[P];
+                            double ax = 0.0, ay = 0.0, az = 0.0;
+                            if (ansatz >= 1) {
+                                ax = w[P]*(2.0*vgaa[P]*gax[P] + vgab[P]*gbx[P]);
+                                ay = w[P]*(2.0*vgaa[P]*gay[P] + vgab[P]*gby[P]);
+                                az = w[P]*(2.0*vgaa[P]*gaz[P] + vgab[P]*gbz[P]);
+                            }
+                            double* cf = cof + (size_t)ncof*P;
+                            cf[0] = a0; cf[1] = ax; cf[2] = ay; cf[3] = az;
+                            if (!need_ao_pass) continue;
+                            double* tap = TapWide[P] + scol;
+                            double* acc = TapAcc_a[P];
+                            double* accb = TapAcc_b[P];
+                            const double* ph = phi[P];
+                            if (ansatz >= 1) {
+                                const double* px = phix[P]; const double* py = phiy[P]; const double* pz = phiz[P];
+                                if (closed) {
+                                    for (int k = 0; k < nlocal; ++k) {
+                                        const double tv = a0*ph[k] + ax*px[k] + ay*py[k] + az*pz[k];
+                                        tap[k] = tv;
+                                        acc[k] += cl*tv;
+                                        accb[k] += cl*tv;
+                                    }
+                                } else {
+                                    for (int k = 0; k < nlocal; ++k) {
+                                        const double tv = a0*ph[k] + ax*px[k] + ay*py[k] + az*pz[k];
+                                        tap[k] = tv;
+                                        acc[k] += cl*tv;
+                                    }
+                                }
+                            } else if (closed) {
+                                for (int k = 0; k < nlocal; ++k) {
+                                    const double tv = a0*ph[k];
+                                    tap[k] = tv;
+                                    acc[k] += cl*tv;
+                                    accb[k] += cl*tv;
+                                }
+                            } else {
+                                for (int k = 0; k < nlocal; ++k) {
+                                    const double tv = a0*ph[k];
+                                    tap[k] = tv;
+                                    acc[k] += cl*tv;
+                                }
+                            }
+                        }
+                    }
+                    if (!closed) {  // beta slice
+                        if (nw == stage) flush_stage();
+                        const size_t scol = project_in_block ? 0 : (size_t)nw * nlocal;
+                        double* cof = Vcof[vbase + ns];
+                        slice_L[sbase + ns] = L; slice_beta[sbase + ns] = 1; ++ns; ++nw;
+                        for (int P = 0; P < npoints; ++P) {
+                            const double b0 = 0.5 * vrb[P] * w[P];
+                            double bx = 0.0, by = 0.0, bz = 0.0;
+                            if (ansatz >= 1) {
+                                bx = w[P]*(2.0*vgbb[P]*gbx[P] + vgab[P]*gax[P]);
+                                by = w[P]*(2.0*vgbb[P]*gby[P] + vgab[P]*gay[P]);
+                                bz = w[P]*(2.0*vgbb[P]*gbz[P] + vgab[P]*gaz[P]);
+                            }
+                            double* cf = cof + (size_t)ncof*P;
+                            cf[0] = b0; cf[1] = bx; cf[2] = by; cf[3] = bz;
+                            if (!need_ao_pass) continue;
+                            double* tap = TapWide[P] + scol;
+                            double* acc = TapAcc_b[P];
+                            const double* ph = phi[P];
+                            if (ansatz >= 1) {
+                                const double* px = phix[P]; const double* py = phiy[P]; const double* pz = phiz[P];
+                                for (int k = 0; k < nlocal; ++k) {
+                                    const double tv = b0*ph[k] + bx*px[k] + by*py[k] + bz*pz[k];
+                                    tap[k] = tv;
+                                    acc[k] += cl*tv;
+                                }
+                            } else {
+                                for (int k = 0; k < nlocal; ++k) {
+                                    const double tv = b0*ph[k];
+                                    tap[k] = tv;
+                                    acc[k] += cl*tv;
+                                }
+                            }
+                        }
+                    }
+                }  // end microstates in chunk
+
+                // meta contribution: sum_d (v_tau w) chi_d_i chi_d_q, d = x,y,z.
+                // Sd[P][i] = (v_tau w) chi_d[P][Ncore+i] carries the point weight on the active
+                // side; the active-row GEMM contracts Sd against phi_d (chid_act in the projected
+                // block) into waL. The diagonal (need_diag only) adds the per-point term
+                // (v_tau w) chi_d[P][q]^2 directly, no GEMM.
+                if (ansatz >= 2) {
+                    for (int j = 0; j < nc; ++j) {
+                        const int L = c0 + j;
+                        const double cl = C_L[L];
+                        const bool closed = closed_ms[L];
+                        const size_t off = (size_t)j * npoints;
+                        const double* vta = v_tau_a + off;
+                        const double* vtb = v_tau_b + off;
+                        double* waAL = waA + (size_t)L*nact*acc_w;
+                        double* waBL = waB + (size_t)L*nact*acc_w;
+                        double** chid_arr[3] = {chix, chiy, chiz};
+                        double** phid_arr[3] = {phix, phiy, phiz};
+                        double* diAL = need_diag ? (diA + (size_t)L*nmo) : nullptr;
+                        // The three directions accumulate into M3 before the single locked
+                        // scatter below.
+                        const int m3w = project_in_block ? nact : nlocal;
+                        auto meta_dir = [&](const double* vt, double* waL, double* diL) {
+                            for (int i = 0; i < nact; ++i) std::fill(M3[i], M3[i] + m3w, 0.0);
+                            for (int d = 0; d < 3; ++d) {
+                                double** chid = chid_arr[d];
+                                double** phid = phid_arr[d];
+                                for (int P = 0; P < npoints; ++P) {
+                                    const double s = vt[P]*w[P];
+                                    const double* cd = chid[P];
+                                    double* sd = Sd[P];
+                                    for (int i = 0; i < nact; ++i) sd[i] = s*cd[Ncore + i];
+                                    if (diL) {
+                                        for (int q = 0; q < nmo; ++q) diL[q] += cd[q]*(s*cd[q]);
+                                    }
+                                }
+                                if (project_in_block) {
+                                    // sum_nu phid[P][nu] Ca[nu][Ncore+j] is chid[P][Ncore+j],
+                                    // so the active block is Sd^T chid_act directly.
+                                    C_DGEMM('T','N', nact, nact, npoints, 1.0, Sd[0], nact,
+                                            &chid[0][Ncore], nchi, 1.0, M3[0], ld_m3);
+                                } else {
+                                    C_DGEMM('T','N', nact, nlocal, npoints, 1.0, Sd[0], nact,
+                                            phid[0], coll_funcs, 1.0, M3[0], ld_m3);
+                                }
+                            }
+                            wa_set(L);
+                            if (project_in_block) {
+                                for (int i = 0; i < nact; ++i) {
+                                    const double* r = M3[i];
+                                    double* trow = waL + (size_t)i*nact;
+                                    for (int j = 0; j < nact; ++j) trow[j] += r[j];
+                                }
+                            } else {
+                                for (int i = 0; i < nact; ++i) {
+                                    const double* r = M3[i];
+                                    double* trow = waL + (size_t)i*nbf_;
+                                    for (int k = 0; k < nlocal; ++k) trow[function_map[k]] += r[k];
+                                }
+                            }
+                            wa_unset(L);
+                        };
+                        meta_dir(vta, waAL, diAL);
+                        if (!closed) {
+                            double* diBL = need_diag ? (diB + (size_t)L*nmo) : nullptr;
+                            meta_dir(vtb, waBL, diBL);
+                        }
+                        // E1 meta: STau += C_L v_tau w (beta == alpha for closed).
+                        if (want_e1) for (int P = 0; P < npoints; ++P) {
+                            stauA[P] += cl*vta[P]*w[P];
+                            stauB[P] += cl*(closed ? vta[P] : vtb[P])*w[P];
+                        }
+                    }
+                }
+
+                flush_stage();
+                sbase += ns;
+            }  // end chunks
+
+            // Full-MO diagonal of every slice staged in this block. The point-local products
+            //   Z[ncof*P + d][q] = chi[P][q] * {chi, chix, chiy, chiz}_d[P][q]
+            // depend on the point alone, so they are formed once for the block and the sum
+            // over slices is one GEMM against the Tap coefficients:
+            //   V_qq(slice) = 2 sum_{P,d} Vcof[slice][ncof*P + d] Z[ncof*P + d][q].
+            // Z is staged in point chunks; Dd accumulates them before the scatter, which adds
+            // so that slices sharing one (L, spin) target sum.
+            if (need_diag && sbase > 0) {
+                std::fill(Dd.begin(), Dd.begin() + (size_t)sbase*nmo, 0.0);
+                for (int P0 = 0; P0 < npoints; P0 += kZChunk) {
+                    const int np = std::min(kZChunk, npoints - P0);
+                    for (int p = 0; p < np; ++p) {
+                        const double* ch = chi[P0 + p];
+                        double* z0 = Zd.data() + (size_t)(ncof*p + 0)*nmo;
+                        for (int q = 0; q < nmo; ++q) z0[q] = ch[q]*ch[q];
+                        if (ansatz >= 1) {
+                            const double* cx = chix[P0 + p];
+                            const double* cy = chiy[P0 + p];
+                            const double* cz = chiz[P0 + p];
+                            double* z1 = Zd.data() + (size_t)(ncof*p + 1)*nmo;
+                            double* z2 = Zd.data() + (size_t)(ncof*p + 2)*nmo;
+                            double* z3 = Zd.data() + (size_t)(ncof*p + 3)*nmo;
+                            for (int q = 0; q < nmo; ++q) z1[q] = ch[q]*cx[q];
+                            for (int q = 0; q < nmo; ++q) z2[q] = ch[q]*cy[q];
+                            for (int q = 0; q < nmo; ++q) z3[q] = ch[q]*cz[q];
+                        }
+                    }
+                    C_DGEMM('N','N', sbase, nmo, ncof*np, 2.0, &Vcof[0][(size_t)ncof*P0],
+                            ncof*max_points, Zd.data(), nmo, 1.0, Dd.data(), nmo);
+                }
+                for (int sj = 0; sj < sbase; ++sj) {
+                    double* diL = (slice_beta[sj] ? diB : diA) + (size_t)slice_L[sj]*nmo;
+                    C_DAXPY(nmo, 1.0, Dd.data() + (size_t)sj*nmo, 1, diL, 1);
+                }
+            }
+
+            // E1 back-projection of the C_L-weighted AO potential (ONE per block).
+            for (int sp = 0; want_e1 && sp < 2; ++sp) {
+                double** TapAcc = (sp == 0) ? TapAcc_a : TapAcc_b;
+                double** Vp = (sp == 0) ? V_acc_a_p : V_acc_b_p;
+                double* stau = (sp == 0) ? stauA : stauB;
+                // V_loc = sym(phi^T TapAcc) (LSDA+GGA) + sum_d phid^T diag(STau) phid (meta).
+                C_DGEMM('T','N', nlocal, nlocal, npoints, 1.0, phi[0], coll_funcs, TapAcc[0], max_functions, 0.0, Vloc_p[0], max_functions);
+                for (int m = 0; m < nlocal; ++m)
+                    for (int n = 0; n <= m; ++n) { Vloc_p[m][n] = Vloc_p[n][m] = Vloc_p[m][n] + Vloc_p[n][m]; }
+                if (ansatz >= 2) {
+                    double** phid_arr[3] = {phix, phiy, phiz};
+                    for (int d = 0; d < 3; ++d) {
+                        double** phid = phid_arr[d];
+                        for (int P = 0; P < npoints; ++P)
+                            for (int ml = 0; ml < nlocal; ++ml) MbpT[P][ml] = stau[P]*phid[P][ml];
+                        C_DGEMM('T','N', nlocal, nlocal, npoints, 1.0, phid[0], coll_funcs, MbpT[0], max_functions, 1.0, Vloc_p[0], max_functions);
+                    }
+                }
+                // The AO accumulator is shared; only the scatter of this block is serialized.
+#pragma omp critical(reks_vacc)
+                {
+                    for (int ml = 0; ml < nlocal; ++ml) {
+                        const int mg = function_map[ml];
+                        for (int nl = 0; nl < nlocal; ++nl) Vp[mg][function_map[nl]] += Vloc_p[ml][nl];
+                    }
+                }
+            }
+        }  // end blocks
+
+#pragma omp critical
+        {
+            // Per-L scalars and, when it is wanted, the MO diagonal; the weighted-AO rows and
+            // the AO accumulator were already scattered into their shared buffers.
+            for (int L = 0; L < n_micro; ++L) {
+                E_xc[L] += excr[L]; tr_a[L] += trAr[L]; tr_b[L] += trBr[L];
+                if (need_diag) {
+                    C_DAXPY(nmo, 1.0, diA + (size_t)L*nmo, 1, diag_a[L].data(), 1);
+                    C_DAXPY(nmo, 1.0, diB + (size_t)L*nmo, 1, diag_b[L].data(), 1);
+                }
+            }
+        }
+    }  // end omp parallel
+    timer_off(t_grid);
+
+    timer_on(t_proj);
+    // MO projection of the weighted-AO active rows: arows = wa Ca. wa_*_all is
+    // (n_micro*nact) x acc_w; project_in_block copies it straight into arows (already the
+    // active block), otherwise a contiguous run of microstates is one GEMM against Ca
+    // columns [mo_lo, mo_lo+mo_width), its flat result split across the run's arows.
+    sc.proj.resize(project_in_block ? 0 : (size_t)n_micro * nact * mo_width);
+    std::vector<double>& proj = sc.proj;
+    auto project_run = [&](double* wa, std::vector<SharedMatrix>& arows, int L0, int nL) {
+        if (nL <= 0 || mo_width <= 0) return;
+        if (project_in_block) {
+            for (int L = 0; L < nL; ++L)
+                C_DCOPY((size_t)nact*nact, wa + (size_t)(L0 + L)*nact*nact, 1,
+                        arows[L0 + L]->pointer()[0], 1);
+            return;
+        }
+        C_DGEMM('N','N', nL*nact, mo_width, nbf_, 1.0, wa + (size_t)L0*nact*nbf_, nbf_,
+                &Ca_p[0][mo_lo], nmo, 0.0, proj.data(), mo_width);
+        for (int L = 0; L < nL; ++L)
+            C_DCOPY((size_t)nact*mo_width, proj.data() + (size_t)L*nact*mo_width, 1,
+                    arows[L0 + L]->pointer()[0], 1);
+    };
+    project_run(wa_a_all.data(), arows_a, 0, n_micro);
+    // Closed-shell beta is mirrored from alpha below (its weighted-AO block stays zero);
+    // project_run here runs only over the stretches of consecutive open microstates.
+    for (int L0 = 0; L0 < n_micro;) {
+        if (closed_ms[L0]) { ++L0; continue; }
+        int L1 = L0;
+        while (L1 < n_micro && !closed_ms[L1]) ++L1;
+        project_run(wa_b_all.data(), arows_b, L0, L1 - L0);
+        L0 = L1;
+    }
+
+    // Closed-shell RHO convention: RHO_A = RHO_B = nq_total.
+    const double nq_total = std::accumulate(nqT.begin(), nqT.end(), 0.0);
+    quad_values_["RHO_A"] = nq_total;
+    quad_values_["RHO_B"] = nq_total;
+
+    // Closed-shell microstates: mirror beta arows = alpha (and the full MO diagonal when need_diag).
+    for (int L = 0; L < n_micro; ++L) {
+        if (!closed_ms[L]) continue;
+        arows_b[L]->copy(arows_a[L]);
+        if (need_diag) diag_b[L] = diag_a[L];
+    }
+
+    for (int L = 0; L < n_micro; ++L)
+        if (std::isnan(E_xc[L]))
+            throw PSIEXCEPTION("UV::compute_V_microstates_mo: XC energy NaN.");
+
+    timer_off(t_proj);
+    timer_off("UV: Form V mo");
+}
+
 std::vector<SharedMatrix> UV::compute_fock_derivatives() {
     timer_on("UV: Form Fx");
 

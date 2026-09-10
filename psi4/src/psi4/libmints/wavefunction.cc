@@ -1040,7 +1040,8 @@ SharedMatrix Wavefunction::matrix_subset_helper(SharedMatrix M, SharedMatrix C, 
 
 SharedMatrix Wavefunction::basis_projection(SharedMatrix C_A, Dimension noccpi, std::shared_ptr<BasisSet> old_basis,
                                             std::shared_ptr<BasisSet> new_basis) {
-    // Based on Werner's method from Mol. Phys. 102, 21-22, 2311
+    // Based on Werner's method: R. Polly, H.-J. Werner, F. R. Manby, P. J. Knowles,
+    // Mol. Phys. 102 (21-22), 2311-2321 (2004).
     std::shared_ptr<IntegralFactory> newfactory =
         std::make_shared<IntegralFactory>(new_basis, new_basis, new_basis, new_basis);
     std::shared_ptr<IntegralFactory> hybfactory =

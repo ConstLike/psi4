@@ -79,6 +79,9 @@ class HF : public Wavefunction {
     /// User defined orbitals
     SharedMatrix guess_Ca_;
     SharedMatrix guess_Cb_;
+    /// User-defined Fock matrices for the READ guess path.
+    SharedMatrix guess_Fa_;
+    SharedMatrix guess_Fb_;
 
     // Q: right now, thresholds are removed from Wfn since only appear once, py-side.
     //    should we instead store here the E & D to which SCF was converged?
@@ -279,7 +282,7 @@ class HF : public Wavefunction {
     void check_phases();
 
     /// Prints the orbitals in arbitrary order (works with MOM)
-    void print_orbitals();
+    virtual void print_orbitals();
 
     /// Prints some opening information
     void print_header();
@@ -329,7 +332,7 @@ class HF : public Wavefunction {
     virtual int soscf_update(double soscf_conv, int soscf_min_iter, int soscf_max_iter, bool soscf_print);
 
     /// Figure out how to occupy the orbitals in the absence of DOCC and SOCC
-    void find_occupation();
+    virtual void find_occupation();
 
     /** Performs DIIS extrapolation */
     virtual bool diis(double dnorm) { return false; }
@@ -413,6 +416,8 @@ class HF : public Wavefunction {
     // Set guess occupied orbitals, nalpha and nbeta will be taken from the number of passed in eigenvectors
     void guess_Ca(SharedMatrix Ca) { guess_Ca_ = Ca; }
     void guess_Cb(SharedMatrix Cb) { guess_Cb_ = Cb; }
+    void guess_Fa(SharedMatrix Fa) { guess_Fa_ = Fa; }
+    void guess_Fb(SharedMatrix Fb) { guess_Fb_ = Fb; }
 
     // Expert option to reset the occuption or not at iteration zero
     bool reset_occ() const { return reset_occ_; }

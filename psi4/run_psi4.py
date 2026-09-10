@@ -270,6 +270,12 @@ args["input"] = os.path.normpath(args["input"])
 # Setup scratch_messy
 _clean_functions = [psi4.core.clean, psi4.extras.clean_numpy_files]
 
+# macOS: conda OpenBLAS uses libomp (LLVM), Psi4/GCC uses libgomp — two OpenMP
+# runtimes in one process breaks threading. Force OpenBLAS single-threaded.
+# Linux: conda OpenBLAS uses libgomp (same as Psi4) — no conflict, leave alone.
+if sys.platform == "darwin":
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
 # Set a few options (silently)
 psi4.core.set_num_threads(int(args["nthread"]), quiet=True)
 psi4.set_memory(args["memory"], quiet=True)

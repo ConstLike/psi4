@@ -141,10 +141,8 @@ def scf_initialize(self):
     vbase = self.V_potential()
     if vbase:
         collocation_size = vbase.grid().collocation_size()
-        if vbase.functional().ansatz() == 1:
-            collocation_size *= 4  # First derivs
-        elif vbase.functional().ansatz() == 2:
-            collocation_size *= 10  # Second derivs
+        if vbase.functional().ansatz() >= 1:
+            collocation_size *= 4  # Value + 3 gradients; grid cache never exceeds first-derivative order
     else:
         collocation_size = 0
 
@@ -277,6 +275,24 @@ def scf_iterate(self, e_conv=None, d_conv=None):
     efp_enabled = hasattr(self.molecule(), 'EFP')
     cosx_enabled = "COSX" in core.get_option('SCF', 'SCF_TYPE')
     ooo_scf = core.get_option("SCF", "ORBITAL_OPTIMIZER_PACKAGE") in ["OOO", "OPENORBITALOPTIMIZER"]
+    molden_interval = core.get_option("SCF", "MOLDEN_WRITE_INTERVAL")
+    if molden_interval > 0 and ooo_scf:
+        ooo_falls_back_to_internal = (
+            reference in ["ROHF", "CUHF"] or soscf_enabled or self.MOM_excited_
+            or frac_enabled or efp_enabled
+            or core.get_option('SCF', 'PCM') or core.get_option('SCF', 'DDX')
+            or core.get_option('SCF', 'PE')
+            or core.get_option("SCF", "LEVEL_SHIFT") != 0.0
+            or core.get_option("SAPT", "SAPT_DFT_GRAC_COMPUTE") != "NONE"
+            or core.get_option("SCF", "GUESS_MIX")
+        )
+        if not ooo_falls_back_to_internal:
+            raise ValidationError(
+                f"MOLDEN_WRITE_INTERVAL>0 is incompatible with ORBITAL_OPTIMIZER_PACKAGE="
+                f"{core.get_option('SCF', 'ORBITAL_OPTIMIZER_PACKAGE')}: "
+                "OpenOrbitalOptimizer runs an internal C++ SCF loop with no Python-visible "
+                "per-iteration hook. Either set MOLDEN_WRITE_INTERVAL=0, or set "
+                "ORBITAL_OPTIMIZER_PACKAGE=INTERNAL.")
     if ooo_scf:
         pcm_enabled = core.get_option('SCF', 'PCM')
         ddx_enabled = core.get_option('SCF', 'DDX')
@@ -287,7 +303,7 @@ def scf_iterate(self, e_conv=None, d_conv=None):
         if (reference in ["ROHF", "CUHF"] or soscf_enabled or self.MOM_excited_ or frac_enabled or
             efp_enabled or pcm_enabled or ddx_enabled or pe_enabled or autograc_enabled or
             level_shift_enabled or guessmix_enabled):
-            core.print_out(f"    Note: OpenOrbitalOptimizer not compatible with at least one of the following. Falling back to orbital_optimizer_package=internal\n")
+            core.print_out("    Note: OpenOrbitalOptimizer not compatible with at least one of the following. Falling back to orbital_optimizer_package=internal\n")
             core.print_out(f"          {reference=}, soscf={soscf_enabled}, mom={self.MOM_excited_}, frac={frac_enabled}, efp={efp_enabled},\n")
             core.print_out(f"          pcm={pcm_enabled}, ddx={ddx_enabled}, pe={pe_enabled}, autograc={autograc_enabled}, level_shift={level_shift_enabled},\n")
             core.print_out(f"          guess_mix={guessmix_enabled}\n")
@@ -350,6 +366,13 @@ def scf_iterate(self, e_conv=None, d_conv=None):
     SCFE_old = 0.0
     Dnorm = 0.0
     scf_iter_post_screening = 0
+
+    # Pre-loop MOLDEN dump of GUESS state. SAD path has no Ca yet, so skip.
+    if molden_interval > 0 and not self.sad_:
+        molden_prefix = core.get_writer_file_prefix(self.molecule().name())
+        molden_dovirt = bool(core.get_option("SCF", "MOLDEN_WITH_VIRTUAL"))
+        self.write_molden(f"{molden_prefix}.iter_guess.molden", molden_dovirt, False)
+
     while True:
         self.iteration_ += 1
 
@@ -511,6 +534,8 @@ def scf_iterate(self, e_conv=None, d_conv=None):
                 # frac, MOM invoked here from Wfn::HF::find_occupation
                 core.timer_on("HF: Form C")
                 level_shift = core.get_option("SCF", "LEVEL_SHIFT")
+                if hasattr(self, "get_iter_accel_labels"):
+                    status.extend(self.get_iter_accel_labels())
                 if level_shift > 0 and Dnorm > core.get_option('SCF', 'LEVEL_SHIFT_CUTOFF'):
                     status.append("SHIFT")
                     self.form_C(level_shift)
@@ -546,6 +571,12 @@ def scf_iterate(self, e_conv=None, d_conv=None):
             self.damping_update(damping_percentage * 0.01)
             status.append("DAMP={}%".format(round(damping_percentage)))
 
+        # Per-iteration MOLDEN snapshot. >=0 because HF::guess sets iteration_=-1 for READ/SAD.
+        if molden_interval > 0 and self.iteration_ >= 0 and self.iteration_ % molden_interval == 0:
+            molden_prefix = core.get_writer_file_prefix(self.molecule().name())
+            molden_dovirt = bool(core.get_option("SCF", "MOLDEN_WITH_VIRTUAL"))
+            self.write_molden(f"{molden_prefix}.iter_{self.iteration_:03d}.molden", molden_dovirt, False)
+
         if core.has_option_changed("SCF", "ORBITALS_WRITE"):
             filename = core.get_option("SCF", "ORBITALS_WRITE")
             self.to_file(filename)
@@ -578,7 +609,8 @@ def scf_iterate(self, e_conv=None, d_conv=None):
                 break
 
         # Call any postiteration callbacks
-        if not ((self.iteration_ == 0) and self.sad_) and _converged(Ediff, Dnorm, e_conv=e_conv, d_conv=d_conv):
+        if not ((self.iteration_ == 0) and self.sad_) and _converged(Ediff, Dnorm, e_conv=e_conv, d_conv=d_conv) \
+           and not (hasattr(self, "gvb_gate_confirm_pending") and self.gvb_gate_confirm_pending()):
 
             if early_screening:
 
@@ -713,7 +745,7 @@ def scf_finalize_energy(self):
         self.set_variable("GRID ELECTRONS BETA",rho_b)  # P::e SCF
         dev_a = rho_a - self.nalpha()
         dev_b = rho_b - self.nbeta()
-        core.print_out(f"   Electrons on quadrature grid:\n")
+        core.print_out("   Electrons on quadrature grid:\n")
         if self.same_a_b_dens():
             core.print_out(f"      Ntotal   = {rho_ab:15.10f} ; deviation = {dev_b+dev_a:.3e} \n\n")
         else:
@@ -821,9 +853,15 @@ def scf_print_energies(self):
     epe = self.get_energies('PE Energy')
     ke = self.get_energies('Kinetic')
 
+    # SA-REKS: total = E_SA + E_pen + VV10 (not sum of std components); use stored value.
+    is_reks = self.get_energies('REKS SA') != 0.0
     hf_energy = enuc + e1 + e2
     dft_energy = hf_energy + exc + ed + evv10
-    total_energy = dft_energy + eefp + epcm + edd + epe
+    if is_reks:
+        total_energy = self.get_energies('Total Energy')
+    else:
+        total_energy = dft_energy + eefp + epcm + edd + epe
+    e_ipr = self.get_energies('IPR Penalty')
     full_qm = (not core.get_option('SCF', 'PCM') and not core.get_option('SCF', 'DDX') and not core.get_option('SCF', 'PE')
                and not hasattr(self.molecule(), 'EFP'))
 
@@ -835,6 +873,8 @@ def scf_print_energies(self):
         core.print_out("    DFT Exchange-Correlation Energy = {:24.16f}\n".format(exc))
         core.print_out("    Empirical Dispersion Energy =     {:24.16f}\n".format(ed))
         core.print_out("    VV10 Nonlocal Energy =            {:24.16f}\n".format(evv10))
+    if e_ipr != 0.0:
+        core.print_out("    IPR Penalty Energy =              {:24.16f}\n".format(e_ipr))
     if core.get_option('SCF', 'PCM'):
         core.print_out("    PCM Polarization Energy =         {:24.16f}\n".format(epcm))
     if core.get_option('SCF', 'DDX'):

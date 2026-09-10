@@ -1,0 +1,49 @@
+#! REKS(4,4) READ across geometry AND basis (project at fixed nuclei, then transport).
+#! Independence principle: a projected READ guess must reproduce the cold (SAD)
+#! energy at the target geometry+basis. Guards the two-step proc.py dispatch case.
+
+import os
+
+REKS = {
+    "reference": "reks", "scf_type": "pk", "dft_grid_name": "SG1",
+    "reks": [4, 4], "reks_sa_weights": [0.25, 0.25, 0.25, 0.25],
+    "reks_m_fon": 1.99999999, "sa_reks_extra": [[1, 1, 1, 1, 0, 0, 0, 0]],
+    "reks_use_trah": True, "reks_gvb_diis": False,
+    "level_shift": 0.6, "level_shift_cutoff": 0.0, "level_shift_adapt": True,
+    "maxiter": 150, "d_convergence": 6, "e_convergence": 8,
+    "damping_percentage": 0.0, "fail_on_maxiter": False, "reks_report_level": 2,
+}
+
+
+def h4(R):
+    geom = "0 1\n" + "\n".join(f"H 0.0 0.0 {i * R:.6f}" for i in range(4))
+    return psi4.geometry(geom + "\nsymmetry c1\nno_com\nno_reorient\n")
+
+
+def sa_run(R, basis, guess, seed=None):
+    psi4.core.clean()
+    h4(R)
+    opts = dict(REKS)
+    opts["basis"] = basis
+    opts["guess"] = guess
+    psi4.set_options(opts)
+    kwargs = {"return_wfn": True}
+    if seed is not None:
+        kwargs["restart_file"] = seed
+    _, wfn = psi4.energy("bhhlyp", **kwargs)
+    return wfn.energy(), wfn
+
+
+R1, R2 = 2.30, 2.35
+B_SEED, B_TARGET = "6-31g(d)", "cc-pvdz"
+SEED = os.path.join(os.getcwd(), "seed")
+
+# Seed: cold REKS(4,4) at geometry 1 in the seed basis.
+_, seed_wfn = sa_run(R1, B_SEED, "sad")
+seed_wfn.to_file(SEED)
+
+# Target geometry 2 + target basis: cold vs READ (basis projection then transport).
+E_cold, _ = sa_run(R2, B_TARGET, "sad")
+E_read, _ = sa_run(R2, B_TARGET, "read", seed=SEED + ".npy")
+
+compare_values(E_cold, E_read, 7, "REKS(4,4) READ geometry+basis reproduces cold SA energy")  #TEST

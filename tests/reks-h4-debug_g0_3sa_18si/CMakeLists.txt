@@ -1,0 +1,6 @@
+include(TestingMacros)
+
+add_regression_test(reks-h4-debug_g0_3sa_18si "psi;reks;noc1;long")
+
+# Heavy test: skipped by default. To enable, drop this line.
+set_tests_properties(reks-h4-debug_g0_3sa_18si PROPERTIES DISABLED TRUE)

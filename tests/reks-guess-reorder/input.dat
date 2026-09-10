@@ -1,0 +1,75 @@
+#! Acceptance test for SCF GUESS_MO_SWAPS option:
+#!  1) RHF on H2 saves .npy into scratch.
+#!  2) REKS(2,2) READ baseline (no swaps).
+#!  3) REKS(2,2) READ with identity swap "HOMO HOMO" must match baseline.
+#!  4) REKS(2,2) READ with swap "LUMO LUMO+1" replaces LUMO in active by a
+#!     virtual; must converge to a bound state distinct from baseline.
+
+molecule h2 {
+  0 1
+  H 0.0 0.0 0.0
+  H 0.0 0.0 1.6
+  symmetry c1
+}
+
+set basis 6-31g(d)
+set scf_type pk
+
+reks_opts = {
+    'reference':            'reks',
+    'reks':                 [2, 2],
+    'reks_sa_weights':      [0.5, 0.5],
+    'level_shift':          0.6,
+    'level_shift_cutoff':   0.01,   # shift must drop for the swap to reach a distinct state
+    'level_shift_adapt':    True,
+    'reks_use_trah':        True,
+    'fail_on_maxiter':      False,
+    'maxiter':              150,
+    'd_convergence':        6,
+    'e_convergence':        8,
+    'guess':                'read',
+}
+
+
+def reks_energy():
+    """Run REKS energy() and pull the SA energy out of the wavefunction.
+
+    psi4.energy('scf') returns 0.0 for REKS targets because REKS does not
+    write SCF TOTAL ENERGY. wfn.energy() returns the SA energy directly.
+    """
+    _, wfn = psi4.energy('scf', return_wfn=True)
+    return wfn.energy()
+
+
+# (1) cold RHF -> populates scratch .npy
+psi4.set_options({'reference': 'rhf', 'guess': 'sad', 'maxiter': 150,
+                  'd_convergence': 8, 'e_convergence': 8})
+psi4.energy('scf')
+
+# (2) REKS(2,2) READ baseline
+psi4.set_options(reks_opts)
+E_baseline = reks_energy()
+compare_values(True, E_baseline < -0.5,
+               'REKS baseline produced a bound SA energy')  #TEST
+
+# Refresh RHF .npy in scratch (REKS overwrote it on save)
+psi4.set_options({'reference': 'rhf', 'guess': 'sad'})
+psi4.energy('scf')
+
+# (3) Identity swap must not change the answer.
+psi4.set_options(reks_opts)
+psi4.set_options({'guess_mo_swaps': 'HOMO HOMO'})
+E_idswap = reks_energy()
+compare_values(E_baseline, E_idswap, 8, 'identity swap is a no-op')  #TEST
+
+# Refresh again before the LUMO LUMO+1 run.
+psi4.set_options({'reference': 'rhf', 'guess': 'sad', 'guess_mo_swaps': ''})
+psi4.energy('scf')
+
+# (4) Non-trivial swap alters the active space; REKS must converge to a bound
+# state distinct from baseline.
+psi4.set_options(reks_opts)
+psi4.set_options({'guess_mo_swaps': 'LUMO LUMO+1'})
+E_swap = reks_energy()
+compare_values(True, E_swap < 0.0 and abs(E_swap - E_baseline) > 1e-3,
+               'REKS converged with LUMO/LUMO+1 swap to a state distinct from baseline')  #TEST
