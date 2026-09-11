@@ -82,6 +82,45 @@ inline std::vector<double> rks_quadrature_integrate(std::shared_ptr<BlockOPoints
     return ret;
 }
 
+inline std::vector<double> uks_quadrature_integrate(std::shared_ptr<BlockOPoints> block,
+                                                    std::shared_ptr<SuperFunctional> fworker,
+                                                    std::shared_ptr<PointFunctions> pworker) {
+    // Block data
+    int npoints = block->npoints();
+    auto x = block->x();
+    auto y = block->y();
+    auto z = block->z();
+    auto w = block->w();
+
+    // Superfunctional data
+    auto zk = fworker->value("V")->pointer();
+    auto QTp = fworker->value("Q_TMP")->pointer();
+
+    // Points data
+    auto rho_a = pworker->point_value("RHO_A")->pointer();
+    auto rho_b = pworker->point_value("RHO_B")->pointer();
+
+    // Build quadrature
+    std::vector<double> ret(9);
+    ret[0] = C_DDOT(npoints, w, 1, zk, 1);
+    for (int P = 0; P < npoints; P++) {
+        QTp[P] = w[P] * rho_a[P];
+    }
+    ret[1] = C_DDOT(npoints, w, 1, rho_a, 1);
+    ret[2] = C_DDOT(npoints, QTp, 1, x, 1);
+    ret[3] = C_DDOT(npoints, QTp, 1, y, 1);
+    ret[4] = C_DDOT(npoints, QTp, 1, z, 1);
+    for (int P = 0; P < npoints; P++) {
+        QTp[P] = w[P] * rho_b[P];
+    }
+    ret[5] = C_DDOT(npoints, w, 1, rho_b, 1);
+    ret[6] = C_DDOT(npoints, QTp, 1, x, 1);
+    ret[7] = C_DDOT(npoints, QTp, 1, y, 1);
+    ret[8] = C_DDOT(npoints, QTp, 1, z, 1);
+
+    return ret;
+}
+
 inline void sap_integrator(std::shared_ptr<BlockOPoints> block, const SharedVector& sap_potential,
                            std::shared_ptr<PointFunctions> pworker, SharedMatrix V) {
     // Block data
@@ -210,6 +249,137 @@ inline void rks_integrator(std::shared_ptr<BlockOPoints> block, std::shared_ptr<
                     max_functions);
         }
         // parallel_timer_off("Meta", rank);
+    }
+}
+
+inline void uks_integrator(std::shared_ptr<BlockOPoints> block, std::shared_ptr<SuperFunctional> fworker,
+                           std::shared_ptr<PointFunctions> pworker, SharedMatrix Va, SharedMatrix Vb,
+                           int ansatz = -1) {
+    ansatz = (ansatz == -1 ? fworker->ansatz() : ansatz);
+
+    // Block data
+    const auto& function_map = block->functions_local_to_global();
+    auto nlocal = function_map.size();
+    auto npoints = block->npoints();
+    auto w = block->w();
+
+    // Scratch is updated
+    auto Tap = pworker->scratch()[0]->pointer();
+    auto Tbp = pworker->scratch()[1]->pointer();
+
+    // Points data
+    auto phi = pworker->basis_value("PHI")->pointer();
+    auto coll_funcs = pworker->basis_value("PHI")->ncol();
+
+    // V2 Temporary
+    auto max_functions = Va->ncol();
+    auto Va2p = Va->pointer();
+    auto Vb2p = Vb->pointer();
+
+    // ==> LSDA contribution <== //
+    //                                               ∂
+    // Ta, Tb := 1/2 einsum("p, p, pn -> pnσ", w, φ, -- f)[σ = α, β]
+    //                                               ∂ρ
+    auto v_rho_a = fworker->value("V_RHO_A")->pointer();
+    auto v_rho_b = fworker->value("V_RHO_B")->pointer();
+    // timer_on("V: LSDA");
+    for (int P = 0; P < npoints; P++) {
+        std::fill(Tap[P], Tap[P] + nlocal, 0.0);
+        std::fill(Tbp[P], Tbp[P] + nlocal, 0.0);
+        C_DAXPY(nlocal, 0.5 * v_rho_a[P] * w[P], phi[P], 1, Tap[P], 1);
+        C_DAXPY(nlocal, 0.5 * v_rho_b[P] * w[P], phi[P], 1, Tbp[P], 1);
+    }
+    // timer_off("V: LSDA");
+
+    // ==> GGA contribution <== //
+    if (ansatz >= 1) {
+        //                                                                      ∂
+        // Ta, Tb += einsum("p, στ, pστ, xpτ, xpn -> pnσ", w, (σ == τ) ? 2 : 1, -- f, ∇ρ, ∇φ)[σ = α, β]
+        //                                                                      ∂γ
+        // timer_on("V: GGA");
+        auto phix = pworker->basis_value("PHI_X")->pointer();
+        auto phiy = pworker->basis_value("PHI_Y")->pointer();
+        auto phiz = pworker->basis_value("PHI_Z")->pointer();
+        auto rho_ax = pworker->point_value("RHO_AX")->pointer();
+        auto rho_ay = pworker->point_value("RHO_AY")->pointer();
+        auto rho_az = pworker->point_value("RHO_AZ")->pointer();
+        auto rho_bx = pworker->point_value("RHO_BX")->pointer();
+        auto rho_by = pworker->point_value("RHO_BY")->pointer();
+        auto rho_bz = pworker->point_value("RHO_BZ")->pointer();
+        auto v_gamma_aa = fworker->value("V_GAMMA_AA")->pointer();
+        auto v_gamma_ab = fworker->value("V_GAMMA_AB")->pointer();
+        auto v_gamma_bb = fworker->value("V_GAMMA_BB")->pointer();
+
+        for (int P = 0; P < npoints; P++) {
+            C_DAXPY(nlocal, w[P] * (2.0 * v_gamma_aa[P] * rho_ax[P] + v_gamma_ab[P] * rho_bx[P]), phix[P], 1, Tap[P],
+                    1);
+            C_DAXPY(nlocal, w[P] * (2.0 * v_gamma_aa[P] * rho_ay[P] + v_gamma_ab[P] * rho_by[P]), phiy[P], 1, Tap[P],
+                    1);
+            C_DAXPY(nlocal, w[P] * (2.0 * v_gamma_aa[P] * rho_az[P] + v_gamma_ab[P] * rho_bz[P]), phiz[P], 1, Tap[P],
+                    1);
+            C_DAXPY(nlocal, w[P] * (2.0 * v_gamma_bb[P] * rho_bx[P] + v_gamma_ab[P] * rho_ax[P]), phix[P], 1, Tbp[P],
+                    1);
+            C_DAXPY(nlocal, w[P] * (2.0 * v_gamma_bb[P] * rho_by[P] + v_gamma_ab[P] * rho_ay[P]), phiy[P], 1, Tbp[P],
+                    1);
+            C_DAXPY(nlocal, w[P] * (2.0 * v_gamma_bb[P] * rho_bz[P] + v_gamma_ab[P] * rho_az[P]), phiz[P], 1, Tbp[P],
+                    1);
+        }
+        // timer_off("V: GGA");
+    }
+
+    // timer_on("V: LSDA");
+    // ==> Contract Ta and Tba aginst φ, replacing a point index with  an AO index <==
+    C_DGEMM('T', 'N', nlocal, nlocal, npoints, 1.0, phi[0], coll_funcs, Tap[0], max_functions, 0.0, Va2p[0],
+            max_functions);
+    C_DGEMM('T', 'N', nlocal, nlocal, npoints, 1.0, phi[0], coll_funcs, Tbp[0], max_functions, 0.0, Vb2p[0],
+            max_functions);
+
+    // ==> Add the adjoint to complete the LDA and GGA contributions  <==
+    for (int m = 0; m < nlocal; m++) {
+        for (int n = 0; n <= m; n++) {
+            Va2p[m][n] = Va2p[n][m] = Va2p[m][n] + Va2p[n][m];
+            Vb2p[m][n] = Vb2p[n][m] = Vb2p[m][n] + Vb2p[n][m];
+        }
+    }
+    // timer_off("V: LSDA");
+
+    // ==> Meta contribution <== //
+    if (ansatz >= 2) {
+        // timer_on("V: Meta");
+        auto phix = pworker->basis_value("PHI_X")->pointer();
+        auto phiy = pworker->basis_value("PHI_Y")->pointer();
+        auto phiz = pworker->basis_value("PHI_Z")->pointer();
+        auto v_tau_a = fworker->value("V_TAU_A")->pointer();
+        auto v_tau_b = fworker->value("V_TAU_B")->pointer();
+
+        double** phi[3];
+        phi[0] = phix;
+        phi[1] = phiy;
+        phi[2] = phiz;
+
+        double* v_tau[2];
+        v_tau[0] = v_tau_a;
+        v_tau[1] = v_tau_b;
+
+        double** V_val[2];
+        V_val[0] = Va2p;
+        V_val[1] = Vb2p;
+
+        for (int s = 0; s < 2; s++) {
+            double** V2p = V_val[s];
+            double* v_taup = v_tau[s];
+            for (int i = 0; i < 3; i++) {
+                double** phiw = phi[i];
+                for (int P = 0; P < npoints; P++) {
+                    std::fill(Tap[P], Tap[P] + nlocal, 0.0);
+                    C_DAXPY(nlocal, v_taup[P] * w[P], phiw[P], 1, Tap[P], 1);
+                }
+                C_DGEMM('T', 'N', nlocal, nlocal, npoints, 1.0, phiw[0], coll_funcs, Tap[0], max_functions, 1.0,
+                        V2p[0], max_functions);
+            }
+        }
+
+        // timer_off("V: Meta");
     }
 }
 
