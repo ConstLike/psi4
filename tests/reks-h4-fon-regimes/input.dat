@@ -1,0 +1,109 @@
+#! REKS(4,4)/6-31G BHHLYP for linear H4 at three spacings with TRAH and GVB-DIIS; SSR energies of 2S = 0, 2, 4, SI problem, state dipoles.
+
+import json
+import numpy as np
+
+ref = {                                                                                           #TEST
+    "closed": (-1.8941172271909, [1.9999849889, 1.9308541454],                                       #TEST
+               [-2.118221012, -1.933499099, -1.911239417, -1.810819845, -1.74173208, -1.692737349,   #TEST
+                -1.689738971, -1.550175637, -1.532260446, -1.429698015, -1.420578659, -1.378263772,  #TEST
+                -1.262100708, -1.202441513, -1.148470544, -1.105037778],                             #TEST
+               [-2.050425333, -1.981647855, -1.816324024, -1.759900941, -1.644042397, -1.601222186,  #TEST
+                -1.590340992, -1.546972402, -1.479595298, -1.335243506, -1.295558476],               #TEST
+               [-1.846706865]),                                                                      #TEST
+    "opening": (-1.7699306624889, [1.7616491144, 1.4699591910],                                      #TEST
+                [-2.002423564, -1.965705424, -1.761589168, -1.757433246, -1.744978458, -1.727023182, #TEST
+                 -1.716776575, -1.696553348, -1.667755137, -1.626162753, -1.607393213, -1.522985318, #TEST
+                 -1.513935114, -1.486087353, -1.431024997, -1.315370118],                            #TEST
+                [-1.990663548, -1.96745449, -1.760159937, -1.755849208, -1.745887417, -1.714502046,  #TEST
+                 -1.714409259, -1.703680893, -1.680179123, -1.632623918, -1.616614784],              #TEST
+                [-1.97507404]),                                                                      #TEST
+    "open": (-1.6969525570706, [1.1290831026, 1.0618963311],                                         #TEST
+             [-1.993810074, -1.986049882, -1.714862919, -1.710362259, -1.706928047, -1.690662297,    #TEST
+              -1.689908182, -1.681156988, -1.666959601, -1.661054098, -1.65948481, -1.451727158,     #TEST
+              -1.449874749, -1.424290895, -1.380203543, -1.312189104],                               #TEST
+             [-1.990879139, -1.987317446, -1.717149867, -1.706823672, -1.702833239, -1.69463881,     #TEST
+              -1.681505, -1.681298706, -1.665893354, -1.660495693, -1.655278127],                    #TEST
+             [-1.986213601]),                                                                        #TEST
+}                                                                                                   #TEST
+spacing = {"closed": 1.5, "opening": 2.5, "open": 4.0}
+
+solvers = {
+    "TRAH":         {"reks_use_trah": True,  "reks_gvb_diis": False},
+    "GVB-DIIS ORB": {"reks_use_trah": False, "reks_gvb_diis": True, "reks_diis_formulation": "orbital"},
+    "GVB-DIIS CFM": {"reks_use_trah": False, "reks_gvb_diis": True, "reks_diis_formulation": "cfm"},
+}
+
+
+def seed(regime):
+    with open(f"h4_{regime}.json") as f:
+        data = json.load(f)
+    for group in ("matrix", "vector", "matrixarr"):
+        data[group] = {k: (None if v is None else np.array(v)) for k, v in data[group].items()}
+    np.save(f"h4_{regime}.npy", data, allow_pickle=True)
+    return f"h4_{regime}.npy"
+
+
+def h4_chain(z):
+    return geometry("0 1\n" + "\n".join(f"H 0.0 0.0 {zi}" for zi in z) + "\nsymmetry c1\nno_com\nno_reorient\n")
+
+
+def reks(solver, regime, extra=None):
+    core.clean_options()
+    set_num_threads(1)
+    set_options({"basis": "6-31g", "reference": "reks", "reks": [4, 4], "reks_m_fon": 1.99999999,
+                 "scf_type": "pk", "dft_grid_name": "sg1", "e_convergence": 10, "d_convergence": 8,
+                 "guess": "read", "si_reks_2spin": [0, 2, 4],
+                 "si_reks_configs": [[["full"]], [["full"]], [["full"]]], **solvers[solver], **(extra or {})})
+    return energy("bhhlyp", restart_file=seed(regime), return_wfn=True)
+
+
+runs = {"closed": ("GVB-DIIS ORB", "GVB-DIIS CFM"),
+        "opening": ("TRAH", "GVB-DIIS ORB", "GVB-DIIS CFM"),
+        "open": ("GVB-DIIS ORB", "GVB-DIIS CFM")}
+for regime, regime_solvers in runs.items():
+    e_ref, fon_ref, ssr0, ssr2, ssr4 = ref[regime]
+    a = spacing[regime]
+    h4_chain([-1.5 * a, -0.5 * a, 0.5 * a, 1.5 * a])
+    for solver in regime_solvers:
+        level = 5 if (regime, solver) == ("opening", "TRAH") else 2
+        e_sa, wfn = reks(solver, regime, {"reks_report_level": level})
+        if (regime, solver) == ("opening", "GVB-DIIS ORB"):
+            si_wfn = wfn
+        tag = f"{regime} {solver}"
+        compare_values(e_ref, e_sa, 8, f"{tag}: E_SA")  #TEST
+        compare_values(fon_ref, wfn.array_variable("REKS FON").np.ravel(), 6, f"{tag}: bonding FONs")  #TEST
+        compare_values(ssr0, variable("SSR ENERGIES").np.ravel(), 5, f"{tag}: SSR energies 2S=0")  #TEST
+        compare_values(ssr2, variable("REKS SECTOR 1 SSR ENERGIES K=1").np.ravel(), 5,  #TEST
+                       f"{tag}: SSR energies 2S=2")  #TEST
+        compare_values(ssr4, variable("REKS SECTOR 2 SSR ENERGIES K=2").np.ravel(), 5,  #TEST
+                       f"{tag}: SSR energies 2S=4")  #TEST
+        niter = int(variable("SCF ITERATIONS"))
+        compare_values(True, niter <= 80, f"{tag}: iterations")  #TEST
+        clean()
+        clean_variables()
+
+H, S = si_wfn.SI_hamiltonian().np, si_wfn.SI_overlap().np
+E = si_wfn.SI_energies().np.ravel()
+X = si_wfn.SI_coefficients().np[:len(E)].T
+compare_integers(16, len(E), "SI 2S=0: states")  #TEST
+compare_values(np.eye(len(E)), X.T @ S @ X, 10, "SI 2S=0: X^T S X = 1")  #TEST
+compare_values(np.diag(E), X.T @ H @ X, 10, "SI 2S=0: X^T H X = E")  #TEST
+compare_values([si_wfn.get_config_energy(k) for k in range(H.shape[0])], np.diag(H), 10,  #TEST
+               "SI 2S=0: diag(H)")  #TEST
+
+mol = h4_chain([0.0, 1.5, 3.1, 4.5])
+e_sa, wfn = reks("GVB-DIIS ORB", "closed", {"reks_report_level": 3})
+mu_ssr = variable("SSR PERMANENT DIPOLES").np
+mu_nuc = np.array([mol.nuclear_dipole()[i] for i in range(3)])
+dipole_ints = [m.np for m in core.MintsHelper(wfn.basisset()).ao_dipole()]
+occupations = variable("SSR NATURAL OCCUPATIONS").np
+for k in range(mu_ssr.shape[0]):
+    no = variable(f"SSR NATURAL ORBITALS AO STATE={k}").np
+    density = (no * occupations[k]) @ no.T
+    mu_k = mu_nuc + np.array([np.vdot(density, d) for d in dipole_ints])
+    compare_values(4.0, occupations[k].sum(), 10, f"uneven chain: state {k} occupations")  #TEST
+    compare_values(mu_k, mu_ssr[k], 8, f"uneven chain: state {k} dipole")  #TEST
+compare_values(True, np.abs(mu_ssr[:, 2]).max() > 1.0e-2, "uneven chain: nonzero dipoles")  #TEST
+compare_values([-0.0390832260, -0.0212431209, -0.4946132525], variable("SSR PERMANENT DIPOLES").np[:3, 2], 5,  #TEST
+               "uneven chain: mu_z of states 0-2 [D]")  #TEST

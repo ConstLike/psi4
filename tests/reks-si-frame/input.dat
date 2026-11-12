@@ -1,0 +1,94 @@
+#! REKS(8,8): the TRAH gate is the orbital gradient of the accepted Fock, and every microstate
+#! energy E_L (SA-pool and SI-only) equals the UKS energy of that determinant at the
+#! Fock-snapshot orbitals.
+
+import os
+import tempfile
+
+import numpy as np
+
+molecule h8 {
+  0 1
+  H  0.0  0.0  0.0
+  H  0.0  0.0  1.6
+  H  0.0  0.0  3.2
+  H  0.0  0.0  4.8
+  H  0.0  0.0  6.4
+  H  0.0  0.0  8.0
+  H  0.0  0.0  9.6
+  H  0.0  0.0  11.2
+  symmetry c1
+  no_com
+  no_reorient
+}
+
+set basis 6-31g(d)
+set scf_type df
+set df_scf_guess false
+set dft_radial_points 15
+set dft_spherical_points 50
+set reference reks
+set reks [8, 8]
+set sa_reks_configs [PPS1, OSS1, OSS2, OSS3, OSS4]
+set sa_reks_extra [[1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0]]
+set reks_use_trah true
+set reks_gvb_diis false
+set scf_initial_accelerator NONE
+set diis false
+set soscf false
+set damping_percentage 0.0
+set level_shift 0.6
+set level_shift_cutoff 0.0
+set level_shift_adapt true
+set guess sad
+set e_convergence 7
+set d_convergence 5
+set maxiter 300
+set fail_on_maxiter false
+psi4.set_options({'si_reks_configs': [['PPS1', 'OSS1', 'OSS2', 'OSS3', 'OSS4', 'PPS2', 'PPS3']]})
+
+e_sa, wfn = energy('bhhlyp', return_wfn=True)
+
+# TRAH gate: rms == ||g_orb||_F / nmo, below D_CONVERGENCE at exit.
+gate_rms = wfn.scalar_variable("REKS GATE RMS")
+compare_values(wfn.scalar_variable("REKS GORB FRO") / wfn.nmo(), gate_rms, 12, "gate units: rms == ||g_orb||_F / nmo")  #TEST
+compare_values(1, int(gate_rms < 1.0e-5), "TRAH gate: orbital gradient below D_CONVERGENCE at exit")  #TEST
+
+# Fock-snapshot orbitals (REKS C PATH B); the live Ca() is one solver step ahead.
+C_snap = wfn.array_variable("REKS C PATH B").to_array()
+nmo = C_snap.shape[1]
+
+labels = {wfn.get_microstate_label(L): L for L in range(wfn.n_microstates())}
+
+
+def det_energy(label):
+    """UKS iteration-0 energy of the determinant, GUESS READ from the permuted snapshot."""
+    toks = label.strip("|").split(",")
+    alpha = [ord(t) - ord("a") for t in toks if not t.endswith("_")]
+    beta = [ord(t[0]) - ord("a") for t in toks if t.endswith("_")]
+    order_a = alpha + [i for i in range(nmo) if i not in alpha]
+    order_b = beta + [i for i in range(nmo) if i not in beta]
+    d = wfn.to_file()
+    d["matrix"]["Ca"] = C_snap[:, order_a]
+    d["matrix"]["Cb"] = C_snap[:, order_b]
+    d["int"]["nalpha"], d["int"]["nbeta"] = len(alpha), len(beta)
+    d["dimension"]["nalphapi"], d["dimension"]["nbetapi"] = (len(alpha),), (len(beta),)
+    d["dimension"]["doccpi"] = (len(beta),)
+    d["dimension"]["soccpi"] = (len(alpha) - len(beta),)
+    d["boolean"]["same_a_b_orbs"] = False
+    d["boolean"]["same_a_b_dens"] = False
+    d["string"]["name"] = "UKS"
+    tmp = os.path.join(tempfile.gettempdir(), f"reks_si_frame_{os.getpid()}.npy")
+    np.save(tmp, d, allow_pickle=True)
+    h8.set_multiplicity(len(alpha) - len(beta) + 1)
+    psi4.set_options({"reference": "uks", "guess": "read", "maxiter": 1})
+    _, uwfn = energy('bhhlyp', restart_file=tmp, return_wfn=True)
+    os.remove(tmp)
+    return np.asarray(uwfn.variable("SCF TOTAL ENERGIES")).ravel()[0]
+
+
+# SA-pool microstates (built during the SCF) and SI-only ones (built after it).
+for label in ["|a,b,c,d,a_,b_,c_,d_|", "|a,b,c,d,a_,b_,c_,e_|",
+              "|a,b,c,d,e,a_,b_,d_|", "|a,b,c,e,f,a_,b_,c_|"]:
+    e_reks = wfn.get_microstate_energy(labels[label])
+    compare_values(det_energy(label), e_reks, 8, f"E_L {label} == UKS determinant energy")  #TEST

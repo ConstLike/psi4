@@ -1,0 +1,73 @@
+#! REKS(2,2)/cc-pVDZ stretched H2, HF and BHHLYP with every SCF_TYPE; COSX with TRAH and GVB-DIIS.
+
+import json
+import numpy as np
+
+ref = {                                                                                          #TEST
+    ("hf", "exact"): (-0.8203837291453, [-0.9894817555, -0.6512857028, -0.6239832516]),            #TEST
+    ("hf", "df"): (-0.8203857542487, [-0.9895027508, -0.6512687577, -0.6240259669]),               #TEST
+    ("hf", "cd"): (-0.8203836986436, [-0.9894823922, -0.6512850051, -0.6239841437]),               #TEST
+    ("hf", "dfdirj+link"): (-0.8204140051416, [-0.9895089992, -0.6513190111, -0.6240834638]),      #TEST
+    ("hf", "dfdirj+cosx"): (-0.8204129180672, [-0.9895071177, -0.6513187185, -0.6240829586]),      #TEST
+    ("bhhlyp", "exact"): (-0.8858118862115, [-0.9997600919, -0.7718636805, -0.7432910095]),        #TEST
+    ("bhhlyp", "df"): (-0.8858231699795, [-0.9997801618, -0.7718661782, -0.7433438658]),           #TEST
+    ("bhhlyp", "cd"): (-0.8858122066415, [-0.9997611254, -0.7718632878, -0.7432924177]),           #TEST
+    ("bhhlyp", "dfdirj+link"): (-0.8858336615933, [-0.9997840989, -0.7718832243, -0.7433641456]),  #TEST
+    ("bhhlyp", "dfdirj+cosx"): (-0.8858331403940, [-0.9997831226, -0.7718831582, -0.7433639050]),  #TEST
+}                                                                                                  #TEST
+
+scf_types = {
+    "PK": ("exact", {"scf_type": "pk"}),
+    "DIRECT": ("exact", {"scf_type": "direct", "df_scf_guess": False}),
+    "OUT_OF_CORE": ("exact", {"scf_type": "out_of_core"}),
+    "DIRECT INCFOCK": ("exact", {"scf_type": "direct", "df_scf_guess": False, "incfock": True}),
+    "DF": ("df", {"scf_type": "df"}),
+    "MEM_DF": ("df", {"scf_type": "mem_df"}),
+    "DISK_DF": ("df", {"scf_type": "disk_df"}),
+    "CD": ("cd", {"scf_type": "cd"}),
+    "DFDIRJ+LINK": ("dfdirj+link", {"scf_type": "dfdirj+link"}),
+    "DFDIRJ+COSX": ("dfdirj+cosx", {"scf_type": "dfdirj+cosx"}),
+}
+gvb_orb = {"reks_use_trah": False, "reks_gvb_diis": True, "reks_diis_formulation": "orbital"}
+
+molecule h2 {
+0 1
+H 0.0 0.0 0.0
+H 0.0 0.0 2.2
+symmetry c1
+no_com
+no_reorient
+}
+
+with open("h2_opening.json") as f:
+    data = json.load(f)
+for group in ("matrix", "vector", "matrixarr"):
+    data[group] = {k: (None if v is None else np.array(v)) for k, v in data[group].items()}
+np.save("h2_opening.npy", data, allow_pickle=True)
+
+
+def reks(functional, options):
+    core.clean_options()
+    set_num_threads(1)
+    set_options({"basis": "cc-pvdz", "reference": "reks", "reks": [2, 2], "dft_grid_name": "sg1",
+                 "e_convergence": 10, "d_convergence": 8, "guess": "read", **options})
+    e_sa, wfn = energy(functional, restart_file="h2_opening.npy", return_wfn=True)
+    ssr = wfn.array_variable("SSR ENERGIES").np.ravel()
+    clean()
+    return e_sa, ssr
+
+
+for functional in ("hf", "bhhlyp"):
+    for name, (cls, options) in scf_types.items():
+        e_ref, ssr_ref = ref[(functional, cls)]
+        e_sa, ssr = reks(functional, {**gvb_orb, **options})
+        compare_values(e_ref, e_sa, 8, f"{functional} {name} E_SA")  #TEST
+        compare_values(ssr_ref, ssr, 6, f"{functional} {name} SSR")  #TEST
+
+e_ref, ssr_ref = ref[("bhhlyp", "dfdirj+cosx")]
+for solver, options in (("TRAH", {"reks_use_trah": True, "reks_gvb_diis": False, "cosx_maxiter_final": -1}),
+                        ("GVB-DIIS CFM", {"reks_use_trah": False, "reks_gvb_diis": True,
+                                          "reks_diis_formulation": "cfm"})):
+    e_sa, ssr = reks("bhhlyp", {"scf_type": "dfdirj+cosx", **options})
+    compare_values(e_ref, e_sa, 8, f"COSX {solver} E_SA")  #TEST
+    compare_values(ssr_ref, ssr, 6, f"COSX {solver} SSR")  #TEST

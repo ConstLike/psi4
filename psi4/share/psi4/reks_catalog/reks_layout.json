@@ -1,0 +1,370 @@
+{
+  "_doc": "Layout of a REKS Studio catalog blob (reks{N}{M}.bin): one file per active space, every spin sector inside. The preamble carries the format version and the hash of this layout without its `_` entries; a loader refuses a blob whose hash differs. The header is one int64 per field: the counts and the absolute byte offsets of every section. The pools that grow with the configuration pairs are written sector by sector; their ids count from zero inside each sector and SectorEntry carries the sector's origin in each of them. An integer that counts or indexes such a pool is int64; an integer naming a bounded table (orbitals, microstates, configurations, coefficients, FON slots, delta specs) is int32.",
+  "format_version": 11,
+  "enums": {
+    "FonKind": {
+      "kFonLinear": 0,
+      "kFonSqrtGroup": 1,
+      "kFonFinterp": 2
+    },
+    "DeltaKind": {
+      "K2b_Fock": 0,
+      "K2b_ERI": 1,
+      "K2c_ERI": 2
+    }
+  },
+  "_pair_windows_doc": "One varint block per configuration pair, at pair_win_off[p]: its windows in `order`, each as long as the pair's PairShape says; e_pack holds two ints per element. The ids inside are sector-local; a reader adds the sector's origin from SectorEntry.",
+  "_pack_columns_doc": "fock_pack and eri_pack hold one (idxpart id, valpart id) row per distinct Fock or ERI row, the rows that fock_idx and eri_idx name. Each is two delta-coded varint columns, the whole idxpart column then the whole valpart column.",
+  "_columns_doc": "The flat integer arrays of the blob, each element the one little-endian integer its pack spells; the element's width and alignment follow from it. A column that indexes a growing pool (pair_row_ptr, rdm_row_ptr, fon_win, cell_win, term_win, pair_win_off) is int64.",
+  "columns": {
+    "pair_row_ptr": {"pack": "<q"},
+    "pair_key_j": {"pack": "<i"},
+    "pair_shape": {"pack": "<I"},
+    "pair_win_off": {"pack": "<Q"},
+    "rdm_row_ptr": {"pack": "<q"},
+    "cell_win": {"pack": "<q"},
+    "term_win": {"pack": "<q"},
+    "fon_idx": {"pack": "<i"},
+    "fon_win": {"pack": "<q"},
+    "diag_fon_idx": {"pack": "<i"},
+    "fon_slot_idx": {"pack": "<i"},
+    "sa_default": {"pack": "<i"},
+    "si_config_names": {"pack": "<I"},
+    "si_config_defs": {"pack": "<I"},
+    "diag_deps_windows": {"pack": "<i"}
+  },
+  "pack_columns": {
+    "order": [
+      "idxpart_id",
+      "valpart_id"
+    ],
+    "codec": "leb128_zigzag",
+    "plain_coded": [],
+    "delta_coded": [
+      "idxpart_id",
+      "valpart_id"
+    ]
+  },
+  "pair_windows": {
+    "order": [
+      "e_pack",
+      "fock_idx",
+      "lagr_idx",
+      "eri_idx",
+      "s_idx",
+      "fon_prod",
+      "gem[n_generations]",
+      "delta"
+    ],
+    "e_pack_ints_per_element": 2,
+    "codec": "leb128_zigzag",
+    "plain_coded": [
+      "e_pack"
+    ],
+    "delta_coded": [
+      "fock_idx",
+      "lagr_idx",
+      "eri_idx",
+      "s_idx",
+      "fon_prod",
+      "gem",
+      "delta"
+    ]
+  },
+  "_value_rows_doc": "A value row names its FON window (win, sector-local) and its coefficient (coeff, an index into coeff_pool); a Lagrangian row adds its SA-Lagrangian pair w. Window g = base_fon_win + win spans fon_idx[fon_win[g] : fon_win[g + 1]); window 0 of every sector is the empty product.",
+  "header": {
+    "size": 648,
+    "align": 8,
+    "fields": [
+      "n_microstates",
+      "n_configs",
+      "n_geminals",
+      "n_generations",
+      "n_lagrangian_pairs",
+      "n_active_orbitals",
+      "n_electrons",
+      "scheme",
+      "n_orbitals_per_geminal",
+      "string_table_off",
+      "has_si_config_defs",
+      "off_microstates",
+      "off_geminal_templates",
+      "off_lagrangian_pairs",
+      "off_diag_deps",
+      "off_si_config_names",
+      "off_si_config_defs",
+      "n_delta_specs",
+      "off_delta_specs",
+      "n_pairs",
+      "n_pair_rows",
+      "off_pair_row_ptr",
+      "off_pair_key_j",
+      "off_pair_shape",
+      "off_pair_win_off",
+      "n_pair_shapes",
+      "off_pair_shapes",
+      "off_pair_win_data",
+      "pair_win_bytes",
+      "n_fon_pool",
+      "off_fon_pool",
+      "n_fon_idx",
+      "off_fon_idx",
+      "n_fon_win",
+      "off_fon_win",
+      "n_fock_idxpart",
+      "off_fock_idxpart",
+      "n_fock_valpart",
+      "off_fock_valpart",
+      "n_fock_pack_rows",
+      "off_fock_pack",
+      "fock_pack_bytes",
+      "n_eri_idxpart",
+      "off_eri_idxpart",
+      "n_eri_valpart",
+      "off_eri_valpart",
+      "n_eri_pack_rows",
+      "off_eri_pack",
+      "eri_pack_bytes",
+      "n_lagr_pool",
+      "off_lagr_row_pool",
+      "n_e_val_pool",
+      "off_e_val_pool",
+      "n_s_row_pool",
+      "off_s_row_pool",
+      "n_weight_elems",
+      "off_weight_elems",
+      "n_rdm_elems",
+      "n_rdm_rows",
+      "off_rdm_row_ptr",
+      "off_rdm_elems",
+      "n_fon_slot_pool",
+      "off_fon_slot_pool",
+      "n_fon_slot_idx",
+      "off_fon_slot_idx",
+      "n_diag_fon_idx",
+      "off_diag_fon_idx",
+      "n_cell_pq",
+      "off_cell_pq",
+      "n_cell_win",
+      "off_cell_win",
+      "n_cell_pack",
+      "off_cell_pack",
+      "n_coeff_pool",
+      "off_coeff_pool",
+      "n_term_win",
+      "off_term_win",
+      "n_term_pack",
+      "off_term_pack",
+      "n_sectors",
+      "off_sectors"
+    ]
+  },
+  "structs": {
+    "FonFactor": {
+      "pack": "<4i",
+      "size": 16,
+      "align": 4,
+      "fields": [
+        "kind",
+        "slot",
+        "rad_off",
+        "rad_n"
+      ]
+    },
+    "FonSlot": {
+      "pack": "<3i",
+      "size": 12,
+      "align": 4,
+      "fields": [
+        "gen",
+        "g",
+        "use_q"
+      ]
+    },
+    "Coeff": {
+      "pack": "<d",
+      "size": 8,
+      "align": 8,
+      "fields": [
+        "coeff"
+      ]
+    },
+    "CellPq": {
+      "pack": "<2i",
+      "size": 8,
+      "align": 4,
+      "fields": [
+        "p",
+        "q"
+      ]
+    },
+    "ValRow": {
+      "pack": "<qi",
+      "size": 12,
+      "align": 4,
+      "fields": [
+        "win",
+        "coeff"
+      ]
+    },
+    "LagrTerm": {
+      "pack": "<qii",
+      "size": 16,
+      "align": 8,
+      "fields": [
+        "win",
+        "coeff",
+        "w"
+      ]
+    },
+    "CellSel": {
+      "pack": "<qi",
+      "size": 12,
+      "align": 4,
+      "fields": [
+        "win",
+        "pq"
+      ]
+    },
+    "TermSel": {
+      "pack": "<qi",
+      "size": 12,
+      "align": 4,
+      "fields": [
+        "win",
+        "coeff"
+      ]
+    },
+    "GeminalTemplate": {
+      "pack": "<3i",
+      "size": 12,
+      "align": 4,
+      "fields": [
+        "scheme",
+        "orb0",
+        "orb1"
+      ]
+    },
+    "LagrangianPair": {
+      "pack": "<2i",
+      "size": 8,
+      "align": 4,
+      "fields": [
+        "orb_from",
+        "orb_to"
+      ]
+    },
+    "FockIdxPart": {
+      "pack": "<3i",
+      "size": 12,
+      "align": 4,
+      "fields": [
+        "L",
+        "p",
+        "q"
+      ]
+    },
+    "EriIdxPart": {
+      "pack": "<4i",
+      "size": 16,
+      "align": 4,
+      "fields": [
+        "p",
+        "q",
+        "r",
+        "s"
+      ]
+    },
+    "WeightRow": {
+      "pack": "<qi",
+      "size": 12,
+      "align": 4,
+      "fields": [
+        "cell_off",
+        "cell_n"
+      ]
+    },
+    "RdmRow": {
+      "pack": "<qii",
+      "size": 16,
+      "align": 8,
+      "fields": [
+        "cell_off",
+        "key_j",
+        "cell_n"
+      ]
+    },
+    "Microstate": {
+      "pack": "<{n_active_orbitals}b{n_active_orbitals}b",
+      "size": "2*n_active_orbitals",
+      "align": 1,
+      "fields": [
+        "alpha[n_active_orbitals]",
+        "beta[n_active_orbitals]"
+      ]
+    },
+    "DiagDeps": {
+      "pack": "<{2 + 2*n_generations}Q",
+      "size": "16 + 16*n_generations",
+      "align": 8,
+      "fields": [
+        "mw_off",
+        "mw_n",
+        "(gem_off,gem_n)[n_generations]"
+      ]
+    },
+    "PairShape": {
+      "pack": "<{8 + n_generations}i",
+      "size": "32 + 4*n_generations",
+      "align": 4,
+      "fields": [
+        "has_scaling",
+        "n_e",
+        "n_fock",
+        "n_lagr",
+        "n_eri",
+        "n_s",
+        "n_fon_prod",
+        "gem_n[n_generations]",
+        "n_delta"
+      ]
+    },
+    "DeltaSpec": {
+      "pack": "<10i",
+      "size": 40,
+      "align": 4,
+      "fields": [
+        "kind",
+        "fock_orbs[2]",
+        "L1",
+        "L2",
+        "sign",
+        "eri_idx[4]"
+      ]
+    },
+    "SectorEntry": {
+      "pack": "<5i4x12Q",
+      "size": 120,
+      "align": 8,
+      "fields": [
+        "spin2",
+        "config_start",
+        "config_count",
+        "n_generations",
+        "n_sa_default",
+        "off_sa_default",
+        "base_e_val",
+        "base_fock_idxpart",
+        "base_fock_valpart",
+        "base_fock_pack",
+        "base_eri_idxpart",
+        "base_eri_valpart",
+        "base_eri_pack",
+        "base_lagr_row",
+        "base_s_row",
+        "base_fon_idx",
+        "base_fon_win"
+      ]
+    }
+  }
+}

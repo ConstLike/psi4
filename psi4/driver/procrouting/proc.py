@@ -61,6 +61,7 @@ from ..qcdb.basislist import corresponding_basis
 from . import dft, empirical_dispersion, mcscf, proc_util, response, solvent
 from .proc_data import method_algorithm_type
 from .roa import run_roa
+from .scf_proc import reks_proc
 
 # never import driver, wrappers, or aliases into this file
 
@@ -80,7 +81,7 @@ def select_scf_gradient(name, **kwargs):
     type_var, _, mtd_type = method_algorithm_type("scf")  # `"scf"` instead of `name` avoids adding every functional to governing dict in proc_data.py
     module = core.get_global_option('QC_MODULE')
 
-    if mtd_type == 'CD':
+    if mtd_type == 'CD' or reference == 'REKS':
         # manifestation of `"""No analytic derivatives for SCF_TYPE CD."""`.
         #   here, only hits upon `gradient("scf")` so above message also present in driver.py to catch e.g., mp2 gradient atop a cd reference.
         func = None
@@ -1430,7 +1431,9 @@ def scf_wavefunction_factory(name, ref_wfn, reference, **kwargs):
 
     """
     # Figure out functional and dispersion
-    superfunc, _disp_functor = build_functional_and_disp(name, restricted=(reference in ["RKS", "RHF"]), **kwargs)
+    superfunc, _disp_functor = build_functional_and_disp(name,
+                                                         restricted=(reference in ["RKS", "RHF", "REKS"]),
+                                                         **kwargs)
 
     # Build the wavefunction
     core.prepare_options_for_module("SCF")
@@ -1442,6 +1445,8 @@ def scf_wavefunction_factory(name, ref_wfn, reference, **kwargs):
         wfn = core.UHF(ref_wfn, superfunc)
     elif reference == "CUHF":
         wfn = core.CUHF(ref_wfn, superfunc)
+    elif reference == "REKS":
+        wfn = reks_proc.build_wavefunction(ref_wfn, superfunc)
     else:
         raise ValidationError("SCF: Unknown reference (%s) when building the Wavefunction." % reference)
 
@@ -1735,6 +1740,11 @@ def scf_helper(name, post_scf=True, **kwargs):
         ['SCF', 'GUESS'],
         ['SCF', 'DF_INTS_IO'],
         ['SCF', 'ORBITALS_WRITE'],
+        ['SCF', 'DIIS'],
+        ['SCF', 'SOSCF'],
+        ['SCF', 'SCF_INITIAL_ACCELERATOR'],
+        ['SCF', 'LEVEL_SHIFT'],
+        ['SCF', 'LEVEL_SHIFT_CUTOFF'],
         ['SCF_TYPE'],  # Hack: scope gets changed internally with the Andy trick
     )
 
@@ -1747,6 +1757,9 @@ def scf_helper(name, post_scf=True, **kwargs):
 
     # Make sure we grab the correctly scoped integral threshold for SCF
     core.set_global_option('INTS_TOLERANCE', core.get_option('SCF', 'INTS_TOLERANCE'))
+
+    if core.get_option('SCF', 'REFERENCE') == "REKS":
+        reks_proc.force_scf_options(post_scf)
 
     # Grab a few kwargs
     use_c1 = kwargs.get('use_c1', False)
@@ -1941,6 +1954,7 @@ def scf_helper(name, post_scf=True, **kwargs):
     # The wfn from_file routine adds the npy suffix if needed, but we add it here so that
     # we can use os.path.isfile to query whether the file exists before attempting to read
     read_filename = scf_wfn.get_scratch_filename(180) + '.npy'
+    reks_proc.validate_active_window(scf_wfn)
     if ((core.get_option('SCF', 'GUESS') == 'READ') and os.path.isfile(read_filename)):
         old_wfn = core.Wavefunction.from_file(read_filename)
 
@@ -1950,7 +1964,9 @@ def scf_helper(name, post_scf=True, **kwargs):
         if old_wfn.molecule().schoenflies_symbol() != scf_molecule.schoenflies_symbol():
             raise ValidationError("Cannot compute projection of different symmetries.")
 
-        if old_wfn.basisset().name() == scf_wfn.basisset().name():
+        if isinstance(scf_wfn, core.REKS):
+            reks_proc.read_guess(scf_wfn, old_wfn, read_filename, scf_molecule)
+        elif old_wfn.basisset().name() == scf_wfn.basisset().name():
             core.print_out(f"  Reading orbitals from file {read_filename}, no projection.\n\n")
             scf_wfn.guess_Ca(Ca_occ)
             scf_wfn.guess_Cb(Cb_occ)
@@ -1970,6 +1986,8 @@ def scf_helper(name, post_scf=True, **kwargs):
             scf_wfn.reset_occ_ = True
 
     elif (core.get_option('SCF', 'GUESS') == 'READ') and not os.path.isfile(read_filename):
+        if isinstance(scf_wfn, core.REKS):
+            raise reks_proc.missing_restart_error(name, read_filename)
         core.print_out(f"\n !!!  Unable to find file {read_filename}, defaulting to SAD guess. !!!\n\n")
         core.set_local_option('SCF', 'GUESS', 'SAD')
         sad_basis_list = core.BasisSet.build(scf_wfn.molecule(), "ORBITAL",
@@ -2050,13 +2068,14 @@ def scf_helper(name, post_scf=True, **kwargs):
         for pv in ["SCF TOTAL ENERGY", "CURRENT ENERGY", "CURRENT REFERENCE ENERGY"]:
             obj.set_variable(pv, e_scf)
 
-    # We always would like to print a little property information
-    if kwargs.get('scf_do_properties', True):
+    # We always would like to print a little property information (REKS: only requested ones)
+    props = [x.upper() for x in core.get_option("SCF", "SCF_PROPERTIES")]
+    is_reks = core.get_option("SCF", "REFERENCE") == "REKS"
+    if kwargs.get('scf_do_properties', True) and (props or not is_reks):
         oeprop = core.OEProp(scf_wfn)
         oeprop.set_title("SCF")
 
         # Figure our properties, if empty do dipole
-        props = [x.upper() for x in core.get_option("SCF", "SCF_PROPERTIES")]
         if "DIPOLE" not in props:
             props.append("DIPOLE")
 
@@ -2085,14 +2104,7 @@ def scf_helper(name, post_scf=True, **kwargs):
     if core.get_option("SCF", "MOLDEN_WRITE"):
         filename = core.get_writer_file_prefix(scf_molecule.name()) + ".molden"
         dovirt = bool(core.get_option("SCF", "MOLDEN_WITH_VIRTUAL"))
-
-        occa = scf_wfn.occupation_a()
-        occb = scf_wfn.occupation_a()
-
-        mw = core.MoldenWriter(scf_wfn)
-        mw.write(filename, scf_wfn.Ca(), scf_wfn.Cb(), scf_wfn.epsilon_a(),
-                 scf_wfn.epsilon_b(), scf_wfn.occupation_a(),
-                 scf_wfn.occupation_b(), dovirt)
+        scf_wfn.write_molden(filename, dovirt, False)
 
     # Write checkpoint file (orbitals and basis); Can be disabled, e.g., for findif displacements
     if write_checkpoint_file and isinstance(_chkfile, str):
@@ -2896,7 +2908,7 @@ def run_scf_hessian(name, **kwargs):
     if ref_wfn is None:
         ref_wfn = run_scf(name, **kwargs)
 
-    badref = core.get_option('SCF', 'REFERENCE') in ['ROHF', 'CUHF']
+    badref = core.get_option('SCF', 'REFERENCE') in ['ROHF', 'CUHF', 'REKS']
     badint = core.get_global_option('SCF_TYPE') in [ 'CD', 'OUT_OF_CORE']
     if badref or badint:
         raise ValidationError("Only RHF/UHF/RKS/UKS Hessians are currently implemented. SCF_TYPE either CD or OUT_OF_CORE not supported")

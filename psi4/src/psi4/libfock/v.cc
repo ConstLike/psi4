@@ -738,11 +738,11 @@ void VBase::build_collocation_cache(size_t memory) {
     // Figure out many blocks to skip
 
     size_t collocation_size = grid_->collocation_size();
-    if (functional_->ansatz() == 1) {
-        collocation_size *= 4;  // For gradients
-    }
-    if (functional_->ansatz() == 2) {
-        collocation_size *= 10;  // For gradients and Hessians
+    cache_map_deriv_ = point_workers_[0]->deriv();
+    if (cache_map_deriv_ >= 2) {
+        collocation_size *= 10;  // values, gradients and Hessians
+    } else if (cache_map_deriv_ >= 1) {
+        collocation_size *= 4;  // values and gradients
     }
 
     // Figure out stride as closest whole number to amount we need
@@ -759,7 +759,7 @@ void VBase::build_collocation_cache(size_t memory) {
         return;
     }
 
-    cache_map_deriv_ = point_workers_[0]->deriv();
+    timer_on("V: Collocation cache");
     auto saved_size_rank = std::vector<size_t>(num_threads_, 0);
     auto ncomputed_rank = std::vector<size_t>(num_threads_, 0);
 
@@ -810,6 +810,7 @@ void VBase::build_collocation_cache(size_t memory) {
     if (print_) {
         outfile->Printf("  Cached %.1lf%% of DFT collocation blocks in %.3lf [GiB].\n\n", fraction, gib_saved);
     }
+    timer_off("V: Collocation cache");
 }
 void VBase::prepare_vv10_cache(DFTGrid& nlgrid, SharedMatrix D,
                                std::vector<std::map<std::string, SharedVector>>& vv10_cache,
@@ -825,6 +826,7 @@ void VBase::prepare_vv10_cache(DFTGrid& nlgrid, SharedMatrix D,
         // Need a points worker per thread, only need RKS-like terms
         auto point_tmp = std::make_shared<RKSFunctions>(primary_, max_points, max_functions);
         point_tmp->set_ansatz(ansatz);
+        if (ansatz >= 2) point_tmp->set_deriv(2);
         point_tmp->set_pointers(D);
         nl_point_workers.push_back(point_tmp);
     }

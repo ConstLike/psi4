@@ -1,0 +1,98 @@
+#! REKS(4,4)/6-31G BHHLYP linear H4 from SAD, Huckel, REKS, RKS and UHF guesses (new basis, geometry, active window); REKS(2,2) H2 in a linearly dependent basis.
+
+import json
+import numpy as np
+
+e_ref = {                                                           #TEST
+    ("6-31g", 1.5): -1.8941172271909,                               #TEST
+    ("cc-pvdz", 1.5): -1.9045083000951,                             #TEST
+    ("6-31g", 1.6): -1.8821582579513,                               #TEST
+    ("cc-pvdz", 1.6): -1.8914598225712,                             #TEST
+}                                                                   #TEST
+e_lindep_ref = -0.9246013613121                                     #TEST
+
+
+def h4_chain(a, mult=1):
+    return geometry(f"0 {mult}\n" + "\n".join(f"H 0.0 0.0 {z}" for z in (-1.5 * a, -0.5 * a, 0.5 * a, 1.5 * a))
+                    + "\nsymmetry c1\nno_com\nno_reorient\n")
+
+
+def reks44(basis, guess, restart=None, extra=None):
+    core.clean_options()
+    set_num_threads(1)
+    set_options({"basis": basis, "reference": "reks", "reks": [4, 4], "reks_m_fon": 1.99999999,
+                 "scf_type": "pk", "dft_grid_name": "sg1", "e_convergence": 10, "d_convergence": 8,
+                 "guess": guess, "reks_use_trah": False, "reks_gvb_diis": True, **(extra or {})})
+    kwargs = {"restart_file": restart} if restart else {}
+    e_sa, wfn = energy("bhhlyp", return_wfn=True, **kwargs)
+    clean()
+    return e_sa, wfn
+
+
+with open("h4_closed.json") as f:
+    data = json.load(f)
+for group in ("matrix", "vector", "matrixarr"):
+    data[group] = {k: (None if v is None else np.array(v)) for k, v in data[group].items()}
+np.save("h4_closed.npy", data, allow_pickle=True)
+
+h4_chain(1.5)
+e_sa, wfn = reks44("6-31g", "read", "h4_closed.npy")
+compare_values(e_ref[("6-31g", 1.5)], e_sa, 8, "READ seed E_SA")  #TEST
+wfn.to_file("h4_converged")
+e_sa, wfn = reks44("6-31g", "read", "h4_converged.npy")
+compare_values(e_ref[("6-31g", 1.5)], e_sa, 8, "READ REKS E_SA")  #TEST
+compare_values(True, int(variable("SCF ITERATIONS")) <= 2, "READ REKS iterations")  #TEST
+for guess in ("sad", "huckel"):
+    e_sa, wfn = reks44("6-31g", guess)
+    compare_values(e_ref[("6-31g", 1.5)], e_sa, 8, f"{guess.upper()} E_SA")  #TEST
+
+for basis, a, path in (("cc-pvdz", 1.5, "basis"), ("6-31g", 1.6, "geometry"), ("cc-pvdz", 1.6, "basis and geometry")):
+    h4_chain(a)
+    e_read, _ = reks44(basis, "read", "h4_closed.npy")
+    compare_values(e_ref[(basis, a)], e_read, 8, f"READ new {path} E_SA")  #TEST
+
+h4_chain(1.5)
+core.clean_options()
+set_options({"basis": "6-31g", "scf_type": "pk", "dft_grid_name": "sg1", "reference": "rks"})
+_, rks = energy("bhhlyp", return_wfn=True)
+rks.to_file("h4_rks")
+clean()
+e_sa, _ = reks44("6-31g", "read", "h4_rks.npy")
+compare_values(e_ref[("6-31g", 1.5)], e_sa, 8, "READ RKS E_SA")  #TEST
+e_sa, _ = reks44("6-31g", "read", "h4_rks.npy", {"guess_active_window": ["HOMO-1", "HOMO", "LUMO", "LUMO+1"]})
+compare_values(e_ref[("6-31g", 1.5)], e_sa, 8, "READ RKS window E_SA")  #TEST
+e_sa, _ = reks44("6-31g", "read", "h4_rks.npy", {"guess_active_window": ["HOMO-1", "HOMO", "LUMO", "LUMO+2"]})
+compare_values(True, e_sa > e_ref[("6-31g", 1.5)] + 0.1, "READ RKS window LUMO+2 E_SA")  #TEST
+e_sa, _ = reks44("cc-pvdz", "read", "h4_rks.npy")
+compare_values(e_ref[("cc-pvdz", 1.5)], e_sa, 8, "READ RKS new basis E_SA")  #TEST
+
+h4_chain(1.5, 3)
+core.clean_options()
+set_options({"basis": "6-31g", "scf_type": "pk", "reference": "uhf"})
+_, uhf = energy("hf", return_wfn=True)
+uhf.to_file("h4_uhf")
+clean()
+data = np.load("h4_uhf.npy", allow_pickle=True).item()
+data["matrix"]["Cb"] = data["matrix"]["Ca"][:, ::-1].copy()
+np.save("h4_uhf_permuted.npy", data, allow_pickle=True)
+h4_chain(1.5)
+e_uhf, _ = reks44("6-31g", "read", "h4_uhf.npy")
+compare_values(e_ref[("6-31g", 1.5)], e_uhf, 8, "READ UHF E_SA")  #TEST
+e_sa, _ = reks44("6-31g", "read", "h4_uhf_permuted.npy")
+compare_values(e_uhf, e_sa, 12, "READ UHF permuted beta E_SA")  #TEST
+
+molecule h2 {
+0 1
+H 0.0 0.0 0.0
+H 0.0 0.0 0.7
+symmetry c1
+no_com
+no_reorient
+}
+core.clean_options()
+set_options({"basis": "aug-cc-pvdz", "reference": "reks", "reks": [2, 2], "scf_type": "pk",
+             "dft_grid_name": "sg1", "e_convergence": 10, "d_convergence": 8, "s_tolerance": 1.0e-3})
+e_sa, wfn = energy("bhhlyp", return_wfn=True)
+compare_integers(17, wfn.nmo(), "lin-dep Nmo")  #TEST
+compare_integers(18, wfn.nso(), "lin-dep Nso")  #TEST
+compare_values(e_lindep_ref, e_sa, 8, "lin-dep E_SA")  #TEST

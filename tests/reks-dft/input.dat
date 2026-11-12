@@ -1,0 +1,67 @@
+#! REKS(2,2)/cc-pVDZ stretched H2 with LDA, GGA, meta-GGA and range-separated functionals, TRAH and GVB-DIIS, READ and SAD guess; M06-L HeH+ with all orbitals active.
+
+import json
+import numpy as np
+
+ref = {                                                                                           #TEST
+    "svwn": (-0.9310259964449, 1.6248497876, [-1.0099739724, -0.8520780205, -0.8208148853]),        #TEST
+    "pbe": (-0.9203736716930, 1.5579562190, [-1.0089933659, -0.8317539775, -0.8048552021]),         #TEST
+    "blyp": (-0.9266154876503, 1.6039147374, [-1.0045590961, -0.8486718792, -0.8189489046]),        #TEST
+    "m06-l": (-0.9122389610939, 1.5108174894, [-1.0144873876, -0.8099905346, -0.7901097683]),       #TEST
+    "wb97x": (-0.8872451763810, 1.4874519041, [-1.0109294242, -0.7635609285, -0.7409672407]),       #TEST
+    "wpbe": (-0.8867439347742, 1.4730725210, [-1.0166271084, -0.7568607612, -0.7307225356]),        #TEST
+}                                                                                                   #TEST
+
+solvers = {
+    "TRAH":         {"reks_use_trah": True,  "reks_gvb_diis": False},
+    "GVB-DIIS ORB": {"reks_use_trah": False, "reks_gvb_diis": True, "reks_diis_formulation": "orbital"},
+    "GVB-DIIS CFM": {"reks_use_trah": False, "reks_gvb_diis": True, "reks_diis_formulation": "cfm"},
+}
+runs = [(functional, "GVB-DIIS ORB", "read") for functional in ref] + \
+       [("pbe", "TRAH", "read"), ("pbe", "GVB-DIIS CFM", "read"), ("m06-l", "TRAH", "read"),
+        ("wb97x", "TRAH", "read"), ("wb97x", "GVB-DIIS ORB", "sad"), ("wpbe", "GVB-DIIS ORB", "sad")]
+
+molecule h2 {
+0 1
+H 0.0 0.0 0.0
+H 0.0 0.0 2.2
+symmetry c1
+no_com
+no_reorient
+}
+
+with open("h2_opening.json") as f:
+    data = json.load(f)
+for group in ("matrix", "vector", "matrixarr"):
+    data[group] = {k: (None if v is None else np.array(v)) for k, v in data[group].items()}
+np.save("h2_opening.npy", data, allow_pickle=True)
+
+for functional, solver, guess in runs:
+    core.clean_options()
+    set_num_threads(1)
+    set_options({"basis": "cc-pvdz", "reference": "reks", "reks": [2, 2], "scf_type": "pk",
+                 "dft_grid_name": "sg1", "e_convergence": 10, "d_convergence": 8, "guess": guess,
+                 **solvers[solver]})
+    kwargs = {"restart_file": "h2_opening.npy"} if guess == "read" else {}
+    e_sa, wfn = energy(functional, return_wfn=True, **kwargs)
+    e_ref, fon_ref, ssr_ref = ref[functional]
+    tag = f"{functional} {solver} {guess.upper()}"
+    compare_values(e_ref, e_sa, 8, f"{tag} E_SA")  #TEST
+    compare_values(fon_ref, wfn.array_variable("REKS FON").np[0, 0], 6, f"{tag} n_a")  #TEST
+    compare_values(ssr_ref, wfn.array_variable("SSR ENERGIES").np.ravel(), 6, f"{tag} SSR")  #TEST
+    clean()
+
+heh = {}
+for ghost in ("", "@H 0.0 0.0 60.0\n"):
+    geometry("1 1\nHe 0.0 0.0 0.0\nH 0.0 0.0 1.0\n" + ghost + "symmetry c1\nno_com\nno_reorient\n")
+    core.clean_options()
+    set_num_threads(1)
+    set_options({"basis": "sto-3g", "reference": "reks", "reks": [2, 2], "scf_type": "pk",
+                 "dft_grid_name": "sg1", "e_convergence": 10, "d_convergence": 8, **solvers["TRAH"]})
+    e_sa, wfn = energy("m06-l", return_wfn=True)
+    heh[ghost != ""] = (wfn.nmo(), e_sa, wfn.array_variable("SSR ENERGIES").np.ravel())
+    clean()
+compare_integers(2, heh[False][0], "HeH+ Nmo")  #TEST
+compare_integers(3, heh[True][0], "HeH+ ghost Nmo")  #TEST
+compare_values(heh[False][1], heh[True][1], 10, "HeH+ ghost E_SA")  #TEST
+compare_values(heh[False][2], heh[True][2], 8, "HeH+ ghost SSR")  #TEST

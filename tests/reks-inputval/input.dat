@@ -1,0 +1,321 @@
+#! REKS input validation: malformed options and unsupported features raise with specific messages
+
+import psi4
+
+BASE = {
+    'basis': '6-31g(d)', 'scf_type': 'pk', 'reference': 'reks',
+    'reks_report_level': 2, 'guess': 'sad', 'reks_use_trah': True,
+}
+
+
+def chain(symbol, n, c1=True):
+    lines = [f"{symbol} 0.0 0.0 {i * 1.6:.6f}" for i in range(n)]
+    return "\n".join(lines + (["symmetry c1"] if c1 else []))
+
+
+H2 = chain("H", 2)
+H4 = chain("H", 4)
+HE2 = chain("He", 2)
+H2_D2H = chain("H", 2, c1=False)
+H2_FRAME = H2 + "\nno_com\nno_reorient"
+
+# (label, opts, wanted substrings, molecule, mult)
+CASES = [
+    ("01_threelem_multisa",
+     {'reks': [4, 4, 0], 'sa_reks_configs': [[0, 1, 2], [0, 1]],
+      'sa_reks_weights': [0.2] * 5},
+     ["must have exactly 2 elements [N, M], got 3"], H4, 1),
+    ("02_flat_sa_two_labels",
+     {'reks': [4, 4], 'sa_reks_configs': [0, 1, 2],
+      'sa_reks_2spin': [0, 2], 'sa_reks_weights': [0.2] * 3},
+     ["2 label(s) for 1 typed SA block(s)"], H4, 1),
+    ("03_three_blocks_two_labels",
+     {'reks': [4, 4], 'sa_reks_configs': [[0, 1, 2], [0, 1], [0]],
+      'sa_reks_2spin': [0, 2], 'sa_reks_weights': [0.2] * 6},
+     ["2 label(s) for 3 typed SA block(s)"], H4, 1),
+    ("04_sa_missing_manifold",
+     {'reks': [4, 4], 'sa_reks_configs': [[0, 1, 2], []],
+      'sa_reks_2spin': [0, 10], 'sa_reks_weights': [0.2] * 3},
+     ["has no 2S=10 spin manifold (available 2S: 0, 2, 4)",
+      "SA block 0 -> 2S=0 (explicit)"], H4, 1),
+    ("05_mult_mismatch_h4",
+     {'reks': [4, 4], 'sa_reks_configs': [[0, 1, 2], [0, 1]],
+      'sa_reks_weights': [0.2] * 5},
+     ["REKS supports only REKS(N,N)", "got reks [4, 4], multiplicity 3"], H4, 3),
+    ("06_si_three_groups_two_labels",
+     {'reks': [4, 4], 'sa_reks_configs': [[0, 1, 2], [0, 1]],
+      'sa_reks_weights': [0.2] * 5,
+      'si_reks_configs': [[[0, 1, 2]], [[0, 1]], [[0]]],
+      'si_reks_2spin': [0, 2]},
+     ["2 label(s) for 3 SI group(s)"], H4, 1),
+    ("07_si_index_range",
+     {'reks': [4, 4], 'sa_reks_configs': [[0, 1, 2], [0, 1]],
+      'sa_reks_weights': [0.2] * 5,
+      'si_reks_configs': [[[0, 1, 2]], [[0, 100]]]},
+     ["config index (local) 100 is out of range [0, 11) for SI group 1 (2S=2)"], H4, 1),
+    ("08_si_cross_sector_idx",
+     {'reks': [4, 4], 'sa_reks_configs': [[0, 1, 2], [0, 1]],
+      'sa_reks_weights': [0.2] * 5,
+      'si_reks_configs': [[[0, 1, 2, 18]], [[0, 1]]]},
+     ["config index (local) 18 is out of range [0, 18) for SI group 0 (2S=0)"], H4, 1),
+    ("09a_arity0", {'reks': []},
+     ["must have exactly 2 elements [N, M], got 0"], H4, 1),
+    ("09b_arity1", {'reks': [4]},
+     ["must have exactly 2 elements [N, M], got 1"], H4, 1),
+    ("09c_arity4", {'reks': [4, 4, 0, 0]},
+     ["must have exactly 2 elements [N, M], got 4"], H4, 1),
+    ("10_threelem_hint", {'reks': [4, 4, 2]},
+     ["must have exactly 2 elements [N, M], got 3"], H4, 1),
+    ("11_reks_sectors", {'reks': [4, 4], 'reks_sectors': [0, 2]},
+     ["REKS_SECTORS is not a valid option"], H4, 1),
+    ("12_initial_m_fon", {'reks': [4, 4], 'reks_initial_m_fon': [[0, 1]]},
+     ["REKS_INITIAL_M_FON is not a valid option"], H4, 1),
+    ("13_sa_len_mismatch",
+     {'reks': [4, 4], 'sa_reks_configs': [[0, 1, 2], [0, 1]],
+      'sa_reks_2spin': [0, 2, 4], 'sa_reks_weights': [0.2] * 5},
+     ["3 label(s) for 2 typed SA block(s)"], H4, 1),
+    ("14_si_len_mismatch",
+     {'reks': [4, 4], 'si_reks_configs': [[[0, 1, 2]], [[0, 1]]],
+      'si_reks_2spin': [0, 2, 4]},
+     ["3 label(s) for 2 SI group(s)"], H4, 1),
+    ("15_dup_label",
+     {'reks': [4, 4], 'sa_reks_configs': [[0, 1, 2], [0, 1]],
+      'sa_reks_2spin': [2, 2], 'sa_reks_weights': [0.2] * 5},
+     ["pairwise distinct; 2S=2 is repeated"], H4, 1),
+    ("16_si_missing_manifold",
+     {'reks': [4, 4], 'si_reks_configs': [[[0, 1]]], 'si_reks_2spin': [6]},
+     ["has no 2S=6 spin manifold (available 2S: 0, 2, 4)"], H4, 1),
+    ("17_mixed_depth", {'reks': [4, 4], 'sa_reks_configs': [[0, 1], [[2]]]},
+     ["SA_REKS_CONFIGS: mixed nesting depth: element 0 has depth 1 but element 1 has depth 2"], H4, 1),
+    ("18_sa_ladder_overrun",
+     {'reks': [4, 4], 'sa_reks_configs': [[0], [0], [0], [0]]},
+     ["has 3 spin manifolds, got 4 SA blocks",
+      "Ladder mode maps block i to the i-th available manifold"], H4, 1),
+    ("19_si_ladder_overrun",
+     {'reks': [4, 4], 'si_reks_configs': [[[0]], [[0]], [[0]], [[0]]]},
+     ["has 3 spin manifolds, got 4 SI groups"], H4, 1),
+    ("20a_sa_2spin_no_configs", {'reks': [4, 4], 'sa_reks_2spin': [0, 2]},
+     ["2 labels but SA_REKS_CONFIGS is absent"], H4, 1),
+    ("20b_si_2spin_no_configs", {'reks': [4, 4], 'si_reks_2spin': [0, 2]},
+     ["2 labels but SI_REKS_CONFIGS is absent"], H4, 1),
+    ("21a_sa_empty_plus_2spin",
+     {'reks': [4, 4], 'sa_reks_configs': [], 'sa_reks_2spin': [2]},
+     ["1 label(s) for 0 typed SA block(s)",
+      "OMIT sa_reks_configs and set sa_reks_2spin [x]"], H4, 1),
+    ("21b_si_empty_plus_2spin",
+     {'reks': [4, 4], 'si_reks_configs': [], 'si_reks_2spin': [2]},
+     ["1 label(s) for 0 SI group(s)",
+      "OMIT si_reks_configs and set si_reks_2spin [x]"], H4, 1),
+    ("22_si_depth_2level",
+     {'reks': [4, 4], 'si_reks_configs': [[0, 1], [0]],
+      'si_reks_2spin': [0, 2]},
+     ["got a 2-level list of cassettes"], H4, 1),
+    ("23a_scalar_in_group",
+     {'reks': [4, 4], 'si_reks_configs': [[[0, 1], 2], [[0]]]},
+     ["must be a list of SI cassettes"], H4, 1),
+    ("23b_si_mixed_depth",
+     {'reks': [4, 4], 'si_reks_configs': [[[0, 1]], [0]]},
+     ["SI_REKS_CONFIGS: mixed nesting depth: element 0 has depth 2 but element 1 has depth 1"], H4, 1),
+    ("24a_sa_alias_both",
+     {'reks': [4, 4], 'sa_reks_configs': [[0, 1, 2]],
+      'sa_reks_2spin': [0], 'reks_sa_2spin': [0]},
+     ["Specify only one of 'SA_REKS_2SPIN' and 'REKS_SA_2SPIN'"], H4, 1),
+    ("24b_si_alias_both",
+     {'reks': [4, 4], 'si_reks_configs': [[[0, 1]]],
+      'si_reks_2spin': [0], 'reks_si_2spin': [0]},
+     ["Specify only one of 'SI_REKS_2SPIN' and 'REKS_SI_2SPIN'"], H4, 1),
+    ("25_weights_len",
+     {'reks': [4, 4], 'sa_reks_configs': [0, 1, 2],
+      'sa_reks_weights': [0.5, 0.5]},
+     ["expected 3 weights (SA_REKS_CONFIGS=3 + SA_REKS_EXTRA=0), got 2"], H4, 1),
+    ("26_empty_ensemble", {'reks': [4, 4], 'sa_reks_configs': []},
+     ["The REKS SA ensemble is empty"], H4, 1),
+    ("27a_sa_2spin_empty",
+     {'reks': [4, 4], 'sa_reks_configs': [0, 1, 2], 'sa_reks_2spin': []},
+     ["SA_REKS_2SPIN: set but empty; omit it or list one 2S value per block/group"], H4, 1),
+    ("27b_si_2spin_empty",
+     {'reks': [4, 4], 'si_reks_configs': [[0, 1]], 'si_reks_2spin': []},
+     ["SI_REKS_2SPIN: set but empty"], H4, 1),
+    ("28_mult_mismatch_h2", {'reks': [2, 2]},
+     ["got reks [2, 2], multiplicity 3",
+      "Keep multiplicity 1 and select spin manifolds with SA_REKS_2SPIN"], H2, 3),
+    ("29_report_empty",
+     {'reks': [4, 4], 'si_reks_configs': [[[0, 1]]], 'si_reks_report_states': []},
+     ["SI_REKS_REPORT_STATES: set but empty"], H4, 1),
+    ("30_report_no_cassettes",
+     {'reks': [4, 4], 'si_reks_configs': [], 'si_reks_report_states': [1]},
+     ["SI_REKS_REPORT_STATES: set but the run has no SI cassettes"], H4, 1),
+    ("31_report_len",
+     {'reks': [4, 4], 'si_reks_configs': [[[0, 1]]], 'si_reks_report_states': [1, 1]},
+     ["2 value(s) for 1 SI cassette(s); list exactly one per cassette"], H4, 1),
+    ("32_report_zero",
+     {'reks': [4, 4], 'si_reks_configs': [[[0, 1]]], 'si_reks_report_states': [0]},
+     ["entry 0 is 0; each value must be at least 1"], H4, 1),
+    ("33_report_over_dim",
+     {'reks': [4, 4], 'si_reks_configs': [[[0, 1]]], 'si_reks_report_states': [3]},
+     ["entry 0 is 3 but SI cassette 0 has dimension 2"], H4, 1),
+    ("34_report_alias_both",
+     {'reks': [4, 4], 'si_reks_configs': [[[0, 1]]],
+      'si_reks_report_states': [1], 'reks_si_report_states': [1]},
+     ["Specify only one of 'SI_REKS_REPORT_STATES' and 'REKS_SI_REPORT_STATES'"], H4, 1),
+    ("35_report_level", {'reks': [2, 2], 'reks_report_level': 9},
+     ["REKS_REPORT_LEVEL must be", "got 9"], H2, 1),
+    ("36_interp_delta", {'reks': [2, 2], 'reks_fon_interp_delta': -0.1},
+     ["REKS_FON_INTERP_DELTA must be >= 0"], H2, 1),
+    ("37_gate_streak",
+     {'reks': [2, 2], 'reks_gvb_diis': True, 'reks_gvb_gate_streak': 0, 'reks_report_level': 4},
+     ["REKS_GVB_GATE_STREAK must be >= 1"], H2, 1),
+    ("38_symmetry", {'reks': [2, 2]},
+     ["multiplicity 1, 8 irreps", "add 'symmetry c1'"], H2_D2H, 1),
+    ("39_reks_absent", {},
+     ["REKS active space not specified"], H2, 1),
+    ("40_not_installed", {'reks': [14, 14]},
+     ["REKS active space [N=14, M=14] is not installed", "[2,2]", "PSI4_REKS_CATALOG"], H2, 1),
+    ("40b_n_ne_m", {'reks': [2, 4]},
+     ["REKS supports only REKS(N,N) with N even and N >= 2", "got reks [2, 4]"], H2, 1),
+    ("40c_odd_n", {'reks': [3, 3]},
+     ["REKS supports only REKS(N,N) with N even and N >= 2", "got reks [3, 3]"], H4, 1),
+    ("40d_overlap_cutoff_zero", {'reks': [2, 2], 'si_reks_overlap_cutoff': 0.0},
+     ["SI_REKS_OVERLAP_CUTOFF is 0.000000; it must be positive"], H2, 1),
+    ("41_core_negative", {'reks': [4, 4]},
+     ["active electrons N=4 exceed the molecule's 2 total electrons"], H2, 1),
+    ("42_basis_too_small", {'reks': [2, 2], 'basis': 'sto-3g'},
+     ["core (1) + active orbitals M=2 = 3 exceed the 2 molecular orbitals"], HE2, 1),
+    ("43_sa_depth", {'reks': [4, 4], 'sa_reks_configs': [[[0]]]},
+     ["SA_REKS_CONFIGS: element 0 is nested too deeply (depth 2, maximum 1"], H4, 1),
+    ("44_2spin_negative", {'reks': [4, 4], 'sa_reks_2spin': [-2]},
+     ["SA_REKS_2SPIN: entries are 2S >= 0; got -2"], H4, 1),
+    ("45_sa_index_range", {'reks': [4, 4], 'sa_reks_configs': [0, 100]},
+     ["SA_REKS_CONFIGS: config index (local) 100 is out of range [0, 18) for SA block 0 (2S=0)"], H4, 1),
+    ("46_sa_duplicate", {'reks': [4, 4], 'sa_reks_configs': [0, 1, 0]},
+     ["duplicate config (local) 0 in SA block 0 (2S=0)"], H4, 1),
+    ("47_sa_unknown_token", {'reks': [4, 4], 'sa_reks_configs': ['nosuchconfig']},
+     ["Unknown REKS config token 'nosuchconfig'"], H4, 1),
+    ("48_sa_exclude", {'reks': [4, 4], 'sa_reks_configs': ['full', 'exclude:sps']},
+     ["'exclude:sps' is not allowed in an SA block"], H4, 1),
+    ("49_si_scalar", {'reks': [4, 4], 'si_reks_configs': [0, 1]},
+     ["SI_REKS_CONFIGS: scalar elements are not a cassette form"], H4, 1),
+    ("50_token_scheme_range", {'reks': [4, 4], 'si_reks_configs': [['single-scheme-9']]},
+     ["'single-scheme-9': scheme 9 is outside [0,"], H4, 1),
+    ("51_token_no_match", {'reks': [4, 4], 'si_reks_configs': [['zzz*']]},
+     ["'zzz*' matches no configuration of"], H4, 1),
+    ("52_token_class_none", {'reks': [4, 4], 'si_reks_configs': [['single-scheme-D3']]},
+     ["scheme class 'D3' has no scheme among the"], H4, 1),
+    ("53_token_bad_arg", {'reks': [4, 4], 'si_reks_configs': [['single-scheme-foo']]},
+     ["takes scheme indices (non-negative integers) and scheme classes"], H4, 1),
+    ("54_token_twice", {'reks': [4, 4], 'si_reks_configs': [['mixed-scheme-0-0']]},
+     ["scheme 0 is reached twice"], H4, 1),
+    ("55_extra_len", {'reks': [2, 2], 'sa_reks_extra': [[1, 0, 1]]},
+     ["SA_REKS_EXTRA[0]: expected 4 occupation entries", "got 3"], H2, 1),
+    ("56_extra_value", {'reks': [2, 2], 'sa_reks_extra': [[2, 0, 0, 0]]},
+     ["SA_REKS_EXTRA[0][0] = 2: occupations must be 0 or 1"], H2, 1),
+    ("57_extra_electrons", {'reks': [2, 2], 'sa_reks_extra': [[1, 1, 1, 0]]},
+     ["determinant has 3 electrons but the active space holds N=2"], H2, 1),
+    ("58_weights_negative",
+     {'reks': [4, 4], 'sa_reks_configs': [[0, 1], [0]], 'sa_reks_weights': [0.5, 0.6, -0.1]},
+     ["SA_REKS_WEIGHTS[2] = -0.1", "weights must be non-negative"], H4, 1),
+    ("59_weights_sum",
+     {'reks': [2, 2], 'sa_reks_configs': [0, 1], 'sa_reks_weights': [0.5, 0.4]},
+     ["SA_REKS_WEIGHTS: weights sum to 0.9"], H2, 1),
+    ("60_report_si_labeled_2level",
+     {'reks': [4, 4], 'si_reks_configs': [[0, 1]], 'si_reks_2spin': [2],
+      'si_reks_report_states': [5]},
+     ["entry 0 is 5 but SI cassette 0 has dimension 2"], H4, 1),
+    ("61_report_si_implicit_2level",
+     {'reks': [4, 4], 'si_reks_configs': [[0, 1]], 'si_reks_report_states': [3]},
+     ["entry 0 is 3 but SI cassette 0 has dimension 2"], H4, 1),
+    ("62_report_si_default_labeled",
+     {'reks': [4, 4], 'si_reks_2spin': [2], 'si_reks_report_states': [0]},
+     ["entry 0 is 0; each value must be at least 1"], H4, 1),
+    ("63_sa_default_labeled_weights",
+     {'reks': [4, 4], 'sa_reks_2spin': [2], 'sa_reks_weights': [1.0]},
+     ["SA_REKS_WEIGHTS: expected"], H4, 1),
+]
+
+
+GUESS = "reks_inputval_rhf.npy"
+GUESS_TZ = "reks_inputval_rhf_tz.npy"
+REFUSED = "Not supported for REFERENCE REKS: "
+
+
+def reks_call(method='hf', fn=psi4.energy, **kwargs):
+    return lambda mol: fn(method, molecule=mol, **kwargs)
+
+
+# (label, opts, wanted substrings, call); H2, REKS [2, 2]
+DRIVER_CASES = [
+    ("d01_pcm", {'pcm': True}, [REFUSED + "PCM."], reks_call()),
+    ("d02_ddx", {'ddx': True}, [REFUSED + "DDX."], reks_call()),
+    ("d02b_pe", {'pe': True}, [REFUSED + "PE."], reks_call()),
+    ("d03_double_hybrid", {}, [REFUSED + "double-hybrid functional B2PLYP."], reks_call('b2plyp')),
+    ("d04_mom", {'mom_start': 3}, [REFUSED + "MOM_START."], reks_call()),
+    ("d05_frac", {'frac_start': 3}, [REFUSED + "FRAC_START."], reks_call()),
+    ("d06_damping", {'damping_percentage': 20.0}, [REFUSED + "DAMPING_PERCENTAGE."], reks_call()),
+    ("d07_stability", {'stability_analysis': 'check'}, [REFUSED + "STABILITY_ANALYSIS."], reks_call()),
+    ("d08_tdscf", {'tdscf_states': [2]}, [REFUSED + "TDSCF_STATES."], reks_call()),
+    ("d09_vv10", {}, [REFUSED + "VV10 nonlocal correlation (WB97X-V)."], reks_call('wb97x-v')),
+    ("d09b_grac", {'dft_grac_shift': 0.1}, [REFUSED + "DFT_GRAC_SHIFT."], reks_call('pbe')),
+    ("d10_all_listed", {'mom_start': 3, 'damping_percentage': 20.0},
+     [REFUSED + "MOM_START, DAMPING_PERCENTAGE."], reks_call()),
+    ("d11_post_scf", {}, ["REFERENCE REKS is a complete calculation and is not a reference for post-SCF"],
+     reks_call('dct')),
+    ("d12_gradient_analytic", {}, ["not available for target derivative level", "REFERENCE=REKS"],
+     reks_call(fn=psi4.gradient, dertype=1)),
+    ("d13_hessian_analytic", {}, ["not available for target derivative level", "REFERENCE=REKS"],
+     reks_call(fn=psi4.hessian, dertype=2)),
+    ("d14_read_no_file", {'guess': 'read'}, ["REKS GUESS=READ: no saved orbitals to read"], reks_call()),
+    ("d15_window_needs_read", {'guess_active_window': ['HOMO', 'LUMO']},
+     ["GUESS_ACTIVE_WINDOW reorders the orbitals taken from the READ guess and needs GUESS READ"],
+     reks_call()),
+    ("d16_window_length", {'guess_active_window': ['HOMO']},
+     ["GUESS_ACTIVE_WINDOW lists 1 orbitals but the active space holds 2"],
+     reks_call(restart_file=GUESS)),
+    ("d17_window_token", {'guess_active_window': ['HOMO', 'LUMOX']},
+     ["GUESS_ACTIVE_WINDOW bad token: 'LUMOX'"], reks_call(restart_file=GUESS)),
+    ("d18_window_range", {'guess_active_window': ['HOMO', 'LUMO+20']},
+     ["entry 'LUMO+20' resolves to MO 21, outside the 4 orbitals"], reks_call(restart_file=GUESS)),
+    ("d19_window_repeat", {'guess_active_window': ['HOMO', 'HOMO']},
+     ["GUESS_ACTIVE_WINDOW names MO [0] more than once"], reks_call(restart_file=GUESS)),
+    ("d20_read_puream", {'basis': 'cc-pvtz', 'puream': False},
+     ["the saved orbitals have 28 basis-function rows", "Use the PUREAM of the source calculation"],
+     reks_call(restart_file=GUESS_TZ)),
+]
+
+
+def run_case(label, opts, wants, mol, mult, call=reks_call()):
+    psi4.core.clean()
+    psi4.core.clean_options()
+    active = psi4.geometry(f"0 {mult}\n{mol}")
+    o = dict(BASE)
+    o.update(opts)
+    try:
+        psi4.set_options(o)
+        call(active)
+    except Exception as e:
+        msg = str(e)
+        low = msg.lower()
+        for want in wants:
+            hit = want.lower() in low
+            if not hit:
+                flat = " | ".join(msg.strip().splitlines())
+                print(f"@@ {label}: MISSING SUBSTRING {want!r} in: {flat[:400]}")
+            compare_integers(1, int(hit), f"{label}: message carries {want!r}")  #TEST
+    else:
+        print(f"@@ {label}: NO ERROR RAISED (fail-open)")
+        compare_integers(1, 0, f"{label}: raises")  #TEST
+
+
+for label, opts, wants, mol, mult in CASES:
+    run_case(label, opts, wants, mol, mult)
+
+psi4.core.clean()
+psi4.core.clean_options()
+rhf_molecule = psi4.geometry(f"0 1\n{H2_FRAME}", name="rhf_guess")
+psi4.set_options({'basis': BASE['basis'], 'scf_type': 'pk', 'reference': 'rhf'})
+rhf_wfn = psi4.energy('hf', molecule=rhf_molecule, return_wfn=True)[1]
+rhf_wfn.to_file(GUESS)
+psi4.set_options({'basis': 'cc-pvtz'})
+psi4.energy('hf', molecule=rhf_molecule, return_wfn=True)[1].to_file(GUESS_TZ)
+
+for label, opts, wants, call in DRIVER_CASES:
+    run_case(label, dict({'reks': [2, 2]}, **opts), wants, H2_FRAME, 1, call)

@@ -1,0 +1,108 @@
+#! REKS(2,2)/cc-pVDZ BHHLYP for H2 at three bond lengths with TRAH, GVB-DIIS and plain solvers; microstate energies vs RHF/UHF and RKS/UKS.
+
+import json
+import numpy as np
+
+ref = {                                                                                      #TEST
+    "closed": (-0.9221643810003, 1.9999999427,                                                 #TEST
+               [-1.1594570497, -0.6848717123, -0.0684973496]),                                 #TEST
+    "opening": (-0.8858118862115, 1.5093336152,                                                #TEST
+                [-0.9997600919, -0.7718636805, -0.7432910095]),                                #TEST
+    "open": (-0.8631859866836, 1.1132357159,                                                   #TEST
+             [-0.9873674175, -0.7390045558, -0.7379087311]),                                   #TEST
+}                                                                                              #TEST
+bond = {"closed": 0.75, "opening": 2.2, "open": 3.5}
+
+solvers = {
+    "TRAH":         {"reks_use_trah": True,  "reks_gvb_diis": False},
+    "GVB-DIIS ORB": {"reks_use_trah": False, "reks_gvb_diis": True, "reks_diis_formulation": "orbital"},
+    "GVB-DIIS CFM": {"reks_use_trah": False, "reks_gvb_diis": True, "reks_diis_formulation": "cfm"},
+    "PLAIN":        {"reks_use_trah": False, "reks_gvb_diis": False},
+}
+level5 = {("closed", "GVB-DIIS CFM"), ("opening", "TRAH"), ("open", "GVB-DIIS ORB"), ("opening", "PLAIN")}
+
+
+def seed(regime):
+    with open(f"h2_{regime}.json") as f:
+        data = json.load(f)
+    for group in ("matrix", "vector", "matrixarr"):
+        data[group] = {k: (None if v is None else np.array(v)) for k, v in data[group].items()}
+    np.save(f"h2_{regime}.npy", data, allow_pickle=True)
+    return f"h2_{regime}.npy"
+
+
+def h2_at(r):
+    return geometry(f"""
+        0 1
+        H 0.0 0.0 0.0
+        H 0.0 0.0 {r}
+        symmetry c1
+        no_com
+        no_reorient
+        """)
+
+
+def reks(regime, solver, functional="bhhlyp", extra=None):
+    h2_at(bond[regime])
+    core.clean_options()
+    set_num_threads(1)
+    set_options({"basis": "cc-pvdz", "reference": "reks", "reks": [2, 2], "scf_type": "pk",
+                 "dft_grid_name": "sg1", "e_convergence": 10, "d_convergence": 8, "guess": "read",
+                 "reks_report_level": 5 if (regime, solver) in level5 else 2, **solvers[solver], **(extra or {})})
+    return energy(functional, restart_file=seed(regime), return_wfn=True)
+
+
+def determinant_energy(wfn, functional, label):
+    C = wfn.array_variable("REKS C PATH B").np
+    toks = label.strip("|").split(",")
+    alpha = [ord(t) - ord("a") for t in toks if not t.endswith("_")]
+    beta = [ord(t[0]) - ord("a") for t in toks if t.endswith("_")]
+    order_a = alpha + [i for i in range(C.shape[1]) if i not in alpha]
+    order_b = beta + [i for i in range(C.shape[1]) if i not in beta]
+    closed = alpha == beta
+    data = wfn.to_file()
+    data["matrix"]["Ca"] = C[:, order_a]
+    data["matrix"]["Cb"] = C[:, order_b]
+    data["int"]["nalpha"], data["int"]["nbeta"] = len(alpha), len(beta)
+    data["dimension"]["nalphapi"], data["dimension"]["nbetapi"] = (len(alpha),), (len(beta),)
+    data["dimension"]["doccpi"] = (len(beta),)
+    data["dimension"]["soccpi"] = (len(alpha) - len(beta),)
+    data["boolean"]["same_a_b_orbs"] = closed
+    data["boolean"]["same_a_b_dens"] = closed
+    ks = functional != "hf"
+    data["string"]["name"] = ("RKS" if ks else "RHF") if closed else ("UKS" if ks else "UHF")
+    np.save("determinant.npy", data, allow_pickle=True)
+    mol = core.get_active_molecule()
+    mol.set_multiplicity(len(alpha) - len(beta) + 1)
+    set_options({"reference": data["string"]["name"].lower(), "guess": "read", "maxiter": 1,
+                 "fail_on_maxiter": False})
+    _, det = energy(functional, restart_file="determinant.npy", return_wfn=True)
+    mol.set_multiplicity(1)
+    return np.asarray(det.variable("SCF TOTAL ENERGIES")).ravel()[0]
+
+
+for regime in ("closed", "opening", "open"):
+    e_ref, fon_ref, ssr_ref = ref[regime]
+    for solver in solvers:
+        e_sa, wfn = reks(regime, solver)
+        tag = f"{regime} {solver}"
+        compare_values(e_ref, e_sa, 8, f"{tag}: E_SA")  #TEST
+        compare_values(fon_ref, wfn.array_variable("REKS FON").np[0, 0], 6, f"{tag}: n_a")  #TEST
+        compare_values(ssr_ref, wfn.array_variable("SSR ENERGIES").np.ravel(), 6, f"{tag}: SSR energies")  #TEST
+        niter = int(variable("SCF ITERATIONS"))
+        compare_values(True, niter <= 25, f"{tag}: iterations")  #TEST
+        clean()
+
+for functional in ("hf", "bhhlyp"):
+    e_sa, wfn = reks("opening", "GVB-DIIS ORB", functional, {"sa_reks_extra": [[1, 0, 1, 0]]})
+    labels = {wfn.get_microstate_label(L): L for L in range(wfn.n_microstates())}
+    e_closed = wfn.get_microstate_energy(labels["|a,a_|"])
+    e_triplet = wfn.get_microstate_energy(labels["|a,b|"])
+    extra = wfn.n_microstates()
+    compare_strings("|a,a_|", wfn.get_microstate_label(extra), f"{functional}: extra label")  #TEST
+    compare_values(e_closed, wfn.get_microstate_energy(extra), 12, f"{functional}: extra energy")  #TEST
+    compare_values(determinant_energy(wfn, functional, "|a,a_|"), e_closed, 9,  #TEST
+                   f"{functional}: closed-shell SCF")  #TEST
+    compare_values(determinant_energy(wfn, functional, "|a,b|"), e_triplet, 9,  #TEST
+                   f"{functional}: high-spin SCF")  #TEST
+    clean()

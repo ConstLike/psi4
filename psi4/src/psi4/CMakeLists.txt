@@ -96,6 +96,7 @@ foreach(dir_name
   libpsio
   libpsipcm
   libqt
+  libreks
   libsapt_solver
   libscf_solver
   libtrans

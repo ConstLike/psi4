@@ -57,6 +57,8 @@ dfh.*
 input.log
 
 *.json
+# REKS catalog-blob ABI single source: read at build time (CMake hash step), must ship.
+!psi4/share/psi4/reks_catalog/reks_layout.json
 
 # Special test cases
 tests/*/iter.dat

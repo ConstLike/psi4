@@ -1,0 +1,40 @@
+#! REKS(2,2)/cc-pVDZ PBE-D3(BJ) stretched H2: D3 shifts E_SA and SSR energies by E_disp.
+
+import json
+import numpy as np
+
+e_disp_ref = -0.000195138915                                                     #TEST
+e_pbe_ref = -0.9203736716930                                                     #TEST
+
+molecule h2 {
+0 1
+H 0.0 0.0 0.0
+H 0.0 0.0 2.2
+symmetry c1
+no_com
+no_reorient
+}
+
+with open("h2_opening.json") as f:
+    data = json.load(f)
+for group in ("matrix", "vector", "matrixarr"):
+    data[group] = {k: (None if v is None else np.array(v)) for k, v in data[group].items()}
+np.save("h2_opening.npy", data, allow_pickle=True)
+
+result = {}
+for functional in ("pbe", "pbe-d3bj"):
+    core.clean_options()
+    set_num_threads(1)
+    set_options({"basis": "cc-pvdz", "reference": "reks", "reks": [2, 2], "scf_type": "pk",
+                 "dft_grid_name": "sg1", "e_convergence": 10, "d_convergence": 8, "guess": "read"})
+    e_sa, wfn = energy(functional, restart_file="h2_opening.npy", return_wfn=True)
+    result[functional] = (e_sa, wfn.array_variable("SSR ENERGIES").np.ravel())
+    clean()
+
+e_disp = variable("DISPERSION CORRECTION ENERGY")
+e_pbe, ssr_pbe = result["pbe"]
+e_d3, ssr_d3 = result["pbe-d3bj"]
+compare_values(e_pbe_ref, e_pbe, 8, "PBE E_SA")  #TEST
+compare_values(e_disp_ref, e_disp, 10, "D3BJ energy")  #TEST
+compare_values(e_pbe + e_disp, e_d3, 10, "PBE-D3BJ E_SA")  #TEST
+compare_values(ssr_pbe + e_disp, ssr_d3, 9, "PBE-D3BJ SSR")  #TEST

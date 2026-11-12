@@ -58,6 +58,7 @@
 #include "psi4/libscf_solver/uhf.h"
 #include "psi4/libscf_solver/rohf.h"
 #include "psi4/libscf_solver/cuhf.h"
+#include "psi4/libscf_solver/reks.h"
 #include "psi4/libfunctional/superfunctional.h"
 #include "psi4/libfock/v.h"
 
@@ -413,7 +414,11 @@ void export_wavefunction(py::module& m) {
         .def("compute_spin_contamination", &scf::HF::compute_spin_contamination, "docstring")
         .def("semicanonicalize", &scf::HF::semicanonicalize, "Semicanonicalizes the orbitals for ROHF.")
         .def("print_stability_analysis", &scf::HF::print_stability_analysis, "docstring")
-        .def("openorbital_scf", &scf::HF::openorbital_scf, "Runs the SCF with OpenOrbitalOptimizer");
+        .def("openorbital_scf", &scf::HF::openorbital_scf, "Runs the SCF with OpenOrbitalOptimizer")
+        .def("iteration_labels", &scf::HF::iteration_labels,
+             "Labels appended to the status column of the current SCF iteration")
+        .def("convergence_held", &scf::HF::convergence_held,
+             "True while convergence is held back although the energy and density criteria are met");
 
     /// HF Functions
     py::class_<scf::RHF, std::shared_ptr<scf::RHF>, scf::HF>(m, "RHF", "docstring")
@@ -455,6 +460,71 @@ void export_wavefunction(py::module& m) {
              "Returns a new wavefunction with internal data converted to C_1 symmetry, using pre-c1-constructed "
              "BasisSet *basis*",
              "basis"_a)
+        .def("mintshelper", &Wavefunction::mintshelper, "The MintsHelper object");
+
+    py::class_<scf::REKS, std::shared_ptr<scf::REKS>, scf::HF>(m, "REKS",
+             "Restricted Ensemble Kohn-Sham wavefunction for multi-configurational DFT")
+        .def(py::init<std::shared_ptr<Wavefunction>, std::shared_ptr<SuperFunctional>>())
+        .def("guess_fon", &scf::REKS::guess_fon,
+             "Seed run sector s's REKS FON vector from a saved wavefunction for the READ "
+             "guess path (default sector 0). Matrix must have n_fon_variables entries in "
+             "(1, n_fon) or (n_fon, 1) layout. Values within 1e-8 of 0.0 or 2.0 are clamped "
+             "away from the boundary.",
+             "fon"_a, "s"_a = 0)
+        .def("guess_fon_upper", &scf::REKS::guess_fon_upper,
+             "Seed a higher REKS FON generation (gen >= 1: m, u, v, w) of run sector s "
+             "(default sector 0) from a saved wavefunction. Parallel to guess_fon; matrix "
+             "must have that generation's active-geminal entries. Boundary clamping identical "
+             "to guess_fon.",
+             "gen"_a, "fon"_a, "s"_a = 0)
+        .def("get_microstate_energy", &scf::REKS::get_microstate_energy,
+             "Returns the microstate energy for index L", "L"_a)
+        .def("get_microstate_label", &scf::REKS::get_microstate_label,
+             "Returns the occupation label of microstate L, e.g. |a,b,c,a_,b_,d_|", "L"_a)
+        .def("get_f_value", &scf::REKS::get_f_value,
+             "Returns f_interp value for n-geminal i of run sector s", "pair"_a = 0, "s"_a = 0)
+        // Generation-indexed FON accessors (gen 0=n, 1=m, 2=u, ...; defaults to n, sector 0).
+        .def("get_fon_p", &scf::REKS::get_fon_p,
+             "Returns bonding-orbital FON of geminal g in generation gen of run sector s",
+             "pair"_a, "gen"_a = 0, "s"_a = 0)
+        .def("get_fon_q", &scf::REKS::get_fon_q,
+             "Returns antibonding-orbital FON of geminal g in generation gen of run sector s",
+             "pair"_a, "gen"_a = 0, "s"_a = 0)
+        .def("get_n_scheme", &scf::REKS::get_n_scheme,
+             "Returns scheme tag of geminal g (0 = SCF-optimized, >0 = post-SCF)", "g"_a)
+        .def("get_lagrangian", &scf::REKS::get_lagrangian, "Returns Lagrangian element by index", "idx"_a)
+        .def("get_config_energy", &scf::REKS::get_config_energy,
+             "Returns configuration energy by index K evaluated against run sector s",
+             "K"_a, "s"_a = 0)
+        .def("fon_vector", &scf::REKS::get_fon_vector,
+             "Active bonding FONs (p) of run sector s, generation gen, ordered by that "
+             "sector's active geminal pool.", "s"_a, "gen"_a)
+        .def("set_fon_vector", &scf::REKS::put_fon_vector,
+             "Set run sector s generation gen active FONs (p; q = 2 - p) from a list "
+             "matching the sector's active geminal pool. Mutates the live snapshot for "
+             "frozen-orbital probing; does not re-run SCF.", "s"_a, "gen"_a, "fons"_a)
+        .def("n_pairs", &scf::REKS::n_pairs, "Returns number of n-geminals")
+        .def("n_configs", &scf::REKS::n_configs, "Returns number of configurations")
+        .def("n_microstates", &scf::REKS::n_microstates, "Returns total number of microstates")
+        .def("n_sa_microstates", &scf::REKS::n_sa_microstates, "Returns number of SA microstates")
+        .def("n_lagrangians", &scf::REKS::n_lagrangians, "Returns number of Lagrangian elements")
+        .def("n_si_states", &scf::REKS::n_si_states, "Returns number of SI states")
+        .def("get_Ncore", &scf::REKS::get_Ncore,
+             "Returns number of doubly-occupied core orbitals (MOs below the active space)")
+        .def("n_active_orbitals", &scf::REKS::n_active_orbitals,
+             "Returns number of active orbitals")
+        .def("get_active_mo_indices", &scf::REKS::get_active_mo_indices,
+             "Returns MO indices of active orbitals (length n_active_orbitals)")
+        // SI accessors
+        .def("SI_hamiltonian", &scf::REKS::SI_hamiltonian, "Returns SI Hamiltonian as Matrix (n x n)")
+        .def("SI_energies", &scf::REKS::SI_energies,
+             "Returns physical SI eigenvalues as Vector (n_physical; null-space roots excluded), "
+             "truncated to the first SI_REKS_REPORT_STATES entries when that option caps cassette 0")
+        .def("SI_coefficients", &scf::REKS::SI_coefficients,
+             "Returns SI eigenvectors as Matrix (rows = states, columns = configs, n x n by "
+             "default); the row count follows SI_REKS_REPORT_STATES when that option caps "
+             "cassette 0, the column count is always n")
+        .def("SI_overlap", &scf::REKS::SI_overlap, "Returns SI overlap matrix as Matrix (n x n)")
         .def("mintshelper", &Wavefunction::mintshelper, "The MintsHelper object");
 
     /// EP2 functions

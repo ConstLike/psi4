@@ -1,0 +1,57 @@
+#! GVB-DIIS convergence-gate units contract: the Dnorm the SCF iterator gates on equals the
+#! full orbital-rotation gradient Frobenius norm divided by nmo (rms per matrix element), and
+#! the persistence latch only confirms on a state that satisfies the joint criteria.
+
+molecule h2 {
+  0 1
+  H 0.0 0.0 0.0
+  H 0.0 0.0 1.6
+  symmetry c1
+  no_com
+  no_reorient
+}
+
+set basis 6-31g(d)
+set scf_type pk
+set df_scf_guess false
+set reference reks
+set reks [2, 2]
+set reks_sa_weights [0.5, 0.5]
+set dft_grid_name SG1
+set scf_initial_accelerator NONE
+set scf_initial_start_diis_transition 0.1
+set scf_initial_finish_diis_transition 0.0001
+set diis false
+set soscf false
+set damping_percentage 0.0
+set level_shift 0.6
+set level_shift_cutoff 0.0
+set level_shift_adapt true
+set reks_use_trah false
+set reks_gvb_diis true
+set reks_diis_formulation CFM
+set guess SAD
+set e_convergence 8
+set d_convergence 6
+set maxiter 100
+
+e_cfm, wfn = energy('bhhlyp', return_wfn=True)
+
+# Units contract at the accepted iterate: the rms the SCF gate saw equals ||g_orb||_F / nmo.
+# A revert to Frobenius gating breaks this by a factor of nmo.
+gate_rms = wfn.scalar_variable("REKS GATE RMS")
+gorb_fro = wfn.scalar_variable("REKS GORB FRO")
+nmo = wfn.nmo()
+compare_values(gorb_fro / nmo, gate_rms, 12, "gate units: rms == ||g_orb||_F / nmo")  #TEST
+
+# Persistence latch: the accepted value is the true rms below the D-gate, not the
+# pre-confirmation sentinel (which sits strictly above d_convergence).
+compare_values(1, int(gate_rms < 1.0e-6), "latch: accepted rms below D_CONVERGENCE")  #TEST
+
+# Engine cross-check: ORBITAL formulation reaches the same SA energy through the same gate.
+clean()
+set reks_diis_formulation ORBITAL
+e_orb, wfn2 = energy('bhhlyp', return_wfn=True)
+compare_values(e_cfm, e_orb, 8, "CFM vs ORBITAL SA energy")  #TEST
+compare_values(wfn2.scalar_variable("REKS GORB FRO") / wfn2.nmo(),
+               wfn2.scalar_variable("REKS GATE RMS"), 12, "gate units (ORBITAL)")  #TEST

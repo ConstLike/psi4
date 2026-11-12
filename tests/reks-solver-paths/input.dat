@@ -1,0 +1,57 @@
+#! REKS(4,4)/6-31G H4: TRAH and GVB-DIIS solver variants converge to one E_SA; E_SA at MAXITER matches the exported frame
+
+import numpy as np
+
+e_sa_ref = -1.7699306624889                                                            #TEST
+
+molecule h4 {
+0 1
+H 0.0 0.0 -3.75
+H 0.0 0.0 -1.25
+H 0.0 0.0 1.25
+H 0.0 0.0 3.75
+symmetry c1
+no_com
+no_reorient
+}
+
+base = {"basis": "6-31g", "reference": "reks", "reks": [4, 4], "reks_m_fon": 1.99999999, "scf_type": "pk",
+        "dft_grid_name": "sg1", "e_convergence": 10, "d_convergence": 8}
+gvb = {"reks_use_trah": False, "reks_gvb_diis": True}
+converging = {
+    "TRAH -> GVB-DIIS ORB": {"reks_use_trah": True, "reks_gvb_diis": True},
+    "TRAH -> GVB-DIIS CFM": {"reks_use_trah": True, "reks_gvb_diis": True, "reks_diis_formulation": "cfm"},
+    "TRAH, static level shift": {"reks_use_trah": True, "reks_gvb_diis": False, "level_shift_adapt": False},
+    "GVB-DIIS, gate streak 1": {**gvb, "reks_gvb_gate_streak": 1},
+    "GVB-DIIS, Tikhonov ridge always": {**gvb, "reks_diis_cond_kappa_bypass": 0.0,
+                                        "reks_diis_cond_tikhonov_scale": 1.0e-6},
+    "GVB-DIIS, one-step cycle window": {**gvb, "reks_diis_mon_cycle_window": 1, "reks_diis_mon_progress_eps": 0.9},
+}
+stopped = {
+    ("bhhlyp", "GVB-DIIS ORB"): gvb,
+    ("bhhlyp", "GVB-DIIS CFM"): {**gvb, "reks_diis_formulation": "cfm"},
+    ("pbe", "TRAH"): {"reks_use_trah": True, "reks_gvb_diis": False},
+    ("pbe", "TRAH -> GVB-DIIS ORB"): {"reks_use_trah": True, "reks_gvb_diis": True},
+}
+
+
+def reks(functional, options, restart=None):
+    core.clean_options()
+    set_num_threads(1)
+    set_options({**base, **options})
+    kwargs = {"restart_file": restart} if restart else {}
+    e_sa, wfn = energy(functional, return_wfn=True, **kwargs)
+    clean()
+    return e_sa, wfn
+
+
+for label, options in converging.items():
+    e_sa, _ = reks("bhhlyp", options)
+    compare_values(e_sa_ref, e_sa, 8, f"{label}: E_SA")  #TEST
+
+for (functional, label), options in stopped.items():
+    e_stop, wfn = reks(functional, {**options, "maxiter": 6, "fail_on_maxiter": False})
+    wfn.to_file("stopped")
+    reks(functional, {**options, "guess": "read", "maxiter": 1, "fail_on_maxiter": False}, "stopped.npy")
+    e_frame = np.asarray(variable("SCF TOTAL ENERGIES")).ravel()[0]
+    compare_values(e_stop, e_frame, 10, f"{functional} {label}: MAXITER E_SA")  #TEST

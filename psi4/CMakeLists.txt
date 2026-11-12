@@ -415,6 +415,7 @@ install(
     PATTERN "dftd3/psithon2/psiaux2/*"
     PATTERN "mints3/L*dat"
     PATTERN "mints3/P*dat"
+    PATTERN "reks-*/*.json"
   )
 
     # <<<  install psi4 share/ & include/  >>>
@@ -425,7 +426,19 @@ install(DIRECTORY share/psi4/
         PATTERN "*.bin" EXCLUDE
         PATTERN "*.pyc" EXCLUDE
         PATTERN "fsapt.py" EXCLUDE
+        PATTERN "reks_catalog" EXCLUDE
     )
+
+# REKS catalog: symlink to the source directory, so every blob in it is visible without a copy;
+# on Windows (symlinks need privileges) a copy of every blob in it
+if(WIN32)
+    install(DIRECTORY share/psi4/reks_catalog/
+            DESTINATION ${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_DATADIR}/psi4/reks_catalog
+            FILES_MATCHING PATTERN "*.bin")
+else()
+    install(CODE "file(CREATE_LINK \"${CMAKE_CURRENT_SOURCE_DIR}/share/psi4/reks_catalog\"
+        \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_DATADIR}/psi4/reks_catalog\" SYMBOLIC)")
+endif()
 
 install(FILES share/psi4/quadratures/1_x/R_avail${_endian_ext}.bin
         RENAME quadratures/1_x/R_avail.bin

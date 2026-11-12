@@ -141,10 +141,8 @@ def scf_initialize(self):
     vbase = self.V_potential()
     if vbase:
         collocation_size = vbase.grid().collocation_size()
-        if vbase.functional().ansatz() == 1:
-            collocation_size *= 4  # First derivs
-        elif vbase.functional().ansatz() == 2:
-            collocation_size *= 10  # Second derivs
+        if vbase.functional().ansatz() >= 1:
+            collocation_size *= 4  # Value + 3 gradients; grid cache never exceeds first-derivative order
     else:
         collocation_size = 0
 
@@ -511,6 +509,7 @@ def scf_iterate(self, e_conv=None, d_conv=None):
                 # frac, MOM invoked here from Wfn::HF::find_occupation
                 core.timer_on("HF: Form C")
                 level_shift = core.get_option("SCF", "LEVEL_SHIFT")
+                status.extend(self.iteration_labels())
                 if level_shift > 0 and Dnorm > core.get_option('SCF', 'LEVEL_SHIFT_CUTOFF'):
                     status.append("SHIFT")
                     self.form_C(level_shift)
@@ -574,11 +573,13 @@ def scf_iterate(self, e_conv=None, d_conv=None):
         # have we completed our post-early screening SCF iterations?
         if early_screening_disabled:
             scf_iter_post_screening += 1
-            if scf_iter_post_screening >= scf_maxiter_post_screening and scf_maxiter_post_screening > 0:
+            if scf_iter_post_screening >= scf_maxiter_post_screening and scf_maxiter_post_screening > 0 \
+               and not self.convergence_held():
                 break
 
         # Call any postiteration callbacks
-        if not ((self.iteration_ == 0) and self.sad_) and _converged(Ediff, Dnorm, e_conv=e_conv, d_conv=d_conv):
+        if not ((self.iteration_ == 0) and self.sad_) and _converged(Ediff, Dnorm, e_conv=e_conv, d_conv=d_conv) \
+           and not self.convergence_held():
 
             if early_screening:
 

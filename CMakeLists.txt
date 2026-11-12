@@ -397,7 +397,13 @@ include(ConfigTesting)
 install(DIRECTORY ${STAGED_INSTALL_PREFIX}/
         DESTINATION ${CMAKE_INSTALL_PREFIX}
         USE_SOURCE_PERMISSIONS
-        PATTERN "*.pyc" EXCLUDE)
+        PATTERN "*.pyc" EXCLUDE
+        PATTERN "reks_catalog" EXCLUDE)
+
+# REKS catalog: the staged directory links the source tree; install copies every blob in it
+install(DIRECTORY psi4/share/psi4/reks_catalog/
+        DESTINATION ${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_DATADIR}/psi4/reks_catalog
+        FILES_MATCHING PATTERN "*.bin")
 
 install(DIRECTORY samples
         DESTINATION ${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_DATADIR}/psi4

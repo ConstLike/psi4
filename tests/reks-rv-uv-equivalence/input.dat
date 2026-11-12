@@ -1,0 +1,91 @@
+#! Invariant: RV(D) and UV(D, D) on a closed-shell density produce identical
+#! V_alpha (up to libxc round-off) and identical FUNCTIONAL / VV10 quadrature
+#! values. This guarantees the REKS RV path on Da_ matches the historical UV
+#! path on (Da_, Da_).
+
+import numpy as np
+import psi4
+from psi4 import core
+from psi4.driver.procrouting.dft import build_superfunctional
+
+
+molecule h2o {
+0 1
+O   0.000000000   0.000000000   0.117790000
+H   0.000000000   0.755453000  -0.471161000
+H   0.000000000  -0.755453000  -0.471161000
+symmetry c1
+}
+
+psi4.set_options({
+    "basis": "cc-pVDZ",
+    "scf_type": "df",
+    "reference": "rhf",
+    "dft_spherical_points": 590,
+    "dft_radial_points": 99,
+    "d_convergence": 10,
+    "e_convergence": 10,
+})
+
+# Converged closed-shell density on which to evaluate XC.
+e_ref, wfn = psi4.energy("hf", return_wfn=True)
+basis = wfn.basisset()
+Da = wfn.Da()  # closed-shell density (alpha = beta)
+
+
+def _va_and_quad(name, restricted):
+    sup, _ = build_superfunctional(name, restricted)
+    sup.set_lock(False)
+    sup.set_max_points(core.get_option("SCF", "DFT_BLOCK_MAX_POINTS"))
+    sup.set_deriv(1)
+    sup.allocate()
+
+    pot_type = "RV" if restricted else "UV"
+    pot = core.VBase.build(basis, sup, pot_type)
+    pot.initialize()
+    if restricted:
+        pot.set_D([Da])
+        Va = core.Matrix("Va", basis.nbf(), basis.nbf())
+        pot.compute_V([Va])
+    else:
+        pot.set_D([Da, Da])
+        Va = core.Matrix("Va", basis.nbf(), basis.nbf())
+        Vb = core.Matrix("Vb", basis.nbf(), basis.nbf())
+        pot.compute_V([Va, Vb])
+    quad = dict(pot.quadrature_values())
+    pot.finalize()
+    return Va, quad
+
+
+def _max_abs_delta(A, B):
+    return float(np.max(np.abs(A.np - B.np)))
+
+
+cases = [
+    # (name,       Va_tol,   E_tol)
+    ("svwn",       1.0e-13, 1.0e-13),
+    ("pbe",        1.0e-13, 1.0e-13),
+    ("blyp",       1.0e-13, 1.0e-13),
+    ("b3lyp",      1.0e-13, 1.0e-13),
+    ("m06",        1.0e-12, 1.0e-12),
+]
+
+for name, va_tol, e_tol in cases:
+    Va_rv, q_rv = _va_and_quad(name, restricted=True)
+    Va_uv, q_uv = _va_and_quad(name, restricted=False)
+    dVa  = _max_abs_delta(Va_rv, Va_uv)
+    dE   = abs(q_rv["FUNCTIONAL"] - q_uv["FUNCTIONAL"])
+    psi4.compare_values(0.0, dVa, int(round(-np.log10(va_tol))),  #TEST
+                        f"RV vs UV V_alpha {name}: max|delta| < {va_tol:.0e}")  #TEST
+    psi4.compare_values(0.0, dE, int(round(-np.log10(e_tol))),  #TEST
+                        f"RV vs UV E_xc      {name}: |delta| < {e_tol:.0e}")  #TEST
+
+# VV10 contract: RV and UV must yield identical VV10 contribution.
+Va_rv, q_rv = _va_and_quad("wb97x-v", restricted=True)
+Va_uv, q_uv = _va_and_quad("wb97x-v", restricted=False)
+dVa   = _max_abs_delta(Va_rv, Va_uv)
+dXC   = abs(q_rv["FUNCTIONAL"] - q_uv["FUNCTIONAL"])
+dVV10 = abs(q_rv["VV10"]       - q_uv["VV10"])
+psi4.compare_values(0.0, dVa,   13, "RV vs UV V_alpha wb97x-v: max|delta| < 1e-13")  #TEST
+psi4.compare_values(0.0, dXC,   13, "RV vs UV E_xc      wb97x-v: |delta| < 1e-13")  #TEST
+psi4.compare_values(0.0, dVV10, 13, "RV vs UV E_VV10    wb97x-v: |delta| < 1e-13")  #TEST

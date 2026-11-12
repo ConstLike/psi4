@@ -279,7 +279,7 @@ class HF : public Wavefunction {
     void check_phases();
 
     /// Prints the orbitals in arbitrary order (works with MOM)
-    void print_orbitals();
+    virtual void print_orbitals();
 
     /// Prints some opening information
     void print_header();
@@ -312,8 +312,8 @@ class HF : public Wavefunction {
     virtual std::shared_ptr<VBase> V_potential() const = 0;
 
     /// Returns the occupation vectors
-    std::shared_ptr<Vector> occupation_a() const;
-    std::shared_ptr<Vector> occupation_b() const;
+    virtual std::shared_ptr<Vector> occupation_a() const;
+    virtual std::shared_ptr<Vector> occupation_b() const;
 
     /// Save the current density and energy.
     virtual void save_density_and_energy();
@@ -329,10 +329,16 @@ class HF : public Wavefunction {
     virtual int soscf_update(double soscf_conv, int soscf_min_iter, int soscf_max_iter, bool soscf_print);
 
     /// Figure out how to occupy the orbitals in the absence of DOCC and SOCC
-    void find_occupation();
+    virtual void find_occupation();
 
     /** Performs DIIS extrapolation */
     virtual bool diis(double dnorm) { return false; }
+
+    /// Labels appended to the status column of the current SCF iteration
+    virtual std::vector<std::string> iteration_labels() const { return {}; }
+
+    /// True while convergence is held back although the energy and density criteria are met
+    virtual bool convergence_held() const { return false; }
 
     /** Compute the orbital gradient */
     virtual double compute_orbital_gradient(bool save_diis, int max_diis_vectors) { return 0.0; }

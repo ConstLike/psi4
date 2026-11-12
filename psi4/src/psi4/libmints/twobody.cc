@@ -123,11 +123,12 @@ TwoBodyAOInt::~TwoBodyAOInt() {}
 // Haser 1989, Equation 7 
 void TwoBodyAOInt::update_density(const std::vector<SharedMatrix>& D) {
 
-    if (max_dens_shell_pair_.size() == 0) {
-        max_dens_shell_pair_.resize(D.size());
-        for (int i = 0; i < D.size(); i++) {
-            max_dens_shell_pair_[i].resize(nshell_ * nshell_);
-        }
+    // resize() is idempotent at equal size; cheap no-op on the steady-state
+    // path and the only place where a varying density-list length (e.g. REKS
+    // microstate batches) is reconciled.
+    max_dens_shell_pair_.resize(D.size());
+    for (auto& mp : max_dens_shell_pair_) {
+        mp.resize(nshell_ * nshell_);
     }
     
     timer_on("Update Density");
@@ -170,30 +171,31 @@ double TwoBodyAOInt::shell_pair_max_density(int M, int N) const {
     return D_max;
 }
 
-// Haser 1989 Equations 6 to 14
+// Haser 1989 Equations 6 to 14. Generalized to arbitrary density-list size:
+// J-like blocks (M,N) and (R,S) are summed across the list (all densities
+// contribute additively to the Coulomb operator), K-like blocks take the
+// per-density maximum (each exchange channel is independent). The two
+// historical special cases recover exactly: RHF (size == 1) keeps the
+// closed-shell factor of 4; UHF / ROHF (size == 2) and the open generic
+// case (REKS microstate batches, size > 2) share the factor-2 path. Indexing
+// is contract-checked: the loop stops at .size() so a stale list never
+// reaches an unallocated row.
 bool TwoBodyAOInt::shell_significant_density(int M, int N, int R, int S) {
 
-    // Maximum density matrix equation
-    double max_density = 0.0;
-
-    // Equation 6 (RHF Case)
-    if (max_dens_shell_pair_.size() == 1) {
-        max_density = std::max({4.0 * max_dens_shell_pair_[0][M * nshell_ + N], 4.0 * max_dens_shell_pair_[0][R * nshell_ + S], 
-            max_dens_shell_pair_[0][M * nshell_ + R], max_dens_shell_pair_[0][M * nshell_ + S],
-            max_dens_shell_pair_[0][N * nshell_ + R], max_dens_shell_pair_[0][N * nshell_ + S]});
-    } else { // UHF and ROHF
-        // J-like terms
-        double D_MN = max_dens_shell_pair_[0][M * nshell_ + N] + max_dens_shell_pair_[1][M * nshell_ + N];
-        double D_RS = max_dens_shell_pair_[0][R * nshell_ + S] + max_dens_shell_pair_[1][R * nshell_ + S];
-
-        // K-like terms
-        double D_MR = std::max(max_dens_shell_pair_[0][M * nshell_ + R], max_dens_shell_pair_[1][M * nshell_ + R]);
-        double D_MS = std::max(max_dens_shell_pair_[0][M * nshell_ + S], max_dens_shell_pair_[1][M * nshell_ + S]);
-        double D_NR = std::max(max_dens_shell_pair_[0][N * nshell_ + R], max_dens_shell_pair_[1][N * nshell_ + R]);
-        double D_NS = std::max(max_dens_shell_pair_[0][N * nshell_ + S], max_dens_shell_pair_[1][N * nshell_ + S]);
-
-        max_density = std::max({2.0 * D_MN, 2.0 * D_RS, D_MR, D_MS, D_NR, D_NS});
+    double D_MN_sum = 0.0, D_RS_sum = 0.0;
+    double D_MR_max = 0.0, D_MS_max = 0.0, D_NR_max = 0.0, D_NS_max = 0.0;
+    for (auto const& mp : max_dens_shell_pair_) {
+        D_MN_sum += mp[M * nshell_ + N];
+        D_RS_sum += mp[R * nshell_ + S];
+        D_MR_max = std::max(D_MR_max, mp[M * nshell_ + R]);
+        D_MS_max = std::max(D_MS_max, mp[M * nshell_ + S]);
+        D_NR_max = std::max(D_NR_max, mp[N * nshell_ + R]);
+        D_NS_max = std::max(D_NS_max, mp[N * nshell_ + S]);
     }
+
+    const double j_factor = (max_dens_shell_pair_.size() == 1) ? 4.0 : 2.0;
+    double max_density = std::max({j_factor * D_MN_sum, j_factor * D_RS_sum,
+                                   D_MR_max, D_MS_max, D_NR_max, D_NS_max});
 
     // Square of Cauchy-Schwarz Q_MN terms (Eq. 13)
     double mn_mn = shell_pair_values_[N * nshell_ + M];

@@ -3,6 +3,7 @@ list(APPEND sources
   frac.cc
   hf.cc
   mom.cc
+  reks.cc
   rhf.cc
   rohf.cc
   sad.cc
@@ -19,7 +20,7 @@ if(ENABLE_GTFOCK)
     add_dependencies(scf_solver INTERFACE GTFockInt GTFockCInt)
 endif()
 
-target_link_libraries(scf_solver PUBLIC diis)
+target_link_libraries(scf_solver PUBLIC diis reks)
 
 # OpenOrbitalOptimizer support for SCF solver
 # PUBLIC because scf_solver headers may expose OpenOrbitalOptimizer types

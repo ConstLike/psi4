@@ -89,7 +89,8 @@ foreach(test_name aediis-1
                   pywrap-checkrun-rohf pywrap-checkrun-uhf pywrap-db1
                   pywrap-db3
                   pywrap-molecule rasci-c2-active rasci-h2o
-                  rasci-ne rasscf-sp sad-scf-type sad1 sapt1 sapt2 sapt3 sapt4 sapt5 sapt6 sapt-dft-api sapt-dft-lrc
+                  rasci-ne rasscf-sp
+                  sad-scf-type sad1 sapt1 sapt2 sapt3 sapt4 sapt5 sapt6 sapt-dft-api sapt-dft-lrc
                   remp-energy1 remp-energy2
                   sapt-exch-disp-inf sapt-exch-ind-inf sapt-exch-ind30-inf
                   sapt7 sapt8 scf-bz2 scf-dipder scf-guess scf-guess-read1 scf-upcast-custom-basis
@@ -107,6 +108,27 @@ foreach(test_name aediis-1
                   dft-pruning freq-masses sapt9 sapt10 sapt11 scf-uhf-grad-nobeta
                   linK-1 linK-2 linK-3
                   cbs-xtpl-energy-conv ddd-deriv dfmp2f12-1
+                  reks-h2_g0_2sa_3si_blyp
+                  reks-h2_g0_2sa_3si_m06l
+                  reks-rv-uv-equivalence
+                  reks-guess-reorder
+                  reks-inputval
+                  reks-lindep-nmo
+                  reks-diis-gate-units
+                  reks-si-frame
+                  reks-read-geom
+                  reks-read-basis
+                  reks-read-geom-basis
+                  reks-lrc-wpbe
+                  reks-pbe-gvbdiis
+                  reks-h2-fon-regimes
+                  reks-h4-fon-regimes
+                  reks-c2h4-si-properties
+                  reks-scf-types
+                  reks-dft
+                  reks-guess
+                  reks-config-pools
+                  reks-solver-paths
                   )
     add_subdirectory(${test_name})
 endforeach()
@@ -181,6 +203,7 @@ if(DFTD3_EXECUTABLE)
     add_subdirectory(sapt0-d)
     add_subdirectory(fsapt-d)
     add_subdirectory(fsaptd-terms)
+    add_subdirectory(reks-dft-d3)
     message(STATUS "${Cyan}Found DFTD3${ColourReset}: ${DFTD3_EXECUTABLE}")
     message(STATUS "Adding test cases: Psi4 + DFTD3")
 endif()

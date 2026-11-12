@@ -1,0 +1,988 @@
+
+    -----------------------------------------------------------------------
+          Psi4: An Open-Source Ab Initio Electronic Structure Package
+                               Psi4 1.12a1.dev436 
+
+                         Git: Rev {kk/reks.v22} db23281 dirty
+
+
+    D. G. A. Smith, L. A. Burns, A. C. Simmonett, R. M. Parrish,
+    M. C. Schieber, R. Galvelis, P. Kraus, H. Kruse, R. Di Remigio,
+    A. Alenaizan, A. M. James, S. Lehtola, J. P. Misiewicz, M. Scheurer,
+    R. A. Shaw, J. B. Schriber, Y. Xie, Z. L. Glick, D. A. Sirianni,
+    J. S. O'Brien, J. M. Waldrop, A. Kumar, E. G. Hohenstein,
+    B. P. Pritchard, B. R. Brooks, H. F. Schaefer III, A. Yu. Sokolov,
+    K. Patkowski, A. E. DePrince III, U. Bozkaya, R. A. King,
+    F. A. Evangelista, J. M. Turney, T. D. Crawford, C. D. Sherrill,
+    J. Chem. Phys. 152(18) 184108 (2020). https://doi.org/10.1063/5.0006002
+
+                            Additional Code Authors
+    E. T. Seidl, C. L. Janssen, E. F. Valeev, M. L. Leininger,
+    J. F. Gonthier, R. M. Richard, H. R. McAlexander, M. Saitow, X. Wang,
+    P. Verma, M. H. Lechner, A. Jiang, S. Behnle, A. G. Heide,
+    M. F. Herbst, D. L. Poole, T. Győri, E. C. Mitchell, J. P. Pederson,
+    and A. M. Wallace
+
+             Previous Authors, Complete List of Code Contributors,
+                       and Citations for Specific Modules
+    https://github.com/psi4/psi4/blob/master/codemeta.json
+    https://github.com/psi4/psi4/graphs/contributors
+    https://psicode.org/psi4manual/master/introduction.html#citing-psifour
+
+    -----------------------------------------------------------------------
+
+
+    Psi4 started on: Sunday, 04 October 2026 10:23PM
+
+    Process ID: 53882
+    Host:       constlike.local
+    PSIDATADIR: /Users/stan/Codebase/psi4_dir/main/build/stage/share/psi4
+    Memory:     500.0 MiB
+    Threads:    1
+    Addons:     a̶d̶c̶c̶, a̶m̶b̶i̶t̶, b̶s̶e̶, c̶c̶t̶3̶, c̶f̶o̶u̶r̶, c̶h̶e̶m̶p̶s̶2̶, c̶p̶p̶e̶, d̶d̶x̶, dftd3,
+                d̶f̶t̶d̶4̶, d̶k̶h̶, e̶c̶p̶i̶n̶t̶, e̶i̶n̶s̶u̶m̶s̶, f̶o̶r̶t̶e̶, g̶a̶u̶x̶c̶,
+                g̶c̶p̶, g̶d̶m̶a̶, g̶e̶o̶m̶e̶t̶r̶i̶c̶, g̶p̶u̶_̶d̶f̶c̶c̶,
+                i̶n̶t̶e̶g̶r̶a̶t̶o̶r̶x̶x̶, i̶p̶i̶, l̶i̶b̶e̶f̶p̶, m̶d̶i̶, m̶p̶2̶d̶, m̶r̶c̶c̶,
+                o̶o̶o̶, o̶p̶e̶n̶f̶e̶r̶m̶i̶o̶n̶p̶s̶i̶4̶, p̶c̶m̶s̶o̶l̶v̶e̶r̶,
+                p̶s̶i̶4̶f̶o̶c̶k̶c̶i̶, p̶s̶i̶x̶a̶s̶, p̶y̶e̶i̶n̶s̶u̶m̶s̶, qcmanybody, r̶e̶s̶p̶,
+                s̶i̶m̶i̶n̶t̶, s̶n̶s̶m̶p̶2̶, v̶2̶r̶d̶m̶_̶c̶a̶s̶s̶c̶f̶
+
+  ==> Input File <==
+
+--------------------------------------------------------------------------
+#! REKS(2,2)/cc-pVDZ PBE-D3(BJ) stretched H2: D3 shifts E_SA and SSR energies by E_disp.
+
+import json
+import numpy as np
+
+e_disp_ref = -0.000195138915                                                     #TEST
+e_pbe_ref = -0.9203736716930                                                     #TEST
+
+molecule h2 {
+0 1
+H 0.0 0.0 0.0
+H 0.0 0.0 2.2
+symmetry c1
+no_com
+no_reorient
+}
+
+with open("h2_opening.json") as f:
+    data = json.load(f)
+for group in ("matrix", "vector", "matrixarr"):
+    data[group] = {k: (None if v is None else np.array(v)) for k, v in data[group].items()}
+np.save("h2_opening.npy", data, allow_pickle=True)
+
+result = {}
+for functional in ("pbe", "pbe-d3bj"):
+    core.clean_options()
+    set_num_threads(1)
+    set_options({"basis": "cc-pvdz", "reference": "reks", "reks": [2, 2], "scf_type": "pk",
+                 "dft_grid_name": "sg1", "e_convergence": 10, "d_convergence": 8, "guess": "read"})
+    e_sa, wfn = energy(functional, restart_file="h2_opening.npy", return_wfn=True)
+    result[functional] = (e_sa, wfn.array_variable("SSR ENERGIES").np.ravel())
+    clean()
+
+e_disp = variable("DISPERSION CORRECTION ENERGY")
+e_pbe, ssr_pbe = result["pbe"]
+e_d3, ssr_d3 = result["pbe-d3bj"]
+compare_values(e_pbe_ref, e_pbe, 8, "PBE E_SA")  #TEST
+compare_values(e_disp_ref, e_disp, 10, "D3BJ energy")  #TEST
+compare_values(e_pbe + e_disp, e_d3, 10, "PBE-D3BJ E_SA")  #TEST
+compare_values(ssr_pbe + e_disp, ssr_d3, 9, "PBE-D3BJ SSR")  #TEST
+--------------------------------------------------------------------------
+  Threads set to 1 by Python driver.
+
+Scratch directory: /var/folders/tp/7jzk1kyd2pb3d2xjvky58g600000gn/T//psiscr/
+ Found user provided orbital data. Setting orbital guess to READ 
+ Copying restart file <h2_opening.npy> to </var/folders/tp/7jzk1kyd2pb3d2xjvky58g600000gn/T//psiscr/output.h2.53882.180.npy> for internal processing
+   => Libint2 <=
+
+    Primary   basis highest AM E, G, H:  6, 6, 3
+    Auxiliary basis highest AM E, G, H:  7, 7, 4
+    Onebody   basis highest AM E, G, H:  -, -, -
+    Solid Harmonics ordering:            Gaussian
+
+*** tstart() called on constlike.local
+*** at Sun Oct  4 22:23:13 2026
+
+   => Loading Basis Set <=
+
+    Name: CC-PVDZ
+    Role: ORBITAL
+    Keyword: BASIS
+    atoms 1-2 entry H          line    22 file /Users/stan/Codebase/psi4_dir/main/build/stage/share/psi4/basis/cc-pvdz.gbs 
+
+
+         ---------------------------------------------------------
+                                   SCF
+               by Justin Turney, Rob Parrish, Andy Simmonett
+                          and Daniel G. A. Smith
+                             REKS Reference
+                        1 Threads,    500 MiB Core
+         ---------------------------------------------------------
+
+  ==> Geometry <==
+
+    Molecular point group: c1
+    Full point group: C_inf_v
+
+    Geometry (in Angstrom), charge = 0, multiplicity = 1:
+
+       Center              X                  Y                   Z               Mass       
+    ------------   -----------------  -----------------  -----------------  -----------------
+         H            0.000000000000     0.000000000000     0.000000000000     1.007825032230
+         H            0.000000000000     0.000000000000     2.200000000000     1.007825032230
+
+  Running in c1 symmetry.
+
+  Rotational constants: A = ************  B =      3.45594  C =      3.45594 [cm^-1]
+  Rotational constants: A = ************  B = 103606.42696  C = 103606.42696 [MHz]
+  Nuclear repulsion =    0.240535095759091
+
+  Charge       = 0
+  Multiplicity = 1
+  Electrons    = 2
+  Nalpha       = 1
+  Nbeta        = 1
+
+  ==> Algorithm <==
+
+  SCF Algorithm Type is PK.
+  DIIS disabled.
+  MOM disabled.
+  Fractional occupation disabled.
+  Guess Type is READ.
+  Energy threshold   = 1.00e-10
+  Density threshold  = 1.00e-08
+  Integral threshold = 1.00e-12
+
+  ==> Primary Basis <==
+
+  Basis Set: CC-PVDZ
+    Blend: CC-PVDZ
+    Number of shells: 6
+    Number of basis functions: 10
+    Number of Cartesian functions: 10
+    Spherical Harmonics?: true
+    Max angular momentum: 1
+
+  ==> DFT Potential <==
+
+   => LibXC <=
+
+    Version 7.0.0
+    S. Lehtola, C. Steigemann, M. J.T. Oliveira, and M. A.L. Marques.,  SoftwareX 7, 1–5 (2018) (10.1016/j.softx.2017.11.002)
+
+   => Composite Functional: PBE <= 
+
+    PBE GGA Exchange-Correlation Functional
+
+    J.P. Perdew et. al., Phys. Rev. Lett., 77(18), 3865-3868, 1996
+
+
+    Deriv               =              1
+    GGA                 =           TRUE
+    Meta                =          FALSE
+
+    Exchange Hybrid     =          FALSE
+    MP2 Hybrid          =          FALSE
+
+   => Exchange Functionals <=
+
+    1.0000     XC_GGA_X_PBE
+
+   => Correlation Functionals <=
+
+    1.0000     XC_GGA_C_PBE
+
+   => LibXC Density Thresholds  <==
+
+    XC_GGA_C_PBE:  1.00E-12 
+    XC_GGA_X_PBE:  1.00E-15 
+
+   => Molecular Quadrature <=
+
+    Radial Scheme          =       TREUTLER
+    Pruning Scheme         =           NONE
+    Nuclear Scheme         =       TREUTLER
+
+    Blocking Scheme        =         OCTREE
+    BS radius alpha        =              1
+    Pruning alpha          =              1
+    Radial Points          =             75
+    Spherical Points       =            302
+    Total Points           =           5804
+    Total Blocks           =             70
+    Max Points             =            198
+    Max Functions          =             10
+    Weights Tolerance      =       1.00E-15
+
+   =========================================================================
+
+                                REKS Studio
+
+           Spin-Restricted Ensemble-referenced Kohn-Sham DFT
+             State-Averaged (SA) and State-Interaction (SI)
+
+            Konstantin Komarov, Michael Filatov, Seung Kyu Min
+
+    Ulsan National Institute of Science and Technology (UNIST), South Korea
+   =========================================================================
+
+    REKS Studio Setup
+    -----------------
+      Variant            REKS(2,2)  scheme 0  spin 0  (singlet)
+      Active space       2 electrons in 2 orbitals,  core 0
+      Active MO indices  1A 2A 
+
+    Pairing schemes (GVB(2,2) geminal pairs)
+
+      scheme 0 : (a,b)
+
+        GVB(2,2) wavefunctions for pair (p,q)
+          Singlet closed-shell
+            Psi_0(p,q) = +1/sqrt(2.0) * sqrt(n0_p) * |p,p_|
+                         -1/sqrt(2.0) * sqrt(n0_q) * |q,q_|
+            Psi_2(p,q) = +1/sqrt(2.0) * sqrt(n0_q) * |p,p_|
+                         +1/sqrt(2.0) * sqrt(n0_p) * |q,q_|
+          Singlet open-shell
+            Psi_1(p,q) = +1/sqrt(2.0) * |p,q_|
+                         +1/sqrt(2.0) * |q,p_|
+          FON constraint: n_p + n_q = 2.0
+
+    SA pool
+    -------
+
+      K    config weight      definition
+      0    PPS1   0.500000    A[(core) Psi_0(a,b) ]
+      1    OSS1   0.500000    A[(core) Psi_1(a,b) ]
+                  ------------
+                  sum = 1.000000
+
+      E[SA-REKS] = 0.500000 * E(PPS1)
+                 + 0.500000 * E(OSS1)
+
+    SI pool
+    -------
+
+      cassette  dim  label
+      0         3    3SI-2SA-REKS(2,2)
+
+      K    config definition
+      0    PPS1   A[(core) Psi_0(a,b) ]
+      1    OSS1   A[(core) Psi_1(a,b) ]
+      2    DES1   A[(core) Psi_2(a,b) ]
+
+   => Loading Basis Set <=
+
+    Name: CC-PVDZ
+    Role: ORBITAL
+    Keyword: BASIS
+    atoms 1-2 entry H          line    22 file /Users/stan/Codebase/psi4_dir/main/build/stage/share/psi4/basis/cc-pvdz.gbs 
+
+  Reading orbitals from file /var/folders/tp/7jzk1kyd2pb3d2xjvky58g600000gn/T//psiscr/output.h2.53882.180.npy, no projection.
+
+  ==> Integral Setup <==
+
+  Using in-core PK algorithm.
+   Calculation information:
+      Number of atoms:                   2
+      Number of AO shells:               6
+      Number of primitives:             10
+      Number of atomic orbitals:        10
+      Number of basis functions:        10
+
+      Integral cutoff                 1.00e-12
+      Number of threads:                 1
+
+  Performing in-core PK
+  Using 3080 doubles for integral storage.
+  We computed 231 shell quartets total.
+  Whereas there are 231 unique shell quartets.
+
+  ==> DiskJK: Disk-Based J/K Matrices <==
+
+    J tasked:                  Yes
+    K tasked:                   No
+    wK tasked:                  No
+    Memory [MiB]:              373
+    Schwarz Cutoff:          1E-12
+
+    OpenMP threads:              1
+
+  Cached 100.0% of DFT collocation blocks in 0.002 [GiB].
+
+  Minimum eigenvalue in the overlap matrix is 2.2957858817E-01.
+  Reciprocal condition number of the overlap matrix is 1.1377785787E-01.
+    Using symmetric orthogonalization.
+
+  ==> Pre-Iterations <==
+
+  SCF Guess: REKS orbitals restored from previous computation (REKS::guess override).
+
+  REKS READ: restoring n-FON from saved wavefunction:
+    n[0] = 1.506518260732
+   -------------------------------------------------------
+    Irrep   Nso     Nmo     Nalpha   Nbeta   Ndocc  Nsocc
+   -------------------------------------------------------
+     A         10      10       0       0       0       0
+   -------------------------------------------------------
+    Total      10      10       1       1       1       0
+   -------------------------------------------------------
+
+  ==> Iterations <==
+
+                        Total Energy        Delta E     RMS |[F,P]|
+
+   @REKS iter   0:    -0.91931628932041   -9.19316e-01   0.00000e+00 
+   @REKS iter   1:    -0.91931628932041    0.00000e+00   3.58408e-03 SHIFT
+   @REKS iter   2:    -0.92008100621987   -7.64717e-04   1.92376e-03 SHIFT
+   @REKS iter   3:    -0.92028193244950   -2.00926e-04   1.96701e-03 ORB-GVB-DIIS/SHIFT
+   @REKS iter   4:    -0.92037288589801   -9.09534e-05   1.58451e-04 ORB-GVB-DIIS/SHIFT
+   @REKS iter   5:    -0.92037366899602   -7.83098e-07   1.02727e-05 ORB-GVB-DIIS/SHIFT
+   @REKS iter   6:    -0.92037367168452   -2.68850e-09   6.58076e-07 ORB-GVB-DIIS/SHIFT
+   @REKS iter   7:    -0.92037367169302   -8.49720e-12   1.90659e-08 ORB-GVB-DIIS/SHIFT
+   @REKS iter   8:    -0.92037367169303   -1.07692e-14   9.47130e-10 ORB-GVB-DIIS/SHIFT
+   @REKS iter   9:    -0.92037367169303    2.22045e-16   7.98265e-11 ORB-GVB-DIIS/SHIFT
+  Energy and wave function converged.
+
+
+  ==> Post-Iterations <==
+
+   Electrons on quadrature grid:
+      Ntotal   =    2.0000103651 ; deviation = 1.037e-05 
+
+    Orbital Energies [Eh]
+    ---------------------
+
+    Core Doubly Occupied (0):                                             
+
+    
+
+    Active Fractionally Occupied (2):                                     
+
+       1A   (a) -0.261544    n_a =  1.557956
+       2A   (b) -0.190880    n_b =  0.442044
+
+    Virtual (8):                                                          
+
+       3A      0.424158     4A      0.443487     5A      1.138023  
+       6A      1.187702     7A      1.187702     8A      1.203528  
+       9A      1.203528    10A      1.320772  
+
+  @REKS Final Energy:    -0.92037367169303
+
+   => Energetics <=
+
+    Nuclear Repulsion Energy =              0.2405350957590909
+    One-Electron Energy =                  -1.4839562613297312
+    Two-Electron Energy =                   0.8305587983890591
+    DFT Exchange-Correlation Energy =      -0.5075113045114477
+    Empirical Dispersion Energy =           0.0000000000000000
+    VV10 Nonlocal Energy =                  0.0000000000000000
+    Total Energy =                         -0.9203736716930290
+
+   => SA-REKS Energy Decomposition <=
+
+    config      weight       E(config) [Eh]        w * E(config)
+    ------------------------------------------------------------
+    PPS1      0.500000      -1.008993365928      -0.504496682964
+    OSS1      0.500000      -0.831753977458      -0.415876988729
+    ------------------------------------------------------------
+    E[SA-REKS]                                   -0.920373671693
+
+
+  SI Eigenproblem: standard (S = I), dimension 3
+  SI eigenvalues and composition (|w_j| > 5%, w_j = c_j*(Sc)_j):
+    E[ 0] =      -1.008993365928   PPS1(+100%)
+    E[ 1] =      -0.831753977458   OSS1(+100%)
+    E[ 2] =      -0.804855202067   DES1(+100%)
+
+  ==> 3SI-2SA-REKS(2,2) State Properties (K=0) <==
+
+    [tag1] Microstate Energies (sorted by energy)
+    --------------------------------------
+      E[|a,b| ] =      -0.988527594466 Ha
+      E[|a,a_|] =      -0.978006177014 Ha
+      E[|a,b_|] =      -0.910140785962 Ha
+      E[|b,b_|] =      -0.835842390981 Ha
+    --------------------------------------
+
+
+    [tag2] Fractional Occupation Numbers (active orbitals)
+    --------------------------------------------------
+      Geminal Pairs  Scheme 0: (a,b)
+    --------------------------------------------------
+      Orbital                 1A          2A 
+      Energy (Ha)      -0.261544   -0.190880 
+      REKS label               a           b 
+      n-FON (Scheme0)   1.557956    0.442044 
+    --------------------------------------------------
+
+    [tag3] Lagrangian eps_pq and ERI (pq|st) for building SSR(2,2) Hamiltonian matrix
+    -------------------------------------------------------------------------------------
+      pq      eps_pq    st:         ab
+    -------------------------------------------------------------------------------------
+      ab    0.000000           --    
+    -------------------------------------------------------------------------------------
+
+    [tag4] Pre-diagonalization SI Hamiltonian (3x3)
+    -----------------------------------------
+                            PPS1          OSS1          DES1
+      PPS1             -1.008993     +0.000000     +0.000000
+      OSS1             +0.000000     -0.831754     +0.000000
+      DES1             +0.000000     +0.000000     -0.804855
+    -----------------------------------------
+
+    [tag5] SI Overlap S (3x3)
+    -----------------------------------------
+                            PPS1          OSS1          DES1
+      PPS1             +1.000000     +0.000000     +0.000000
+      OSS1             +0.000000     +1.000000     +0.000000
+      DES1             +0.000000     +0.000000     +1.000000
+    -----------------------------------------
+
+    [tag6] Adiabatic State Energies
+    ------------------------
+      SSR State S0        -1.008993365928 Ha
+      SSR State S1        -0.831753977458 Ha
+      SSR State S2        -0.804855202067 Ha
+    ------------------------
+
+    [tag7] Excitation Energies (from S0)
+    -----------------------------
+      S0 -> S1 : Delta E =     0.177239 Ha =     4.822929 eV
+      S0 -> S2 : Delta E =     0.204138 Ha =     5.554882 eV
+    -----------------------------
+
+    [tag8] Transition Dipole Moments (a.u.)
+    --------------------------------
+      Pair                 mu_x         mu_y         mu_z         |mu|
+      S0 -> S1          0.000000     0.000000    -1.236628     1.236628
+      S0 -> S2         -0.000000    -0.000000    -0.000000     0.000000
+      S1 -> S2         -0.000000    -0.000000     4.055638     4.055638
+    --------------------------------
+
+    [tag9] Oscillator Strengths
+    --------------------
+      Pair                    f      dE (eV)
+      S0 -> S1           0.18070       4.8229
+      S0 -> S2           0.00000       5.5549
+      S1 -> S2           0.29496       0.7320
+    --------------------
+
+
+  =========================================================================
+    SSR Natural Occupations / Orbitals (unrelaxed)  K=0  3SI-2SA-REKS(2,2)
+  -------------------------------------------------------------------------
+
+    [tag10] Table A: SI eigenvector composition (full)
+    ------------------------------------------
+      k    E_k (Ha)                      PPS1          OSS1          DES1
+      0         -1.008993365928     +1.000000     +0.000000     +0.000000
+      1         -0.831753977458     +0.000000     -1.000000     +0.000000
+      2         -0.804855202067     -0.000000     -0.000000     -1.000000
+    ------------------------------------------
+
+    [tag11] Table B: per-state FONs and natural orbitals
+    --------------------------------------------
+      columns = natural orbitals alpha with occupation n_alpha
+      rows = coefficient on each active SCF MO by energy-rank label
+      active SCF MO rows:  a=1A b=2A
+
+      SSR state 0:
+        n_alpha:        1.557956    0.442044
+        MO 1A            +1.0000     +0.0000
+        MO 2A            +0.0000     +1.0000
+
+      SSR state 1:
+        n_alpha:        1.000000    1.000000
+        MO 1A            -0.7071     -0.7071
+        MO 2A            +0.7071     -0.7071
+
+      SSR state 2:
+        n_alpha:        0.442044    1.557956
+        MO 1A            -1.0000     +0.0000
+        MO 2A            +0.0000     +1.0000
+    --------------------------------------------
+
+    [tag12] Integrity check
+    ---------------
+      state  0: trace=2.0000000000 (expect 2.0)  asym=0.00e+00  n in [+0.4420, +1.5580]
+      state  1: trace=2.0000000000 (expect 2.0)  asym=0.00e+00  n in [+1.0000, +1.0000]
+      state  2: trace=2.0000000000 (expect 2.0)  asym=0.00e+00  n in [+0.4420, +1.5580]
+    ---------------
+  =========================================================================
+  End of 3SI-2SA-REKS(2,2) SSR output.
+  =========================================================================
+
+
+Computation Completed
+
+*** tstop() called on constlike.local at Sun Oct  4 22:23:13 2026
+Module time:
+	user time   =       0.17 seconds =       0.00 minutes
+	system time =       0.01 seconds =       0.00 minutes
+	total time  =          0 seconds =       0.00 minutes
+Total time:
+	user time   =       0.17 seconds =       0.00 minutes
+	system time =       0.01 seconds =       0.00 minutes
+	total time  =          0 seconds =       0.00 minutes
+  Threads set to 1 by Python driver.
+
+Scratch directory: /var/folders/tp/7jzk1kyd2pb3d2xjvky58g600000gn/T//psiscr/
+ Found user provided orbital data. Setting orbital guess to READ 
+ Copying restart file <h2_opening.npy> to </var/folders/tp/7jzk1kyd2pb3d2xjvky58g600000gn/T//psiscr/output.h2.53882.180.npy> for internal processing
+   => Libint2 <=
+
+    Primary   basis highest AM E, G, H:  6, 6, 3
+    Auxiliary basis highest AM E, G, H:  7, 7, 4
+    Onebody   basis highest AM E, G, H:  -, -, -
+    Solid Harmonics ordering:            Gaussian
+
+*** tstart() called on constlike.local
+*** at Sun Oct  4 22:23:13 2026
+
+   => Loading Basis Set <=
+
+    Name: CC-PVDZ
+    Role: ORBITAL
+    Keyword: BASIS
+    atoms 1-2 entry H          line    22 file /Users/stan/Codebase/psi4_dir/main/build/stage/share/psi4/basis/cc-pvdz.gbs 
+
+   => PBE-D3(BJ): Empirical Dispersion <=
+
+    Grimme's -D3 (BJ-damping) Dispersion Correction
+    Grimme S.; Ehrlich S.; Goerigk L. (2011), J. Comput. Chem., 32: 1456
+
+        s6 =       1.000000
+        s8 =       0.787500
+        a1 =       0.428900
+        a2 =       4.440700
+
+
+         ---------------------------------------------------------
+                                   SCF
+               by Justin Turney, Rob Parrish, Andy Simmonett
+                          and Daniel G. A. Smith
+                             REKS Reference
+                        1 Threads,    500 MiB Core
+         ---------------------------------------------------------
+
+  ==> Geometry <==
+
+    Molecular point group: c1
+    Full point group: C_inf_v
+
+    Geometry (in Angstrom), charge = 0, multiplicity = 1:
+
+       Center              X                  Y                   Z               Mass       
+    ------------   -----------------  -----------------  -----------------  -----------------
+         H            0.000000000000     0.000000000000     0.000000000000     1.007825032230
+         H            0.000000000000     0.000000000000     2.200000000000     1.007825032230
+
+  Running in c1 symmetry.
+
+  Rotational constants: A = ************  B =      3.45594  C =      3.45594 [cm^-1]
+  Rotational constants: A = ************  B = 103606.42696  C = 103606.42696 [MHz]
+  Nuclear repulsion =    0.240535095759091
+
+  Charge       = 0
+  Multiplicity = 1
+  Electrons    = 2
+  Nalpha       = 1
+  Nbeta        = 1
+
+  ==> Algorithm <==
+
+  SCF Algorithm Type is PK.
+  DIIS disabled.
+  MOM disabled.
+  Fractional occupation disabled.
+  Guess Type is READ.
+  Energy threshold   = 1.00e-10
+  Density threshold  = 1.00e-08
+  Integral threshold = 1.00e-12
+
+  ==> Primary Basis <==
+
+  Basis Set: CC-PVDZ
+    Blend: CC-PVDZ
+    Number of shells: 6
+    Number of basis functions: 10
+    Number of Cartesian functions: 10
+    Spherical Harmonics?: true
+    Max angular momentum: 1
+
+  ==> DFT Potential <==
+
+   => LibXC <=
+
+    Version 7.0.0
+    S. Lehtola, C. Steigemann, M. J.T. Oliveira, and M. A.L. Marques.,  SoftwareX 7, 1–5 (2018) (10.1016/j.softx.2017.11.002)
+
+   => Composite Functional: PBE-D3BJ2B <= 
+
+    PBE GGA Exchange-Correlation Functional
+
+    J.P. Perdew et. al., Phys. Rev. Lett., 77(18), 3865-3868, 1996
+
+
+    Deriv               =              1
+    GGA                 =           TRUE
+    Meta                =          FALSE
+
+    Exchange Hybrid     =          FALSE
+    MP2 Hybrid          =          FALSE
+
+   => Exchange Functionals <=
+
+    1.0000     XC_GGA_X_PBE
+
+   => Correlation Functionals <=
+
+    1.0000     XC_GGA_C_PBE
+
+   => LibXC Density Thresholds  <==
+
+    XC_GGA_C_PBE:  1.00E-12 
+    XC_GGA_X_PBE:  1.00E-15 
+
+   => Molecular Quadrature <=
+
+    Radial Scheme          =       TREUTLER
+    Pruning Scheme         =           NONE
+    Nuclear Scheme         =       TREUTLER
+
+    Blocking Scheme        =         OCTREE
+    BS radius alpha        =              1
+    Pruning alpha          =              1
+    Radial Points          =             75
+    Spherical Points       =            302
+    Total Points           =           5804
+    Total Blocks           =             70
+    Max Points             =            198
+    Max Functions          =             10
+    Weights Tolerance      =       1.00E-15
+
+   =========================================================================
+
+                                REKS Studio
+
+           Spin-Restricted Ensemble-referenced Kohn-Sham DFT
+             State-Averaged (SA) and State-Interaction (SI)
+
+            Konstantin Komarov, Michael Filatov, Seung Kyu Min
+
+    Ulsan National Institute of Science and Technology (UNIST), South Korea
+   =========================================================================
+
+    REKS Studio Setup
+    -----------------
+      Variant            REKS(2,2)  scheme 0  spin 0  (singlet)
+      Active space       2 electrons in 2 orbitals,  core 0
+      Active MO indices  1A 2A 
+
+    Pairing schemes (GVB(2,2) geminal pairs)
+
+      scheme 0 : (a,b)
+
+        GVB(2,2) wavefunctions for pair (p,q)
+          Singlet closed-shell
+            Psi_0(p,q) = +1/sqrt(2.0) * sqrt(n0_p) * |p,p_|
+                         -1/sqrt(2.0) * sqrt(n0_q) * |q,q_|
+            Psi_2(p,q) = +1/sqrt(2.0) * sqrt(n0_q) * |p,p_|
+                         +1/sqrt(2.0) * sqrt(n0_p) * |q,q_|
+          Singlet open-shell
+            Psi_1(p,q) = +1/sqrt(2.0) * |p,q_|
+                         +1/sqrt(2.0) * |q,p_|
+          FON constraint: n_p + n_q = 2.0
+
+    SA pool
+    -------
+
+      K    config weight      definition
+      0    PPS1   0.500000    A[(core) Psi_0(a,b) ]
+      1    OSS1   0.500000    A[(core) Psi_1(a,b) ]
+                  ------------
+                  sum = 1.000000
+
+      E[SA-REKS] = 0.500000 * E(PPS1)
+                 + 0.500000 * E(OSS1)
+
+    SI pool
+    -------
+
+      cassette  dim  label
+      0         3    3SI-2SA-REKS(2,2)
+
+      K    config definition
+      0    PPS1   A[(core) Psi_0(a,b) ]
+      1    OSS1   A[(core) Psi_1(a,b) ]
+      2    DES1   A[(core) Psi_2(a,b) ]
+
+   => Loading Basis Set <=
+
+    Name: CC-PVDZ
+    Role: ORBITAL
+    Keyword: BASIS
+    atoms 1-2 entry H          line    22 file /Users/stan/Codebase/psi4_dir/main/build/stage/share/psi4/basis/cc-pvdz.gbs 
+
+  Reading orbitals from file /var/folders/tp/7jzk1kyd2pb3d2xjvky58g600000gn/T//psiscr/output.h2.53882.180.npy, no projection.
+
+  ==> Integral Setup <==
+
+  Using in-core PK algorithm.
+   Calculation information:
+      Number of atoms:                   2
+      Number of AO shells:               6
+      Number of primitives:             10
+      Number of atomic orbitals:        10
+      Number of basis functions:        10
+
+      Integral cutoff                 1.00e-12
+      Number of threads:                 1
+
+  Performing in-core PK
+  Using 3080 doubles for integral storage.
+  We computed 231 shell quartets total.
+  Whereas there are 231 unique shell quartets.
+
+  ==> DiskJK: Disk-Based J/K Matrices <==
+
+    J tasked:                  Yes
+    K tasked:                   No
+    wK tasked:                  No
+    Memory [MiB]:              373
+    Schwarz Cutoff:          1E-12
+
+    OpenMP threads:              1
+
+  Cached 100.0% of DFT collocation blocks in 0.002 [GiB].
+
+  Minimum eigenvalue in the overlap matrix is 2.2957858817E-01.
+  Reciprocal condition number of the overlap matrix is 1.1377785787E-01.
+    Using symmetric orthogonalization.
+
+  ==> Pre-Iterations <==
+
+  SCF Guess: REKS orbitals restored from previous computation (REKS::guess override).
+
+  REKS READ: restoring n-FON from saved wavefunction:
+    n[0] = 1.506518260732
+   -------------------------------------------------------
+    Irrep   Nso     Nmo     Nalpha   Nbeta   Ndocc  Nsocc
+   -------------------------------------------------------
+     A         10      10       0       0       0       0
+   -------------------------------------------------------
+    Total      10      10       1       1       1       0
+   -------------------------------------------------------
+
+  ==> Iterations <==
+
+                        Total Energy        Delta E     RMS |[F,P]|
+
+   @REKS iter   0:    -0.91951142823523   -9.19511e-01   0.00000e+00 
+   @REKS iter   1:    -0.91951142823523    0.00000e+00   3.58408e-03 SHIFT
+   @REKS iter   2:    -0.92027614513468   -7.64717e-04   1.92376e-03 SHIFT
+   @REKS iter   3:    -0.92047707136431   -2.00926e-04   1.96701e-03 ORB-GVB-DIIS/SHIFT
+   @REKS iter   4:    -0.92056802481282   -9.09534e-05   1.58451e-04 ORB-GVB-DIIS/SHIFT
+   @REKS iter   5:    -0.92056880791083   -7.83098e-07   1.02727e-05 ORB-GVB-DIIS/SHIFT
+   @REKS iter   6:    -0.92056881059933   -2.68850e-09   6.58076e-07 ORB-GVB-DIIS/SHIFT
+   @REKS iter   7:    -0.92056881060783   -8.49698e-12   1.90670e-08 ORB-GVB-DIIS/SHIFT
+   @REKS iter   8:    -0.92056881060784   -1.07692e-14   9.47375e-10 ORB-GVB-DIIS/SHIFT
+   @REKS iter   9:    -0.92056881060784    1.11022e-16   7.98479e-11 ORB-GVB-DIIS/SHIFT
+  Energy and wave function converged.
+
+
+  ==> Post-Iterations <==
+
+   Electrons on quadrature grid:
+      Ntotal   =    2.0000103651 ; deviation = 1.037e-05 
+
+    Orbital Energies [Eh]
+    ---------------------
+
+    Core Doubly Occupied (0):                                             
+
+    
+
+    Active Fractionally Occupied (2):                                     
+
+       1A   (a) -0.261544    n_a =  1.557956
+       2A   (b) -0.190880    n_b =  0.442044
+
+    Virtual (8):                                                          
+
+       3A      0.424158     4A      0.443487     5A      1.138023  
+       6A      1.187702     7A      1.187702     8A      1.203528  
+       9A      1.203528    10A      1.320772  
+
+  @REKS Final Energy:    -0.92056881060784
+
+   => Energetics <=
+
+    Nuclear Repulsion Energy =              0.2405350957590909
+    One-Electron Energy =                  -1.4839562613297173
+    Two-Electron Energy =                   0.8305587983890058
+    DFT Exchange-Correlation Energy =      -0.5075113045114075
+    Empirical Dispersion Energy =          -0.0001951389148143
+    VV10 Nonlocal Energy =                  0.0000000000000000
+    Total Energy =                         -0.9205688106078423
+
+   => SA-REKS Energy Decomposition <=
+
+    config      weight       E(config) [Eh]        w * E(config)
+    ------------------------------------------------------------
+    PPS1      0.500000      -1.009188504843      -0.504594252421
+    OSS1      0.500000      -0.831949116373      -0.415974558186
+    ------------------------------------------------------------
+    E[SA-REKS]                                   -0.920568810608
+
+
+  SI Eigenproblem: standard (S = I), dimension 3
+  SI eigenvalues and composition (|w_j| > 5%, w_j = c_j*(Sc)_j):
+    E[ 0] =      -1.009188504843   PPS1(+100%)
+    E[ 1] =      -0.831949116373   OSS1(+100%)
+    E[ 2] =      -0.805050340981   DES1(+100%)
+
+  ==> 3SI-2SA-REKS(2,2) State Properties (K=0) <==
+
+    [tag1] Microstate Energies (sorted by energy)
+    --------------------------------------
+      E[|a,b| ] =      -0.988722733381 Ha
+      E[|a,a_|] =      -0.978201315929 Ha
+      E[|a,b_|] =      -0.910335924877 Ha
+      E[|b,b_|] =      -0.836037529896 Ha
+    --------------------------------------
+
+
+    [tag2] Fractional Occupation Numbers (active orbitals)
+    --------------------------------------------------
+      Geminal Pairs  Scheme 0: (a,b)
+    --------------------------------------------------
+      Orbital                 1A          2A 
+      Energy (Ha)      -0.261544   -0.190880 
+      REKS label               a           b 
+      n-FON (Scheme0)   1.557956    0.442044 
+    --------------------------------------------------
+
+    [tag3] Lagrangian eps_pq and ERI (pq|st) for building SSR(2,2) Hamiltonian matrix
+    -------------------------------------------------------------------------------------
+      pq      eps_pq    st:         ab
+    -------------------------------------------------------------------------------------
+      ab    0.000000           --    
+    -------------------------------------------------------------------------------------
+
+    [tag4] Pre-diagonalization SI Hamiltonian (3x3)
+    -----------------------------------------
+                            PPS1          OSS1          DES1
+      PPS1             -1.009189     +0.000000     +0.000000
+      OSS1             +0.000000     -0.831949     +0.000000
+      DES1             +0.000000     +0.000000     -0.805050
+    -----------------------------------------
+
+    [tag5] SI Overlap S (3x3)
+    -----------------------------------------
+                            PPS1          OSS1          DES1
+      PPS1             +1.000000     +0.000000     +0.000000
+      OSS1             +0.000000     +1.000000     +0.000000
+      DES1             +0.000000     +0.000000     +1.000000
+    -----------------------------------------
+
+    [tag6] Adiabatic State Energies
+    ------------------------
+      SSR State S0        -1.009188504843 Ha
+      SSR State S1        -0.831949116373 Ha
+      SSR State S2        -0.805050340981 Ha
+    ------------------------
+
+    [tag7] Excitation Energies (from S0)
+    -----------------------------
+      S0 -> S1 : Delta E =     0.177239 Ha =     4.822929 eV
+      S0 -> S2 : Delta E =     0.204138 Ha =     5.554882 eV
+    -----------------------------
+
+    [tag8] Transition Dipole Moments (a.u.)
+    --------------------------------
+      Pair                 mu_x         mu_y         mu_z         |mu|
+      S0 -> S1         -0.000000     0.000000     1.236628     1.236628
+      S0 -> S2          0.000000    -0.000000     0.000000     0.000000
+      S1 -> S2         -0.000000     0.000000     4.055638     4.055638
+    --------------------------------
+
+    [tag9] Oscillator Strengths
+    --------------------
+      Pair                    f      dE (eV)
+      S0 -> S1           0.18070       4.8229
+      S0 -> S2           0.00000       5.5549
+      S1 -> S2           0.29496       0.7320
+    --------------------
+
+
+  =========================================================================
+    SSR Natural Occupations / Orbitals (unrelaxed)  K=0  3SI-2SA-REKS(2,2)
+  -------------------------------------------------------------------------
+
+    [tag10] Table A: SI eigenvector composition (full)
+    ------------------------------------------
+      k    E_k (Ha)                      PPS1          OSS1          DES1
+      0         -1.009188504843     +1.000000     +0.000000     +0.000000
+      1         -0.831949116373     +0.000000     +1.000000     +0.000000
+      2         -0.805050340981     +0.000000     +0.000000     +1.000000
+    ------------------------------------------
+
+    [tag11] Table B: per-state FONs and natural orbitals
+    --------------------------------------------
+      columns = natural orbitals alpha with occupation n_alpha
+      rows = coefficient on each active SCF MO by energy-rank label
+      active SCF MO rows:  a=1A b=2A
+
+      SSR state 0:
+        n_alpha:        1.557956    0.442044
+        MO 1A            +1.0000     +0.0000
+        MO 2A            +0.0000     +1.0000
+
+      SSR state 1:
+        n_alpha:        1.000000    1.000000
+        MO 1A            +1.0000     +0.0000
+        MO 2A            +0.0000     +1.0000
+
+      SSR state 2:
+        n_alpha:        0.442044    1.557956
+        MO 1A            +1.0000     +0.0000
+        MO 2A            +0.0000     +1.0000
+    --------------------------------------------
+
+    [tag12] Integrity check
+    ---------------
+      state  0: trace=2.0000000000 (expect 2.0)  asym=0.00e+00  n in [+0.4420, +1.5580]
+      state  1: trace=2.0000000000 (expect 2.0)  asym=0.00e+00  n in [+1.0000, +1.0000]
+      state  2: trace=2.0000000000 (expect 2.0)  asym=0.00e+00  n in [+0.4420, +1.5580]
+    ---------------
+  =========================================================================
+  End of 3SI-2SA-REKS(2,2) SSR output.
+  =========================================================================
+
+
+Computation Completed
+
+*** tstop() called on constlike.local at Sun Oct  4 22:23:14 2026
+Module time:
+	user time   =       0.46 seconds =       0.01 minutes
+	system time =       0.08 seconds =       0.00 minutes
+	total time  =          1 seconds =       0.02 minutes
+Total time:
+	user time   =       0.66 seconds =       0.01 minutes
+	system time =       0.09 seconds =       0.00 minutes
+	total time  =          1 seconds =       0.02 minutes
+    PBE E_SA..............................................................................PASSED
+    D3BJ energy...........................................................................PASSED
+    PBE-D3BJ E_SA.........................................................................PASSED
+    PBE-D3BJ SSR..........................................................................PASSED
+
+    Psi4 stopped on: Sunday, 04 October 2026 10:23PM
+    Psi4 wall time for execution: 0:00:01.16
+
+*** Psi4 exiting successfully. Buy a developer a beer!

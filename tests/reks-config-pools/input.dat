@@ -1,0 +1,96 @@
+#! REKS(4,4)/6-31G BHHLYP H4: equivalent SI configuration spellings, SA pools, two SI blocks, reported-state cap
+
+import json
+import numpy as np
+
+e_sa_ref = -1.7699306624889                                                                       #TEST
+ssr_full_ref = [-2.002423564, -1.965705424, -1.761589168, -1.757433246, -1.744978458, -1.727023182, #TEST
+                -1.716776575, -1.696553348, -1.667755137, -1.626162753, -1.607393213, -1.522985318, #TEST
+                -1.513935114, -1.486087353, -1.431024997, -1.315370118]                            #TEST
+e_sa_pool_ref = {"weights": -1.8012123077225, "extra": -1.8196329102666, "ladder": -1.7785710620651}  #TEST
+
+names = ["PPS1", "OSS1", "OSS2", "PPS2", "OSS3", "OSS4", "DES1", "DES2", "DES3", "DES4", "OSS_DES1", "OSS_DES2",
+         "OSS_DES3", "OSS_DES4", "DDES1", "DDES2", "DOSS_SPS_0", "DOSS_SPS_1"]
+groups = {
+    "whole 2S=0 manifold": [["full"], list(range(18)), names, ["*"],
+                            ["PPS", "OSS", "DES", "OSS_DES", "DDES", "DOSS_SPS"],
+                            ["single-scheme-0-T"], ["single-scheme-0-1"], ["single-scheme-0-C2"]],
+    "without the spin-projected base": [["full", "exclude:sps"], list(range(16))],
+    "pairing scheme 0": [["single-scheme"], ["single-scheme-0"], ["single_scheme_0"], ["single-scheme:0"],
+                         [0, 1, 2, 6, 7, 10, 11, 14, 16, 17]],
+    "pairing scheme 1": [["single-scheme-1"], ["single-scheme-T"], ["single-scheme-C2"]],
+    "mixed scheme 0": [["mixed-scheme"], [0, 1, 2, 4, 5, 6, 7, 16, 17]],
+    "name patterns": [["PPS?", "OSS*"], [0, 1, 2, 3, 4, 5, 10, 11, 12, 13]],
+}
+sa_pools = {
+    "weights": {"sa_reks_configs": ["PPS1", "OSS1", "OSS2"], "sa_reks_weights": [0.5, 0.25, 0.25]},
+    "extra": {"sa_reks_configs": ["PPS1", "OSS1", "OSS2"], "sa_reks_extra": [[1, 1, 1, 1, 0, 0, 0, 0]],
+              "sa_reks_weights": [0.25, 0.25, 0.25, 0.25]},
+    "ladder": {"sa_reks_configs": [["PPS1", "OSS1", "OSS2"], ["T_PPS1"]], "sa_reks_2spin": [0, 2],
+               "sa_reks_weights": [0.25, 0.25, 0.25, 0.25]},
+}
+
+molecule h4 {
+0 1
+H 0.0 0.0 -3.75
+H 0.0 0.0 -1.25
+H 0.0 0.0 1.25
+H 0.0 0.0 3.75
+symmetry c1
+no_com
+no_reorient
+}
+
+with open("h4_opening.json") as f:
+    data = json.load(f)
+for group in ("matrix", "vector", "matrixarr"):
+    data[group] = {k: (None if v is None else np.array(v)) for k, v in data[group].items()}
+np.save("h4_opening.npy", data, allow_pickle=True)
+
+
+def reks(restart, options=None):
+    core.clean_options()
+    set_num_threads(1)
+    set_options({"basis": "6-31g", "reference": "reks", "reks": [4, 4], "reks_m_fon": 1.99999999,
+                 "scf_type": "pk", "dft_grid_name": "sg1", "e_convergence": 10, "d_convergence": 8,
+                 "guess": "read", "reks_use_trah": False, "reks_gvb_diis": True, **(options or {})})
+    e_sa, wfn = energy("bhhlyp", restart_file=restart, return_wfn=True)
+    ssr = {k: variable(k).np.ravel() for k in ("SSR ENERGIES", "SSR ENERGIES K=1") if has_variable(k)}
+    clean()
+    clean_variables()
+    return e_sa, wfn, ssr
+
+
+e_sa, wfn, ssr = reks("h4_opening.npy")
+compare_values(e_sa_ref, e_sa, 8, "E_SA")  #TEST
+compare_values(ssr_full_ref, ssr["SSR ENERGIES"], 5, "SSR energies")  #TEST
+wfn.to_file("h4_converged")
+ssr_default = ssr["SSR ENERGIES"]
+
+for label, spellings in groups.items():
+    first = None
+    for spelling in spellings:
+        e_sa, _, ssr = reks("h4_converged.npy", {"si_reks_configs": [[spelling]]})
+        if first is None:
+            first = ssr["SSR ENERGIES"]
+            continue
+        compare_values(first, ssr["SSR ENERGIES"], 10, f"{label}: {spelling} == {spellings[0]}")  #TEST
+    if label == "whole 2S=0 manifold":  #TEST
+        compare_values(ssr_default, first, 8, f"{label}: default")  #TEST
+        compare_integers(16, len(first), f"{label}: nstates")  #TEST
+
+_, _, scheme0 = reks("h4_converged.npy", {"si_reks_configs": [[["single-scheme-0"]]]})
+_, _, scheme1 = reks("h4_converged.npy", {"si_reks_configs": [[["single-scheme-1"]]]})
+_, _, both = reks("h4_converged.npy", {"si_reks_configs": [[["single-scheme-0"], ["single-scheme-1"]]]})
+compare_values(scheme0["SSR ENERGIES"], both["SSR ENERGIES"], 8, "two blocks: 0")  #TEST
+compare_values(scheme1["SSR ENERGIES"], both["SSR ENERGIES K=1"], 8, "two blocks: 1")  #TEST
+
+_, _, ssr = reks("h4_converged.npy", {"si_reks_report_states": [3]})
+compare_values(ssr_default[:3], ssr["SSR ENERGIES"], 8, "report states")  #TEST
+
+for spelling in (["PPS1", "OSS1", "OSS2"], [0, 1, 2]):
+    e_sa, _, _ = reks("h4_converged.npy", {"sa_reks_configs": spelling})
+    compare_values(e_sa_ref, e_sa, 10, f"SA {spelling}")  #TEST
+for label, options in sa_pools.items():
+    e_sa, _, _ = reks("h4_converged.npy", options)
+    compare_values(e_sa_pool_ref[label], e_sa, 8, f"SA {label}")  #TEST

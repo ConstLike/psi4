@@ -1,0 +1,76 @@
+#! Acceptance test for the SCF GUESS_ACTIVE_WINDOW option:
+#!  1) RHF on H2 saves .npy into scratch.
+#!  2) REKS(2,2) READ baseline (no window).
+#!  3) REKS(2,2) READ with the identity window ["HOMO", "LUMO"] must match baseline.
+#!  4) REKS(2,2) READ with the window ["HOMO", "LUMO+1"] replaces LUMO in the active
+#!     space by a virtual: the starting orbitals differ; must converge to a bound state.
+
+molecule h2 {
+  0 1
+  H 0.0 0.0 0.0
+  H 0.0 0.0 1.6
+  symmetry c1
+}
+
+set basis 6-31g(d)
+set scf_type pk
+
+reks_opts = {
+    'reference':            'reks',
+    'reks':                 [2, 2],
+    'reks_sa_weights':      [0.5, 0.5],
+    'level_shift':          0.6,
+    'level_shift_cutoff':   0.0,
+    'level_shift_adapt':    True,
+    'reks_use_trah':        True,
+    'fail_on_maxiter':      False,
+    'maxiter':              150,
+    'd_convergence':        6,
+    'e_convergence':        8,
+    'guess':                'read',
+}
+
+
+def reks_energy():
+    """Run REKS energy(); returns (SA energy, energy of the starting orbitals).
+
+    psi4.energy('scf') returns 0.0 for REKS targets because REKS does not
+    write SCF TOTAL ENERGY. wfn.energy() returns the SA energy directly.
+    """
+    _, wfn = psi4.energy('scf', return_wfn=True)
+    return wfn.energy(), float(wfn.variable("SCF TOTAL ENERGIES").ravel()[0])
+
+
+# (1) cold RHF -> populates scratch .npy
+psi4.set_options({'reference': 'rhf', 'guess': 'sad', 'maxiter': 150,
+                  'd_convergence': 8, 'e_convergence': 8})
+psi4.energy('scf')
+
+# (2) REKS(2,2) READ baseline
+psi4.set_options(reks_opts)
+E_baseline, E0_baseline = reks_energy()
+compare_values(True, E_baseline < -0.5,
+               'REKS baseline produced a bound SA energy')  #TEST
+
+# Refresh RHF .npy in scratch (REKS overwrote it on save)
+psi4.set_options({'reference': 'rhf', 'guess': 'sad'})
+psi4.energy('scf')
+
+# (3) The identity window must not change the answer.
+psi4.set_options(reks_opts)
+psi4.set_options({'guess_active_window': ['HOMO', 'LUMO']})
+E_idwin, _ = reks_energy()
+compare_values(E_baseline, E_idwin, 8, 'identity window is a no-op')  #TEST
+
+# Refresh again before the HOMO/LUMO+1 run.
+psi4.set_options({'reference': 'rhf', 'guess': 'sad', 'guess_active_window': []})
+psi4.energy('scf')
+
+# (4) A non-trivial window alters the starting active space; REKS must still converge
+# to a bound state.
+psi4.set_options(reks_opts)
+psi4.set_options({'guess_active_window': ['HOMO', 'LUMO+1']})
+E_win, E0_win = reks_energy()
+compare_values(True, abs(E0_win - E0_baseline) > 1e-3,
+               'HOMO/LUMO+1 window changes the starting orbitals')  #TEST
+compare_values(True, E_win < 0.0, 'REKS converged with the HOMO/LUMO+1 window to a bound state')  #TEST
